@@ -13,9 +13,11 @@ gamut, diagnostics) that brightness plugs into.
 
 ## Architecture at a glance
 
-- **Surface policy** — `SurfaceColorSpacePreference` (create-time, on `WgpuConfiguration`)
-  → `decide_surface_target` → `SurfaceTarget { format, color_space, status }`; the
-  status is app-readable via `frame.wgpu_render_state()`.
+- **Surface policy** — `SurfacePreference` (app-level, create-time on
+  `WgpuConfiguration`) → `decide_surface_target` per viewport, re-run on monitor
+  change → per-viewport `SurfaceTarget` + `SurfaceStatus` (+ `hdr_headroom`, PR 3),
+  surfaced via `ViewportInfo`; shared `RenderState` keeps device/queue/renderer and
+  the format-keyed pipeline cache.
 - **Encoding** — `OutputEncoding::of(format, color_space)`, derived at `Renderer::new`,
   never stored.
 - **Content contract** — float colors are gamma-encoded in the buffer's declared
@@ -29,12 +31,13 @@ gamut, diagnostics) that brightness plugs into.
 
 | PR | Ships | Consumer | Tests |
 |---|---|---|---|
-| **1** | Wide-gamut surface: `SurfaceColorSpacePreference {Off, Auto, DisplayP3}`, `decide_surface_target`, `HdrStatus`, configure threading; callback demo with out-of-sRGB saturation | any eframe app opting in | decider property tests, u8 snapshots, windowed smoke |
-| **2** | Tagged float content (tier C): `Primaries`, `FloatImage`, `ImageData::Float`, upload pairing, `ui.image()` float display, WGSL negative fix, ecolor contract tests | HDR/wide-gamut images via `ui.image()` | upload roundtrip, ecolor properties, snapshots |
-| **3** | HDR extended range: `ExtendedSrgb` + `ExtendedDisplayP3` on `Rgba16Float` (>1.0, EDR); `Auto`; dither off on fp16 | brightness above SDR white | fp16 readback numeric tests, negative GPU round-trip, capture branch, MSAA |
-| **4** | scRGB-linear policy (Windows/DX12) + explicit encoding selection + #7484 semantics | Windows HDR | per-platform (manual-heavy) |
-| **5** | Tier D: `color_edit_button_hdr` + swatch widgets | HDR editing UI | picker snapshots, decomposition tests |
-| — | Side items: `DisplayHdrInfo` per-viewport pass-through, docs, test app | adoption | compile-only + manual |
+| **1** | Wide-gamut surface: `SurfacePreference {Off, WideGamut}`, per-viewport `decide_surface_target` (re-run on monitor change), format-keyed pipeline cache, per-viewport `SurfaceStatus`; callback demo with out-of-sRGB saturation | any eframe app opting in | decider property tests, pipeline-cache test, u8 snapshots, windowed smoke |
+| **2a** | WGSL negative fix (`sign(x)·f(|x|)`) + ecolor contract tests | correctness floor for all float content | negative CPU↔GPU round-trip, ecolor properties |
+| **2b** | Tagged float content (tier C): `Primaries`, `FloatImage`, `ImageData::Float`, upload pairing, `ui.image()` float display | HDR/wide-gamut images via `ui.image()` | upload roundtrip, ecolor properties, snapshots |
+| **3** | HDR extended range: extended pair on `Rgba16Float` (>1.0, EDR); `Hdr`, `WideGamutHdr`; headroom pass-through (`ViewportInfo.hdr_headroom`, painter-fed); dither off on fp16 | brightness above SDR white, adaptive to live headroom | fp16 readback numeric tests, negative GPU round-trip, capture branch, MSAA, windowed smoke asserts the headroom field |
+| **4** | scRGB-linear pairing (Windows/DX12) — HDR brightness **and** wide gamut via signed values — activates the derived encoding path | Windows HDR + wide gamut | per-platform (manual-heavy) |
+| **5** | Tier D: `color_edit_button_hdr` + swatch widgets; the picker edits linear `Rgba` (the app-side math space), converting to encoded at paint | HDR editing UI | picker snapshots, decomposition tests |
+| — | Side items: docs, test app | adoption | compile-only + manual |
 | — | Deferred: tier E (float vertex colors) | vector-shaped HDR | — |
 
 **Binding rules:** every PR ships consumed, testable functionality — nothing dead,
@@ -90,73 +93,145 @@ misinterpreting egui's gamma-encoded output. #7484's black screen is the separat
 **Policy type** — on `WgpuConfiguration`, create-time-only:
 
 ```rust
-pub enum SurfaceColorSpacePreference {
-    Off,               // today's behavior — the rollout default
-    Auto,              // probe; best available, else SDR — the endgame default
-    DisplayP3,         // PR 1 — wide gamut, SDR range (u8 surface, P3-referred)
-    ExtendedSrgb,      // PR 3 — HDR brightness (Rgba16Float + EXTENDED_SRGB)
-    ExtendedDisplayP3, // PR 3 — wide gamut + HDR brightness (Rgba16Float)
+pub enum SurfacePreference {
+    Off,          // today's behavior — the rollout default
+    WideGamut,    // PR 1 — wider gamut, SDR range
+    Hdr,          // PR 3 — brightness, sRGB gamut pinned
+    WideGamutHdr, // PR 3 — both axes, all-or-nothing
 }
 ```
 
-Why create-time-only, and not on the runtime-mutable `SurfaceConfig`: a format change
-invalidates baked pipeline targets, and the only safe mid-run recreate is impossible as
-an eframe API — apps hold `egui::Context` by value. A renderer-only recreate loses
-`Renderer.textures` (font atlas, uploads, `register_native_texture` bind groups) while
-egui ships per-frame *deltas*, so meshes reference missing textures until every image is
-re-touched; re-registering user native textures has no recipe. Half-measures fail
-silently — worse than #7484's visible failure. Full recreate remains an app-level
-technique (the workaround app does exactly this); it is not an upstream deliverable.
-Runtime HDR changes are therefore a documented non-goal.
+Why the preference sits on `WgpuConfiguration` (create-time app policy) rather than
+the runtime-mutable `SurfaceConfig`: naive per-frame pairing lands in #7484 territory
+(double gamma, black screens). What the per-viewport machinery deliberately never
+does is recreate the renderer or context: a renderer-only recreation loses
+`Renderer.textures` (font atlas, uploads, `register_native_texture` bind groups)
+while egui ships per-frame *deltas*, so meshes reference missing textures until every
+image is re-touched; re-registering user native textures has no recipe; full
+recreation is impossible as an eframe API (apps hold `egui::Context` by value). Full
+recreate remains an app-level technique (the workaround app does exactly this), not
+an upstream deliverable. App-driven preference changes at runtime stay out of v1
+scope — they reduce to the same re-decide path as a monitor change (§7) if demand
+appears.
 
-Why a policy enum names targets instead of exposing `format` + `color_space` knobs:
-naive pairing lands in #7484 territory (double gamma, black screens). `Auto` means
-"probe; best available (the extended pair when fp16+extended is supported, else
-`DisplayP3` where supported), else SDR" — it is *not* wgpu's `SurfaceColorSpace::Auto`,
-which resolves fp16 → `ExtendedSrgbLinear`; the doc carries that disclaimer. Whether
-`Auto` may select plain `DisplayP3` (turning the chrome shift on for the endgame
-default) is deliberately open (§11). Unit variants keep the derive set cheap. Defaults:
-`Off` is the upstream rollout default; `Auto` is the endgame default once the fp16
-testing infrastructure exists; our fork opts in unconditionally.
+**Capability requests, not color-space names.** Each variant names a capability the
+app opts into; the decider maps it to a concrete surface pairing per platform. Two
+independent bools (`want_hdr`, `want_wide_gamut`) were rejected: the same four
+combinations exist either way, and only the enum binds each combination to one
+documented fallback policy instead of leaving the join semantics implicit. Every
+variant is all-or-nothing on its own definition — ungrantable means plain SDR with a
+`FellBack` status, never a partial grant. An app that prioritizes brightness picks
+`Hdr`; saturation, `WideGamut`; needs both together, `WideGamutHdr`. Naming primaries
+in requests was rejected for the same reason: the choice can't bind (no platform
+reports more than one in-contract wide space today), it would go stale the day a
+second appears, and primaries precision already lives where it's actionable — the
+content tags (§5).
+
+**The probe is primaries-blind.** Each variant's decider leg walks a priority-ordered
+pairing table and takes the first space the platform reports on a supported format:
+
+```rust
+// WideGamut leg (PR 1): non-extended spaces on u8 formats
+for cs in WIDE_GAMUT_ORDER {              // widest first — table data; +1 row per new primaries
+    for cap in &caps.format_capabilities {
+        if is_u8(cap.format) && cap.color_spaces.contains(cs) {
+            return Granted(cap.format, cs);
+        }
+    }
+}
+FellBack { NoPairedColorSpace }           // nothing wide reported
+```
+
+`Hdr` walks the extended-gamma table the same way; `WideGamutHdr` requires the combined
+pairing. Concrete primaries exist only in these table rows and the content-tag
+pairings — never in the request API (§5's rule). Today the walk has one entry on
+Metal and web (`DISPLAY_P3`) and none on DX12/GLES; a platform reporting BT.2020
+extends the table with zero API change. Unit variants keep the derive set cheap.
+Defaults: `Off` is the default and stays the default — HDR and wide gamut are opt-in,
+one line each. A default flip (`Off` → `Hdr`) is upstream's potential call
+post-adoption, explicitly not planned here: an fp16 swapchain doubles scanout
+bandwidth for every window, and imposing capability — however visually inert — on
+apps that never asked repeats the silent-decision class this design avoids. Our fork
+opts in unconditionally (an app-level choice).
 
 **Decider** — one public function, no projections:
 
 ```rust
-decide_surface_target(caps: &SurfaceCapabilities, pref: SurfaceColorSpacePreference)
-    -> Result<SurfaceTarget, WgpuError>
-// SurfaceTarget { format, color_space, status }
+decide_surface_target(caps: &SurfaceCapabilities, pref: SurfacePreference)
+    -> Result<(SurfaceTarget, SurfaceStatus), WgpuError>
+// SurfaceTarget { format, color_space }  ·  SurfaceStatus: granted or fell back
 ```
 
-The input must be `&SurfaceCapabilities`: wgpu 30 exposes HDR-capable formats only in
-`format_capabilities` with per-format color spaces — a `&[TextureFormat]` cannot see
-them. `decide_surface_target` is the single source of the decision; `RenderState` stores
-its three outputs and `configure_surface` reads the stored fields. Err domain:
-`NoSurfaceFormatsAvailable` only; unavailability of a color space is a *status*, never
-an error. Probe input = the first surface's capabilities (`RenderState::create` runs
-once); later viewports inherit the stored decision, and a viewport that cannot configure
-it fails as an uncaptured device error — documented behavior, not a fallback path.
-Headless (no surface): `Sdr { NoSurface }`.
+**Per-viewport decisioning.** The preference is app-level policy (create-time on
+`WgpuConfiguration`); the *decision* is per-viewport. The painter runs
+`decide_surface_target` against each viewport's own surface capabilities — at viewport
+creation, and again whenever the viewport's monitor changes — stores the resulting
+`(SurfaceTarget, SurfaceStatus)` in that viewport's state, and surfaces both through
+per-viewport `ViewportInfo` alongside `hdr_headroom` (§7). A monitor change that
+alters the capability re-configures that viewport's surface and swaps the pipeline;
+no renderer or context is ever recreated, so #7484's texture-loss trap is not on this
+path — by construction. The input must be `&SurfaceCapabilities`: wgpu 30 exposes
+HDR-capable formats only in `format_capabilities` with per-format color spaces — a
+`&[TextureFormat]` cannot see them. The `Off` leg delegates to the existing
+`preferred_framebuffer_format` (which stays public as the Off-leg implementation), so
+the default path is byte-identical to today's by construction — including its
+`formats.first()` fallback, which can return `Rgba16Float` on float-only surfaces;
+that behavior is inherited deliberately, never silently changed. Err domain:
+`NoSurfaceFormatsAvailable` only; unavailability of a capability is a *status*, never
+an error — and the worst case is an honest SDR viewport: the uncaptured-error/panic
+path of the one-target model is gone by construction. Headless (no surface):
+`FellBack { NoSurface }`.
 
-**Invariant tests:** `decide_surface_target` never returns an incoherent target
-(`(Rgba16Float, Auto)`, `(u8-format, ExtendedSrgb)`, or the double-grammar pair
-`(Bgra8UnormSrgb, DisplayP3)` — wgpu would accept that combo and it violates the
-one-grammar rule), over synthetic `format_capabilities` fixtures (Metal-like, DXGI-like,
-float-without-extended, empty); and the built `SurfaceConfiguration` is asserted
-coherent — `configure_surface` must set `color_space` explicitly, never leave `Auto`
-(wgpu's `get_default_config` seeds `Auto`).
+**Invariant tests (all GPU-free; run in CI on every platform).** `decide_surface_target`
+never returns an incoherent target
+(`(fp16 format, Auto)`, `(u8 format, extended space)`, or the double-grammar pair
+`(Bgra8UnormSrgb, DisplayP3)`). *Grammar* = whether the format applies a hardware sRGB
+decode (`*Srgb` view formats) or stores raw encoded values (`*Unorm` views); a surface
+must use exactly one — the flagship PR 1 pairing `Bgra8Unorm + DisplayP3` is
+raw-view + encoded and valid, while `Bgra8UnormSrgb + DisplayP3` would decode and then
+re-interpret, double-encoding. The enforcement point is a pure builder —
+`build_configuration(caps, target) -> SurfaceConfiguration`, no device, no surface —
+called by the per-viewport configure path, with a `debug_assert!` at the construction
+site: never `Auto` (wgpu's `get_default_config` seeds `Auto`, so the explicit set is
+load-bearing), coherent pair, matches the granted target. Tests run the builder
+directly over synthetic `format_capabilities` fixtures (Metal-like, DXGI-like,
+float-without-extended, empty): the `Off` leg returns exactly
+`preferred_framebuffer_format`'s choice on every fixture (equality test), every built
+configuration is coherent, and the pipeline-cache lookup resolves each granted format
+to the correct pipeline (one entry per format through PR 3).
 
-**Status** — `HdrStatus`, stored on `RenderState`, create-time-immutable, read by apps
-via the existing `frame.wgpu_render_state()`:
+**Status + target** — per-viewport, decided at viewport creation and on monitor
+change, surfaced to apps through `ViewportInfo` (next to `hdr_headroom`, §7); the
+shared `RenderState` keeps device/queue/renderer and the format-keyed pipeline cache:
 
 ```rust
-HdrStatus::Hdr { format: TextureFormat, color_space: SurfaceColorSpace }
-HdrStatus::Sdr { reason: SdrReason }
-// SdrReason: Disabled | NoPairedColorSpace { requested: SurfaceColorSpace } | NoSurface
+pub struct SurfaceTarget {
+    pub format: TextureFormat,
+    pub color_space: SurfaceColorSpace,
+}
+impl SurfaceTarget {
+    /// Can this surface display values above 1.0? (Derived — never stored.)
+    pub fn is_extended(&self) -> bool;
+}
+
+pub enum SurfaceStatus {
+    Granted,                                   // the preference was honored
+    FellBack { reason: FallbackReason },
+}
+
+pub enum FallbackReason {
+    NoPairedColorSpace { requested: SurfacePreference },  // self-describing bug reports
+    NoSurface,                                            // headless
+}
 ```
 
-`NoPairedColorSpace` carries the request so bug reports are self-describing and the enum
-never grows as pairings land. Headroom is a different quantity: live, per-surface — it
-is *not* on `RenderState` (§7).
+Two questions, two types: `surface_target` answers *what is configured*; `status`
+answers *was the request honored*. Every state is truthful — a granted u8 + `DisplayP3`
+pairing is `Granted` with `is_extended() == false` (wide gamut, SDR range), not a
+mislabel. `NoPairedColorSpace` carries the request so bug reports are self-describing.
+`Disabled` dropped: it existed only to shove `Off` into the old enum — Off is simply
+`Granted`. Headroom is a different quantity: live, per-surface — it is *not* on
+`RenderState` (§7).
 
 **Extended-gamma vs scRGB-linear.** Two shader-correct combinations exist: gamma-encoded
 values on an `ExtendedSrgb` surface, and linear values on an `ExtendedSrgbLinear`
@@ -166,13 +241,24 @@ u8 semantics; bit-exact on u8 targets, ≤½-code drift on fp16 targets where th
 quantized at store (the fp16 path is the more accurate side); (b) one texture grammar
 for u8 and float content; (c) `ExtendedSrgb` and `ExtendedDisplayP3` cover web —
 `ExtendedSrgbLinear` is native-only. The permanent cost, stated once: HDR-over-HDR
-compositing and filtering happen in gamma (50%-alpha white over black composites to
-linear 0.214, not 0.25), fixable only by a future linear-surface pairing. Egui's own
+compositing and filtering happen in gamma — 50%-alpha white over black composites to
+linear 0.214 instead of the photometric 0.5 — and the attenuation is baked into the
+stored values (§4), so a linear-surface pairing can display them linearly but cannot
+repair the compositing; that requires a content-contract change (photometric
+premultiply). Egui's own
 house style is gamma blending (`egui/src/lib.rs:147`).
 
-**Sizing:** PR 1 is ~300–450 lines including tests, `MANUAL_TESTING.md`, and the example
-— no shader changes, no `epaint` changes, no eframe changes. Re-measure against upstream
-`main` before drafting.
+**Pipelines.** A color-space change is a swapchain reconfigure — no pipeline impact;
+only the format bakes a render pipeline. Through PR 3 the ladder uses exactly two
+formats (`Bgra8Unorm`, `Rgba16Float`) and both take the same gamma-passthrough
+fragment path (the `OutputEncoding` split arrives with PR 4's scRGB leg), so the
+renderer's pipeline cache holds two entries per preference, keyed by format — the
+renderer's only change.
+
+**Sizing:** PR 1 is ~500–700 lines including tests, `MANUAL_TESTING.md`, and the
+example — no shader changes, no `epaint` changes; eframe changes are confined to the
+painter's per-viewport state; the renderer gains the format-keyed pipeline cache.
+Re-measure against upstream `main` before drafting.
 
 **Migration:** if #8703 merges first, PR 1 becomes an evolution PR against freshly
 merged API (field relocation off `SurfaceConfig`, encoding supersession for their
@@ -181,27 +267,34 @@ adopters, `capture.rs` conflicts). That cost is accepted; see §10.
 ## 3. Output encoding and dithering
 
 `Renderer::new` picks its fragment entry point by `output_color_format.is_srgb()` — a
-derivation that exists but is color-space-blind. PR 1 replaces the sniff with an
+derivation that exists but is color-space-blind. **PR 4** replaces the sniff with an
 explicit, derived selection (never stored — storing a derivable value next to its inputs
-re-introduces drift):
+re-introduces drift); PR 1 ships none of this — with no color-space input to
+`RendererOptions`, its surfaces keep today's `is_srgb()` path, which the table below
+shows is already correct for every PR 1/PR 3 pairing:
 
 ```rust
 enum OutputEncoding { GammaEncoded, Linear }
 // OutputEncoding::of(format, color_space) — total function
 ```
 
-Table: u8 formats → `GammaEncoded`; u8 + `DisplayP3` → `GammaEncoded`; fp16 +
-`ExtendedSrgb` → `GammaEncoded`; fp16 + `ExtendedDisplayP3` → `GammaEncoded`; fp16 +
-`ExtendedSrgbLinear` → `Linear`. Consequences: PR 1 needs no encoding change at all
+Table: u8 formats → `GammaEncoded`; u8 + `DisplayP3` → `GammaEncoded`; fp16 with any
+non-extended space (`Srgb` included — legal in wgpu, so the table must cover it) →
+`GammaEncoded`; fp16 + `ExtendedSrgb` → `GammaEncoded`; fp16 + `ExtendedDisplayP3` →
+`GammaEncoded`; fp16 + `ExtendedSrgbLinear` → `Linear`. Consequences: PR 1 needs no encoding change at all
 (fp16 + `ExtendedSrgb` → gamma passthrough is exactly today's `is_srgb()`-false path);
 the color-space input reaches `RendererOptions` only in PR 4, when the scRGB pairing
-needs the linear path. The invariant tests cover the whole table.
+needs the linear path. The table's totality (every legal pairing maps to an encoding)
+is unit-tested when `of` lands in PR 4 — PR 1/PR 3 exercise only the passthrough row
+implicitly.
 
 **Dithering** defaults to on and its doc admits it assumes an sRGB output. On fp16
 there is no 8-bit quantizer to hide the noise in, and near black the ±1/255 encoded
 noise maps to ×12.92 relative-luminance grain — actively harmful, not "meaningless".
 On float targets dithering is forced off regardless of the knob (which stays untouched
-for 8-bit targets); the doc updates to "assumes an 8-bit sRGB target".
+for 8-bit targets); the doc updates to "assumes an 8-bit sRGB target". Plumbing note:
+the dither seed derives without format input at the renderer site today — PR 3 threads
+the target format through so the float force-off is structural, not a knob value.
 
 ## 4. Content model: the float color contract (PR 2)
 
@@ -212,7 +305,9 @@ vertex and `ImageData` holds only `ColorImage` — nothing in the paint path can
 **Contract.** A float color/texel in egui's HDR path is **gamma-encoded** in the
 buffer's declared `primaries`, **premultiplied in the encoded components**
 (`stored = a × enc(L)` — exactly Color32's convention, not `enc(a·L)`), **unclamped
-above 1.0**, **odd-symmetric for negatives**; 1.0 = SDR reference white. Linear
+above 1.0**, **odd-symmetric for negatives** — the same extension convention as IEC
+61966-2-1's extended range and CSS Color 4; 1.0 = SDR reference white (§7 keeps this
+true on Windows scRGB by rescaling to the display's SDR white). Linear
 (`ecolor::Rgba`) stays the app-side math space, converted at the boundary.
 
 - **Negative extension:** odd-symmetric everywhere. ecolor's Rust functions comply;
@@ -220,25 +315,36 @@ above 1.0**, **odd-symmetric for negatives**; 1.0 = SDR reference white. Linear
   evaluate `pow(negative, …)` (WGSL-undefined, NaN-prone) in a discarded lane. PR 2
   ships the `sign(x)·f(|x|)` fix before any negative-capable float content, plus a
   CPU↔GPU round-trip test with negative inputs.
-- **Premultiply cost:** encoded-space premultiply attenuates HDR translucency by
-  `a^2.4` — 50% alpha on L=4 ≈ −2.4 stops vs a photometric composite. That is the price
-  of encoded-space blending (the alternative overshoots over non-black destinations);
-  photometric alpha work belongs to the future linear-surface pairing. Forcing:
-  continuity with Color32's convention + the compositor's `PreMultiplied` contract over
-  stored values — the blend itself is convention-agnostic. Contract test: swatch at
-  a=0.5, L=4 composites per this rule.
+- **Premultiply cost:** encoded-space premultiply attenuates HDR translucency —
+  50% alpha on L=4 displays linear 0.81 instead of the photometric 2.0 (−1.3 stops;
+  the a^2.4 ≈ −2.4-stops figure is attenuation vs the *unattenuated* value, a
+  different basis). That is the price of encoded-space blending (the alternative
+  overshoots over non-black destinations). It is also baked into *storage*: the
+  attenuation lives in the stored values, so a future linear-surface pairing can
+  display them linearly but cannot recover the unattenuated product — repairing it is
+  a content-contract change (photometric premultiply), not a surface change. Forcing:
+  continuity with Color32's convention; the compositor's `PreMultiplied` behavior for
+  >1.0 content is a named manual experiment (§9), not load-bearing here — the blend
+  itself is convention-agnostic. Contract test: swatch at a=0.5, L=4 composites per
+  this rule.
 - **Filtering/blending occur in gamma (stored space)** — hardware bilinear on
   non-sRGB float formats has no decode; inherited from the u8 path. A linear-surface
-  pairing changes filtering semantics too.
+  pairing changes filtering semantics too. And wgpu exposes no mipmap generation, so
+  heavily minified textures shimmer at fit-to-window sizes — a documented limitation,
+  not a v1 work item.
 - **Multiply cost:** gamma-space multiplies are formula-identical to today's
   `in.color × tex` path (no regression), but branch-crossing: products whose decoded
   value crosses the encode knee take the wrong branch's scale — in-toe products compose
   to exactly `12.92·ab` (12.9× off), mid-tones ±1.5%, dark factors far worse. PQ ingest
   avoids this by decoding to linear first (§7).
-- **Precision:** linear f16 storage is ~2.4× finer in relative luminance terms (≤0.098%
-  vs up to ~0.234% for gamma, from the 2.4 decode slope) and its subnormal floor
-  (~4.6×10⁻⁹) is 12.9× darker than gamma's (~4.7×10⁻⁶). Both are far below the ~1%
-  Weber JND; the decision rests on continuity, not precision.
+- **Precision:** three regions. In the power region (above the toe break), gamma
+  storage is ~2.4× coarser in relative luminance (≈0.12% vs ≈0.05% step — both far
+  below the ~1% Weber JND). In the deep toe the roles reverse: gamma's subnormal
+  onset sits 12.9× deeper in linear terms (≈4.7×10⁻⁶ vs 6.1×10⁻⁵), where linear's
+  steps degrade past ~1.2% while gamma holds ≈0.1%. Absolute floors: gamma encodes
+  down to linear ≈4.6×10⁻⁹ (via the toe's 12.92 slope), 12.9× below linear's
+  ≈6.0×10⁻⁸. Neither difference is perceptible on content; the decision rests on
+  continuity — with the honest note that each curve wins in its own region.
 
 **Type shape.** `ImageData::Float(Arc<FloatImage>)` with
 `FloatImage { primaries: Primaries, pixels: Vec<[f16; 4]> }`, where
@@ -246,28 +352,54 @@ above 1.0**, **odd-symmetric for negatives**; 1.0 = SDR reference white. Linear
 pairing row + conversion matrix, in one PR). Pixels are gamma-encoded, premultiplied in
 the encoded components; RAM format is f16 — 1:1 with the `Rgba16Float` upload
 (zero-copy via `bytemuck::cast_slice`), half the memory of f32 (a 4K frame: 66 MB vs
-133 MB), zero quantization loss vs display. Helpers (`new`, `filled`, `from_rgba_*`,
+133 MB), zero quantization loss vs display. Upload mechanics: egui-wgpu's
+`bytes_per_row` is hardcoded `4 * width` today and becomes f16-aware (`8 * width`,
+padded to wgpu's 256-byte alignment); and wgpu's `write_texture` stages through a
+buffer whenever row pitch misses that alignment — "zero-copy" is the CPU-side map, the
+GPU copy is a real blit (fast, but budget for it in the exposure/re-upload path).
+Helpers (`new`, `filled`, `from_rgba_*`,
 lossy `from_color_image`) take f32 at the edges. Consequences: `Eq` drops from
 `ImageData`/`ImageDelta`/`TexturesDelta` (f32 — matching `Rgba`'s PartialEq-only
 precedent), the closed serde enum extends (changelog note), and the sketch's field
 shape must be re-verified against upstream `main` — #8714 privatized `ColorImage` and
 renamed `size`→`resolution`, so the constructor-based house style applies.
 
-**Upload pairing.** `update_texture` uploads paired tags (`Rgba16Float` for
-`DisplayP3`-tagged content on a DisplayP3 surface, `Srgb`-tagged on `ExtendedSrgb`) and
-rejects unpaired tags loudly. The mismatch rule is strict by design: the most-trafficked
-mismatch (every implicitly-Srgb-tagged `ColorImage` on a P3 policy) must fail visibly,
-not shift colors — conversion is the opting-in app's job in v1 (§5).
+**Upload pairing.** Content carries a `Primaries` tag — `Srgb` is the implicit default
+(every existing `ColorImage`) — and a pairing table decides what each upload does on
+each granted surface:
+
+| Content tag | Granted surface space | Behavior |
+|---|---|---|
+| `Srgb` (implicit or explicit) | sRGB space (any format) | native |
+| `Srgb` (implicit) | `DisplayP3` | native upload — shifts like the chrome (§5) |
+| `DisplayP3` (explicit) | `DisplayP3` (± extended) | native |
+| `DisplayP3` (explicit) | sRGB / extended-sRGB / scRGB | **loud reject** |
+| BT.2020 (future) | anything non-BT.2020 | loud reject until conversion matrices land |
+
+The asymmetry is deliberate and follows the chrome: untagged sRGB bytes on a P3 surface
+shift — the same interpretation every vertex color on that surface gets — so an
+opting-in app's UI and images move together, and the §5 re-encode (≤0.21 ΔE) is the
+escape hatch for either. Loud rejection is reserved for an explicit claim the surface
+cannot honor: P3-tagged content on a surface without P3 is gamut-clipped, and no
+silent guess is honest there. Mechanically, rejection reuses egui's existing
+missing-texture convention: the upload is not performed, a warning logs once per
+texture id, and the standard placeholder renders — no panic, no `update_texture`
+signature change (a `Result`-returning upload is future work if demand appears).
 
 **`ui.image()` tint:** the existing `Color32 × texel` multiply just works.
 
 ## 5. Wide gamut: the primaries-generic mechanism
 
 **Decision:** wide gamut is in scope, generically. The mechanism: content declares its
-primaries; a pairing table decides which surface color space displays each tag
-natively; unpaired tags reject loudly. **Design rule (binding): no specific color space
+primaries; a pairing table decides what each (tag, surface) combination does — explicit
+tags the surface cannot honor reject loudly (§4), while untagged content follows the
+surface's interpretation, the same shift the chrome gets. **Design rule (binding): no
+specific color space
 is privileged — nothing in the architecture may name or branch on a specific primaries.
-** Display P3 is the first wide-gamut pairing, chosen because Metal and web expose it —
+** The rule is structural, not aspirational: the request API names capabilities, not
+primaries (§2); the decider's probe is a table walk over reported capabilities; and
+concrete primaries live only in pairing-table rows. Display P3 is the first wide-gamut
+pairing, chosen because Metal and web expose it —
 not by ideology. "Color space" = primaries × transfer: egui tags primaries and fixes
 storage transfer to gamma; PQ/HLG decode app-side (§7). A new primaries arrives as
 enum variant + pairing row + conversion matrix, in one PR.
@@ -275,15 +407,22 @@ enum variant + pairing row + conversion matrix, in one PR.
 **Platform exposure (verified in wgpu 30):** the non-extended `DisplayP3` space is
 reported for u8 surfaces on Metal and web (sRGB transfer, P3 primaries, SDR clamp,
 `is_hdr() == false`) — PR 1's pairing, no fp16 required. The extended pair
-(`EXTENDED_SRGB`, `EXTENDED_DISPLAY_P3`) is fp16-gated on Metal and web (PR 3).
+(`EXTENDED_SRGB`, `EXTENDED_DISPLAY_P3`) is fp16-gated on Metal and web (PR 3), with a
+carried caveat: wgpu-hal's Metal backend has an in-code TODO that extended-P3 caps
+"need protection … like the BT.2100 cases" (`wgpu-hal metal/surface.rs:299`), so the
+pairing is probe-gated, never assumed — and a failed configure follows the
+multi-viewport failure policy (§7), never a silent sRGB reinterpretation.
 DX12 reports none of these — only `EXTENDED_SRGB_LINEAR` (scRGB) and an out-of-contract
 HDR10 combination (`Rgb10a2Unorm` + `BT2100_PQ`); Vulkan is driver-dependent via
 `VK_EXT_swapchain_colorspace`; GLES reports sRGB only.
 
 **Opt-in chrome shift:** a P3-referred surface reinterprets sRGB-referred UI bytes.
-Quantified (CIEDE2000): neutrals shift exactly 0.0 (shared D65 white); saturated
-accents 1.4–6.2 (chroma +8–36%); re-encoding the u8 style palette into P3-referred
-values is near-lossless (≤0.19). So the opting-in app converts its palette app-side in
+Quantified over egui 0.36.2's default style palette (hyperlink, warn, error,
+selection-stroke, accent-fill in both themes; CIEDE2000, D65, no chromatic
+adaptation): neutrals shift exactly 0.0 (shared D65 white); saturated accents
+2.2–6.8 (chroma +8–36%); re-encoding the u8 palette into P3-referred values is
+near-lossless (≤0.21, u8 quantization). So the opting-in app converts its palette
+app-side in
 v1; egui-side chrome conversion is a follow-up if demand appears. Per-texture content
 conversion is the opting-in app's escape hatch for existing sRGB-referred images.
 
@@ -318,17 +457,46 @@ app — upstream will resist; §11 records the pre-E type decisions.
 
 ## 7. Lifecycle: switching, transitions, headroom
 
-**Runtime switching: non-goal.** See §2 — the full rationale lives there. A surface
-never needs to change for a *display* change: the fp16+extended-sRGB configuration is
-display-agnostic, valid on SDR and HDR panels alike. SDR content renders identically
-(everything in [0,1]); values above 1.0 clip at the panel's white; the only quantity
-that changes is `tone_map_headroom()` — on an SDR display it returns `Some(1.0)` (Apple
-reports 1.0 on non-EDR screens, and the coarse `high_dynamic_range == Some(false)` guard
-pins it), verified in `wgpu-types surface.rs:732-757`. It is polled per frame on the
-main thread (Metal reads `NSScreen`; off-thread returns `None` with a warn-once), and
-EDR headroom ramps over ~1–2 s, so idle repaints run at 250 ms. `Some(1.0)` is a valid
-"no headroom" steady state; `None` means *unknown* — the status design keeps them
-distinct.
+**Runtime switching.** Three distinct mechanisms, decided separately:
+
+- **Monitor-driven re-decide: shipped (PR 1).** A viewport moved to a different
+  monitor re-runs the decider against that monitor's capabilities and reconfigures —
+  capability follows the display; per-viewport `SurfaceStatus` and `hdr_headroom`
+  update with it. No renderer or context recreation is involved (§2), so #7484's
+  partial-recreate trap is not on this path.
+- **App-driven preference changes: non-goal in v1.** The preference is create-time
+  app policy. The per-viewport machinery makes runtime preference mutation the same
+  code path as a monitor change; demand-gated future work.
+- **Renderer/context recreation: non-goal (unchanged).** Renderer-only recreation
+  loses `Renderer.textures` (#7484, §2); full recreation is impossible as an eframe
+  API (apps hold `egui::Context` by value). Full recreate remains an app-level
+  technique (the workaround app does exactly this).
+
+A surface itself never needs to change for a *display* change — the fp16+extended
+configuration is display-agnostic, valid on SDR and HDR panels alike. SDR content
+renders identically (everything in [0,1]); values above 1.0 clip at the panel's white;
+the only quantity that changes with the display is `tone_map_headroom()` — on an SDR
+display it returns `Some(1.0)` (Apple reports 1.0 on non-EDR screens, and the coarse
+`high_dynamic_range == Some(false)` guard pins it), verified in `wgpu-types
+surface.rs:732-757`. It is polled per frame on the main thread (Metal reads
+`NSScreen`; off-thread returns `None` with a warn-once), and EDR headroom ramps over
+~1–2 s (the repaint cadence is the adaptive recipe below). `Some(1.0)` is a valid "no
+headroom" steady
+state; `None` means *unknown* — the status design keeps them distinct.
+
+**Exposure (decided; ships in PR 3).** Headroom is a per-viewport quantity on a
+per-viewport surface, so it cannot live on the shared `RenderState` — structurally, not
+by preference. The eframe wgpu painter, which owns each viewport's surface, polls
+`tone_map_headroom()` per frame and writes it into per-viewport
+`ViewportInfo.hdr_headroom` (Option<f32>, multiplier — the universal currency). It
+ships in PR 3, alongside the first capability that can consume it: extended-range
+rendering without headroom is blind (the same 2.0 is clipped white on an SDR display
+and comfortable at headroom 8.0). Until PR 3, apps holding their own surface poll
+out-of-band — the workaround-app pattern. Repaint reactivity is painter-owned and
+adaptive: while headroom is moving (`|Δ| > ε` between frames) or unsettled, the painter
+schedules `request_repaint_after(100 ms)` — ~10 fps for the 1–2 s a ramp lasts; once
+steady (stable value or `Some(1.0)` on SDR), it stops scheduling and egui rests in
+`ControlFlow::Wait` at zero cost. Apps wanting faster can repaint themselves.
 
 **Capture:** the `capture` feature matches only Rgba8 surfaces and silently produces
 nothing on fp16 (logs + returns). The fp16 branch is a PR 3 deliverable (§8), sharing
@@ -349,14 +517,45 @@ linear scRGB — the PR 4 pairing exists because the platform dictates the space
 (platform-divergent blend grammar is accepted; a linear intermediate render pass is the
 cross-platform escape hatch if egui ever wants uniform photometric blending).
 
-**PQ ingest chain** (app-implemented; egui ships none of it): decode `PQ⁻¹(E')` per
-BT.2100 in BT.2020-referred linear light (never the sRGB inverse — ≈2.12× brightness
-error at reference white); normalize by the 203-nit anchor (ITU-R BT.2408 — the current
-convention; the older 100-nit figure renders PQ ~2× too bright; on Windows use
-`sdr_white_nits` directly); convert primaries via the 3×3 matrix *in linear light*
-(emits negative components — the odd-symmetric contract covers them); apply the paired
-primaries' gamma encode. Never re-apply a decode (double-encode). HLG: out of scope
-until a transfer-carrying tag exists.
+**Windows scRGB anchor (PR 4).** scRGB is scene-referred: `1.0` = 80 nits, fixed — the
+sRGB standard's reference white (IEC 61966-2-1) — unlike macOS EDR's display-referred
+`1.0` (the display's current SDR white, moving with brightness). Windows' SDR-content
+slider does not touch Advanced-Color output at all. egui therefore auto-scales
+scRGB-surface output by `sdr_white_nits / 80` (per-frame uniform on the linear path;
+`DisplayLuminance.sdr_white_nits` tracks the user's slider), so the §4 contract —
+1.0 = SDR reference white — holds identically on both platforms and chrome matches
+surrounding SDR apps. Apps that want absolute nits divide by `sdr_white_nits`
+themselves. The three anchors in play, one table: **80 nits** (scRGB/sRGB standard,
+Windows) · **203 nits** (BT.2408, PQ ingest below) · **display-relative** (macOS EDR;
+the Windows slider).
+
+**Windows wide gamut (PR 4).** scRGB's sRGB primaries are basis vectors, not a
+boundary: signed values make the space gamut-unbounded. DWM's canonical composition
+space carries values outside [0,1] (Microsoft, Advanced Color docs); clipping happens
+only at the display kernel, against the physical panel's gamut. The same
+`(Rgba16Float, ExtendedSrgbLinear)` pairing therefore delivers Windows HDR brightness
+**and** wide gamut: P3/BT.2020-referred content converts via the 3×3 matrix in linear
+light — emitting negatives, which the §4 odd-symmetric contract covers — and on
+Windows 11 22H2+ the same path reaches provisioned SDR wide-gamut displays. Two
+consequences: the `WideGamut` variant (u8 + non-extended space) still falls back on
+DX12 — Windows wide gamut arrives only through this fp16-linear pairing; and the
+`Rgb10a2Unorm + BT2100_PQ` HDR10 pairing demotes to optional future work (its value
+would be HDR-metadata signaling, which wgpu 30 never writes, at the cost of a third
+content contract: PQ transfer + 10-bit unorm).
+
+**PQ/HLG ingest — future work; nothing in v1 consumes BT.2020.** BT.2100 PQ content
+decodes to BT.2020-referred linear light, and v1's content model has no BT.2020
+pairing — so the ingest chain defers as a whole to the transfer-carrying-tags work
+(§ Open questions). The chain's shape, recorded so the future implementer doesn't
+re-derive it: decode `PQ⁻¹(E')` per BT.2100 in BT.2020-referred linear light — never
+the sRGB inverse (PQ code 0.58 — reference white — decodes to linear 0.30 instead of
+1.0 under the 203-nit anchor, ≈3.4× too dark; keeping the 10k-nit PQ output scale
+instead makes it ≈14.6× too bright — the EOTFs are not interchangeable); normalize by
+the 203-nit anchor (ITU-R BT.2408 — the current convention; the older 100-nit figure
+renders PQ ~2× too bright; on Windows use `sdr_white_nits` directly); convert
+primaries via the 3×3 matrix *in linear light* (emits negative components — the §4
+odd-symmetric contract covers them); apply the paired primaries' gamma encode. Never
+re-apply a decode (double-encode).
 
 ## 8. Platform matrix and testing
 
@@ -371,7 +570,7 @@ probe-gated SDR. iOS: same EDR layer model as macOS in principle — compile-onl
 headroom unpopulated by wgpu (upstream TODO).
 
 **Manual protocol.** `MANUAL_TESTING.md` ships in PR 1: per-platform steps,
-deterministic test patterns, expected readings (`HdrStatus`, headroom on an EDR iMac /
+deterministic test patterns, expected readings (`SurfaceStatus`, headroom on an EDR iMac /
 Pro Display XDR / an SDR panel), each marked "CI cannot validate this". "Tested" =
 "this checklist passes". The upstreamed test app is the protocol's instrument:
 snapshot-free (deterministic pattern menu + live status/headroom readout),
@@ -381,7 +580,14 @@ compile-checked by CI.
 kittest prefers CPU adapters (lavapipe) where available, so dev machines and CI exercise
 different adapters and fp16 tolerances must absorb the drift. A windowed CI smoke test
 (macos runners have a window server) verifies *integration*: real window, surface
-configured with the policy, no device errors, sane `HdrStatus`. The *payoff* —
+configured with the policy, no device errors, sane `SurfaceStatus`. The smoke is a
+plain `eframe` example binary (`examples/hdr_smoke.rs`) — example bins run on the main
+thread by construction (kittest's eframe-spawning helper is deprecated/asserted-against
+and is not involved), and example dev-dependencies keep the crates' dep trees clean.
+It runs `run_native` with `WideGamut`, asserts on first frame that `SurfaceStatus` is
+coherent — `Granted` or `FellBack`, never a panic — draws one label, exits after a few
+frames; CI fails on nonzero exit. PR 3 extends the same example with the headroom-field
+assertion. The *payoff* —
 compositor tone mapping, panel gamut — is manual-only.
 
 **Test matrix** (mapped to existing conventions: ecolor 14 inline tests, epaint 96,
@@ -489,29 +695,23 @@ render pass (§7) is the alternative for photometric blending without tier E.
 
 ## Open questions
 
-1. **Headroom exposure before the per-viewport pass-through lands:** `tone_map_headroom()`
-   on `RenderState` (distilled), the whole `DisplayHdrInfo`, or nothing? — the only
-   undecided decision in this plan; must be picked before PR 1.
-2. Does `Auto` ever select plain `DisplayP3` (turning the chrome shift on for the
-   endgame default), or is `Auto` restricted to the extended pair?
-3. PR 4: does `decide_surface_target` gain a per-platform DX12 fallback
-   (`ExtendedSrgb` → `ExtendedSrgbLinear`)?
-4. Web/wasm wiring — deferred for scope (eframe web plumbing + fp16-canvas request).
-5. Future work, framed: transfer-carrying tags (PQ/HLG), OkLCh picker geometry,
-   tier E vertex format, per-texture content conversion.
+1. Web/wasm wiring — deferred for scope (eframe web plumbing + fp16-canvas request).
+2. Future work, framed: transfer-carrying tags (PQ/HLG), OkLCh picker geometry,
+   tier E vertex format, per-texture content conversion, runtime preference changes
+   (the same re-decide path as a monitor change).
 
 ## Appendix A — source anchors
 
 Anchors marked ✓ were re-verified against the working tree at HEAD (`hdr_enablement`,
-2026-10-26); the rest are 0.36.2-era and get re-swept by the entry-4 protocol before
-implementation.
+2026-10-26); the rest are 0.36.2-era and get re-swept by the re-anchor protocol (§10)
+before implementation.
 
 - ✓ `egui-wgpu/src/lib.rs`: no-surface stub `vec![Rgba8Unorm]` (:267);
   `WgpuError` (:46); `SurfaceConfig` runtime-mutable doc (:67);
   `preferred_framebuffer_format` Result-returning (:421); create-once guard
   `render_state.is_none()` (winit.rs:258); no-derivation configure threading.
 - ✓ `egui-wgpu/src/renderer.rs`: dithering default true (:230); blend
-  `One/OneMinusSrcAlpha` (:415-428); texture creation hardcoded Rgba8Unorm;
+  `One/OneMinusSrcAlpha` (:443-455); texture creation hardcoded Rgba8Unorm;
   `capture.rs` silent `_ =>` return (:196-212).
 - ✓ `egui-wgpu/src/egui.wgsl`: gamma fns route negatives to the linear branch (:52-57);
   "dithering is performed on the gamma encoded values" (:180); entry points unclamped
@@ -530,12 +730,14 @@ implementation.
   (:732-757); `DisplayGamut` non_exhaustive/unordered (:696-703); DX12 mapping
   (hal dx12/mod.rs:1455-1466); GLES SRGB-only (hal gles/adapter.rs:1347);
   Vulkan colorspace extension (hal vulkan/instance.rs:280-282); web P3 (webgpu.rs).
-- 0.36.2-era (re-sweep before implementation): §7.4 status payload field list,
-  §7.2 pairing-table enforcement points, §7.5 calibration field list.
+- 0.36.2-era (re-sweep before implementation): status payload field list (§2),
+  pairing-table enforcement points (§4/§5), calibration field list (§7).
 
 ## Appendix B — design history
 
-This plan went through two independent review rounds on 2025-10-25 (~60 decisions:
-six specialist reviewers per round, all findings decided and applied). The complete
-decision log with per-decision rationale lives in `reviews/00-consolidated.md`;
-raw reviewer documents are in git history (commits `01f0735aa`, `4c553b2f3`).
+This plan went through two independent review rounds on 2026-10-25 and a third
+user-walked round on 2026-10-26 (~90 decisions: six specialist reviewers per round,
+every finding decided and applied). The complete decision logs with per-decision
+rationale live in `reviews/00-consolidated.md` and `reviews2/00-consolidated.md`;
+raw reviewer documents are in git history (commits `01f0735aa`, `1f3949f99`,
+`14cb87899`).
