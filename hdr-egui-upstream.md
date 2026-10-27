@@ -31,7 +31,7 @@ gamut, diagnostics) that brightness plugs into.
 
 | PR | Ships | Consumer | Tests |
 |---|---|---|---|
-| **1** | Wide-gamut surface: `SurfacePreference {Off, WideGamut}`, per-viewport `decide_surface_target` (re-run on monitor change), format-keyed pipeline cache, per-viewport `SurfaceStatus`; callback demo with out-of-sRGB saturation | any eframe app opting in | decider property tests, pipeline-cache test, u8 snapshots, windowed smoke |
+| **1** | Wide-gamut surface: `SurfacePreference {Off, WideGamut}`, per-viewport `decide_surface_target` (re-run on monitor change), format-keyed pipeline cache, per-viewport `SurfaceStatus`; callback demo with out-of-sRGB saturation | any eframe app opting in — **landed on the fork** (`hdr-pr1-wide-gamut-surface`, 2026-10-27) | decider property tests, pipeline-cache test, u8 snapshots, windowed smoke |
 | **2a** | WGSL negative fix (`sign(x)·f(|x|)`) + ecolor contract tests | correctness floor for all float content | negative CPU↔GPU round-trip, ecolor properties |
 | **2b** | Tagged float content: `Primaries`, `FloatImage`, `ImageData::Float`, upload pairing, `ui.image()` float display | HDR/wide-gamut images via `ui.image()` | upload roundtrip, ecolor properties, snapshots |
 | **3** | HDR extended range: extended pair on `Rgba16Float` (>1.0, EDR); `Hdr`, `WideGamutHdr`; headroom pass-through (`ViewportInfo.hdr_headroom`, painter-fed); dither off on fp16 | brightness above SDR white, adaptive to live headroom | fp16 readback numeric tests, negative fp16 GPU round-trip (reusing 2a's vectors), capture branch, MSAA, windowed smoke asserts the headroom field |
@@ -245,7 +245,7 @@ pairing is `Granted` with `is_extended() == false` (wide gamut, SDR range), not 
 mislabel. `NoPairedColorSpace` carries the request so bug reports are self-describing.
 Off is simply
 `Granted`. Headroom is a different quantity: live, per-surface — it is *not* on
-`RenderState` (§7).
+`RenderState` (§7). **As implemented (PR 1, fork):** the wgpu types can't cross the dependency boundary (egui-wgpu depends on egui), so `ViewportInfo` carries a wgpu-free mirror — `surface_status: Option<egui::SurfaceStatus>` + `surface_target: Option<String>`, backed by mirror enums (`egui::SurfaceStatus`/`FallbackReason`) documented as the payload; egui-wgpu converts via `From`, dropping the rich `requested` payload app-side (the requesting app knows its own preference). The structured decision is *not* app-reachable in PR 1 — the painter accessor lives below eframe — so consumers needing the granted space parse the diagnostics string; the demo does exactly this. Structured app-side access is demand-gated (§5).
 
 **Extended-gamma vs scRGB-linear.** Two shader-correct combinations exist: gamma-encoded
 values on an `ExtendedSrgb` surface, and linear values on an `ExtendedSrgbLinear`
@@ -267,7 +267,7 @@ only the format bakes a render pipeline. Through PR 3 the ladder uses exactly tw
 formats (`Bgra8Unorm`, `Rgba16Float`) and both take the same gamma-passthrough
 fragment path (the `OutputEncoding` split arrives with PR 4's scRGB leg), so the
 renderer's pipeline cache holds two entries per preference, keyed by format — the
-renderer's only change.
+renderer's only change. **As implemented (PR 1, fork):** the change grew beyond the renderer — `Renderer::new` lost its format parameter, `render`/`update_buffers` and `CallbackTrait::{prepare, paint}` now take the actual per-viewport target format, and `RenderState::target_format` was removed (a shared format cannot answer per-viewport truth; the capture path reads the per-viewport target). These are breaking public-API changes the upstream PR must negotiate — itemized here so the draft doesn't inherit this paragraph's "renderer's only change" understatement.
 
 **Sizing:** PR 1 is ~500–700 lines including tests, `MANUAL_TESTING.md`, and the
 example — no shader changes, no `epaint` changes; eframe changes are confined to the
@@ -430,7 +430,7 @@ reported for u8 surfaces on Metal and web (sRGB transfer, P3 primaries, SDR clam
 carried caveat: wgpu-hal's Metal backend has an in-code TODO that extended-P3 caps
 "need protection … like the BT.2100 cases" (`wgpu-hal metal/surface.rs:299`), so the
 pairing is probe-gated, never assumed — and a failed configure follows the
-multi-viewport failure policy (§7), never a silent sRGB reinterpretation.
+multi-viewport failure policy (§7), never a silent sRGB reinterpretation. As implemented (PR 1, fork): statically verified in wgpu-hal 30.0.1 that the *non-extended* `DisplayP3` mapping is unconditional — `metal/surface.rs:307-327` maps `DisplayP3 → kCGColorSpaceDisplayP3` and calls `setColorspace` on every configure; the :299 TODO gates only the extended variant. The granted pairing is therefore applied to the `CAMetalLayer`, not merely reported.
 DX12 reports none of these — only `ExtendedSrgbLinear` (scRGB) and an out-of-contract
 HDR10 combination (`Rgb10a2Unorm` + `BT2100_PQ`); Vulkan is driver-dependent via
 `VK_EXT_swapchain_colorspace`; GLES reports sRGB only.
@@ -450,7 +450,7 @@ egui-side per-texture conversion is demand-gated future work (below).
 **Demand-gated future work:** full primaries-tagged color API (`Rgba`-level tagging —
 the #2712 fix proper), pairwise primaries↔primaries conversion matrices (BT.2020→P3→
 sRGB as the canonical chain), egui-side per-texture content conversion, color-managed
-textures (OCIO-style).
+textures (OCIO-style), structured app-side per-viewport surface info (PR 1 exposes the decision as mirror status + diagnostics string; consumers needing the granted space must parse the string).
 
 ## 6. What PR 5 cannot do (and why float vertex colors stay deferred)
 
@@ -612,7 +612,10 @@ and is not involved), and example dev-dependencies keep the crates' dep trees cl
 It runs `run_native` with `WideGamut`, asserts on first frame that `SurfaceStatus` is
 coherent — `Granted` or `FellBack`, never a panic — draws one label, exits after a few
 frames; CI fails on nonzero exit. PR 3 extends the same example with the headroom-field
-assertion. The *payoff* —
+assertion. As implemented (PR 1, fork): the smoke exits via `process::exit(0)` after its
+assertions (short-lived windowed eframe apps hit the AppKit teardown abort, §9) and
+carries a 2-minute watchdog so a wedged loop fails CI in minutes, not at the job
+timeout; the step lives in the macOS GPU CI job (`rust.yml`). The *payoff* —
 compositor tone mapping, panel gamut — is manual-only.
 
 **Test matrix** (mapped to existing conventions: ecolor 14 inline tests, epaint 96,
@@ -682,6 +685,13 @@ u8 readback keeps working throughout — PR 1/PR 2a/2b are unaffected.
 - **Multi-viewport × capture** — one shared `Option<CaptureState>` across viewports with
   per-window sizes; needs a test independent of HDR.
 - **glow / wasm** — both stay compile-gated with the new types; no runtime claims.
+- **AppKit window-teardown abort (discovered in PR 1)** — short-lived windowed eframe
+  apps on macOS can abort (exit 134) *after* all work completes: AppKit's
+  `_NSTouchBarFinderObservation` KVO teardown throws `NSRangeException` during the
+  post-close display flush. Policy-independent (reproduces with `Off`), present on the
+  fork base, benign (teardown-only; 900+ healthy frames precede it). The smoke test
+  exits via `process::exit(0)` after its assertions to bypass it; PR 3's smoke
+  extension must keep that pattern.
 
 ## 10. Upstream strategy and process
 
@@ -787,3 +797,12 @@ before drafting PRs (§10).
   Metal-only coarse-bit semantics "HDR active, not merely capable" (hal
   metal/surface.rs:63-67, :128); iOS/tvOS/visionOS EDR TODO naming
   `UIScreen.currentEDRHeadroom` (hal metal/surface.rs:180-181).
+- ✓ **PR 1 realized anchors (fork `hdr-pr1-wide-gamut-surface`, HEAD `68b43576a`,
+  2026-10-27):** `egui-wgpu/src/surface_policy.rs` (policy types, decider, builder);
+  `egui-wgpu/src/winit.rs` (per-viewport decision in `SurfaceState`, monitor re-decide,
+  `surface_decision` accessor); `egui-wgpu/src/renderer.rs` (format-keyed lazy pipeline
+  cache, `target_format` threaded to callbacks); `egui/src/data/input/viewport_info.rs`
+  (mirror payload `SurfaceStatus`/`FallbackReason` + `ViewportInfo` fields);
+  `eframe/src/native/wgpu_integration.rs` (`inject_surface_decision`, both per-frame
+  sites); `crates/eframe/examples/{hdr_smoke,hdr_wide_gamut}.rs`; wgpu-hal 30.0.1
+  `metal/surface.rs:307-327` (non-extended DisplayP3 applied unconditionally).
