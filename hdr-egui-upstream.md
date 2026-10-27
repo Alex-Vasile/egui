@@ -436,7 +436,7 @@ HDR10 combination (`Rgb10a2Unorm` + `BT2100_PQ`); Vulkan is driver-dependent via
 `VK_EXT_swapchain_colorspace`; GLES reports sRGB only.
 
 **Opt-in chrome shift:** a P3-referred surface reinterprets sRGB-referred UI bytes.
-Quantified over egui 0.36.2's default style palette (hyperlink, warn, error,
+Quantified over egui's default style palette at HEAD `1856d58e0` (hyperlink, warn, error,
 selection-stroke, accent-fill in both themes; CIEDE2000, D65, no chromatic
 adaptation): neutrals shift exactly 0.0 (shared D65 white); saturated accents
 2.2–6.8 (chroma +8–36%); re-encoding the u8 palette into P3-referred values is
@@ -737,23 +737,26 @@ tier.
 
 ## Appendix A — source anchors
 
-Anchors marked ✓ were re-verified against the working tree at HEAD (`hdr_enablement`,
-2026-10-26); the rest are 0.36.2-era and get re-swept by the re-anchor protocol (§10)
-before implementation.
+All anchors below were re-verified against the working tree at HEAD `1856d58e0`
+(`hdr_enablement`, 2026-10-26). The fork base is upstream `main` at the 0.37.0-era
+workspace version — not the 0.36.2 tag (395 `crates/` files differ from it); wgpu
+paths cite the 30.0.1 registry (Cargo.lock pins wgpu 30.0.0; the 30.0.1 diffs were
+verified identical in an earlier sweep). Re-run this sweep against upstream `main`
+before drafting PRs (§10).
 
 - ✓ `egui-wgpu/src/lib.rs`: no-surface stub `vec![Rgba8Unorm]` (:267);
   `WgpuError` (:46); `SurfaceConfig` runtime-mutable doc (:67);
   `preferred_framebuffer_format` Result-returning (:421); create-once guard
   `render_state.is_none()` (winit.rs:258); no-derivation configure threading.
 - ✓ `egui-wgpu/src/renderer.rs`: dithering default true (:230); blend
-  `One/OneMinusSrcAlpha` (:443-455); texture creation hardcoded Rgba8Unorm;
-  `capture.rs` silent `_ =>` return (:196-212).
+  `One/OneMinusSrcAlpha` (:443-454); texture creation hardcoded Rgba8Unorm
+  (:713-724); `capture.rs` silent `_ =>` return (:204-209).
 - ✓ `egui-wgpu/src/egui.wgsl`: gamma fns route negatives to the linear branch (:52-57);
   "dithering is performed on the gamma encoded values" (:180); entry points unclamped
-  above 1.0.
-- ✓ `ecolor`: odd-symmetric gamma fns (lib.rs:155-180); Color32 gamma-space
-  premultiplied (color32.rs:8); `Rgba` PartialEq-only (rgba.rs:8-12); `Hsva` clamps
-  saturation and `rgb_from_hsv` emits `[0, v]` (hsva.rs:186-221).
+  above 1.0 (:174, 191).
+- ✓ `ecolor`: odd-symmetric gamma fns (lib.rs:160-180); Color32 gamma-space
+  premultiplied (color32.rs:8); `Rgba` PartialEq-only (rgba.rs:7-10); `Hsva` clamps
+  saturation and `rgb_from_hsv` emits `[0, v]` (hsva.rs:212-230).
 - ✓ `egui`: gamma-blend house style (lib.rs:147); `ViewportInfo`
   (data/input/viewport_info.rs:28); `Frame::wgpu_render_state()` (eframe epi.rs:943);
   `NativeOptions::dithering` default true (epi.rs:500); iOS CI job (rust.yml:201).
@@ -761,10 +764,26 @@ before implementation.
   surface headless; silent capture return; `with_render_options` exists
   (builder.rs:210); snapshot diff is u8-only.
 - ✓ wgpu 30.0.1 (types / core / hal / web): `Auto` resolution (core
-  device/surface_config.rs:24-40); `DisplayHeadroom` macOS-only (types surface.rs:644);
-  `tone_map_headroom` 4-step precedence (types surface.rs:732-757); `DisplayGamut`
+  device/surface_config.rs:24-40); `DisplayHeadroom` macOS-only (types
+  surface.rs:641-662, "Populated only on macOS" :646); `tone_map_headroom` 4-step
+  precedence (types surface.rs:732-757); `DisplayGamut`
   non_exhaustive/unordered (types surface.rs:696-703); DX12 mapping (hal
   dx12/mod.rs:1455-1466); GLES SRGB-only (hal gles/adapter.rs:1347); Vulkan colorspace
-  extension (hal vulkan/instance.rs:280-282); web P3 (web webgpu.rs).
-- 0.36.2-era (re-sweep before implementation): status payload field list (§2),
-  pairing-table enforcement points (§4/§5), calibration field list (§7).
+  extension (hal vulkan/instance.rs:280-282); web P3 (backend/webgpu.rs:4027-4034
+  gamut classification, 4245-4251 canvas color space).
+- ✓ Status payload site (§2): `ViewportInfo` fields
+  (data/input/viewport_info.rs:28-87) — the per-viewport struct that §2's
+  `surface_status` + `hdr_headroom` extend.
+- ✓ Pairing-table enforcement points (§4/§5): §4 upload gating lands at
+  `egui-wgpu/src/renderer.rs:637` (`update_texture`; hardcoded `bytes_per_row`
+  `4 * width` at :671); §5's surface-pairing probe reads wgpu's
+  `SurfaceCapabilities.formats` / `.format_capabilities` (wgpu-types
+  surface.rs:515-521).
+- ✓ Calibration field list (§7): `DisplayHdrInfo` (types surface.rs:587-612);
+  `DisplayLuminance` (types surface.rs:614-639, `sdr_white_nits` :638);
+  `DisplayHeadroom` (types surface.rs:641-662); `DisplayCoarseRange` (types
+  surface.rs:685-694, coarse-bit doc :686-690); `DisplayGamut` (types
+  surface.rs:696-703); `tone_map_headroom` precedence (types surface.rs:732-757);
+  Metal-only coarse-bit semantics "HDR active, not merely capable" (hal
+  metal/surface.rs:63-67, :128); iOS/tvOS/visionOS EDR TODO naming
+  `UIScreen.currentEDRHeadroom` (hal metal/surface.rs:180-181).
