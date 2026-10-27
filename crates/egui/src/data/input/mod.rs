@@ -31,5 +31,5 @@ pub use self::{
     raw_input::RawInput,
     safe_area_insets::SafeAreaInsets,
     touch::{TouchDeviceId, TouchId, TouchPhase},
-    viewport_info::{ViewportEvent, ViewportInfo},
+    viewport_info::{FallbackReason, SurfaceStatus, ViewportEvent, ViewportInfo},
 };

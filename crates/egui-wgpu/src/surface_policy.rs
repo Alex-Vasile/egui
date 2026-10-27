@@ -62,6 +62,16 @@ impl SurfaceTarget {
     }
 }
 
+impl core::fmt::Display for SurfaceTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Self {
+            format,
+            color_space,
+        } = self;
+        write!(f, "{format:?} + {color_space:?}")
+    }
+}
+
 /// Whether the requested [`SurfacePreference`] was honored for a viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceStatus {
@@ -90,6 +100,28 @@ pub enum FallbackReason {
 
     /// There is no surface (headless rendering).
     NoSurface,
+}
+
+/// Convert a surface status into the reduced mirror that egui's
+/// `ViewportInfo` carries.
+///
+/// The rich `requested` payload of
+/// [`FallbackReason::NoPairedColorSpace`] is dropped on purpose: the
+/// requesting app knows its own preference, so the surfaced status only
+/// needs to carry the outcome.
+#[cfg(any(feature = "capture", feature = "winit"))]
+impl From<SurfaceStatus> for egui::SurfaceStatus {
+    fn from(status: SurfaceStatus) -> Self {
+        match status {
+            SurfaceStatus::Granted => Self::Granted,
+            SurfaceStatus::FellBack { reason } => Self::FellBack(match reason {
+                FallbackReason::NoPairedColorSpace { .. } => {
+                    egui::FallbackReason::NoPairedColorSpace
+                }
+                FallbackReason::NoSurface => egui::FallbackReason::NoSurface,
+            }),
+        }
+    }
 }
 
 /// Priority-ordered wide-gamut color spaces the
@@ -582,5 +614,58 @@ mod tests {
             &SurfaceConfig::LOW_LATENCY,
             wgpu::CompositeAlphaMode::Opaque,
         );
+    }
+
+    #[test]
+    fn surface_target_display_is_format_plus_color_space() {
+        for (target, expected) in [
+            (
+                SurfaceTarget {
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    color_space: wgpu::SurfaceColorSpace::DisplayP3,
+                },
+                "Bgra8Unorm + DisplayP3",
+            ),
+            (
+                SurfaceTarget {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    color_space: wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+                },
+                "Rgba16Float + ExtendedSrgbLinear",
+            ),
+            (
+                SurfaceTarget {
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    color_space: wgpu::SurfaceColorSpace::Srgb,
+                },
+                "Bgra8Unorm + Srgb",
+            ),
+        ] {
+            assert_eq!(target.to_string(), expected);
+        }
+    }
+
+    #[cfg(any(feature = "capture", feature = "winit"))]
+    #[test]
+    fn status_conversion_into_egui_mirror() {
+        for (status, expected) in [
+            (SurfaceStatus::Granted, egui::SurfaceStatus::Granted),
+            (
+                SurfaceStatus::FellBack {
+                    reason: FallbackReason::NoPairedColorSpace {
+                        requested: SurfacePreference::WideGamut,
+                    },
+                },
+                egui::SurfaceStatus::FellBack(egui::FallbackReason::NoPairedColorSpace),
+            ),
+            (
+                SurfaceStatus::FellBack {
+                    reason: FallbackReason::NoSurface,
+                },
+                egui::SurfaceStatus::FellBack(egui::FallbackReason::NoSurface),
+            ),
+        ] {
+            assert_eq!(egui::SurfaceStatus::from(status), expected);
+        }
     }
 }

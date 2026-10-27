@@ -683,7 +683,7 @@ impl WgpuWinitRunning<'_> {
 
             // A hidden window is not painted, since nothing would be shown — unless someone
             // wants the pixels anyway, e.g. to screenshot an app that is in the background:
-            let is_visible = viewport.info.visible().unwrap_or(true)
+            let is_visible = info.visible().unwrap_or(true)
                 || viewport
                     .actions_requested
                     .iter()
@@ -693,6 +693,10 @@ impl WgpuWinitRunning<'_> {
                 profiling::scope!("set_window");
                 pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))?;
             }
+
+            // Surface the (possibly just-stored) surface decision before the
+            // info is cloned into the input below:
+            inject_surface_decision(painter, viewport_id, info);
 
             let Some(egui_winit) = egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -1200,6 +1204,28 @@ fn is_viewport_or_descendant_visible(viewports: &Viewports, viewport_id: Viewpor
     })
 }
 
+/// Mirror the painter's current surface decision for a viewport into its
+/// [`ViewportInfo`], so the app sees it as input the same frame.
+///
+/// A viewport without a surface decision right now (no surface yet, or the
+/// surface was torn down) gets `None`: an unknown decision is never
+/// fabricated, and a stale one is never left behind. The glow and web
+/// backends use their own painters and never call this, so their fields
+/// stay `None`.
+fn inject_surface_decision(
+    painter: &egui_wgpu::winit::Painter,
+    viewport_id: ViewportId,
+    info: &mut ViewportInfo,
+) {
+    if let Some((target, status)) = painter.surface_decision(viewport_id) {
+        info.surface_status = Some(status.into());
+        info.surface_target = Some(target.to_string());
+    } else {
+        info.surface_status = None;
+        info.surface_target = None;
+    }
+}
+
 fn render_immediate_viewport(
     beginning: Instant,
     shared: &RefCell<SharedState>,
@@ -1247,6 +1273,10 @@ fn render_immediate_viewport(
             return;
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+
+        // Surface the decision from the previous paint (this viewport's
+        // `set_window` happens further down, before painting):
+        inject_surface_decision(painter, ids.this, &mut viewport.info);
 
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports

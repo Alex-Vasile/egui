@@ -17,6 +17,37 @@ pub enum ViewportEvent {
     Close,
 }
 
+/// Whether the surface of a viewport honors the app's surface preference.
+///
+/// This is the reduced mirror of the richer `egui_wgpu::SurfaceStatus`: egui
+/// core cannot depend on `egui-wgpu`, so wgpu-based backends surface the
+/// outcome in this form via [`ViewportInfo::surface_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum SurfaceStatus {
+    /// The surface honors the app's surface preference.
+    Granted,
+
+    /// The preference could not be honored; the backend fell back to a
+    /// working surface instead.
+    FellBack(FallbackReason),
+}
+
+/// Why the surface preference of a viewport could not be honored.
+///
+/// Reduced from the richer `egui_wgpu::FallbackReason`, which for
+/// `NoPairedColorSpace` also carries the request that could
+/// not be granted — an app that asked for it knows its own request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum FallbackReason {
+    /// No surface format paired with the color space the preference needs.
+    NoPairedColorSpace,
+
+    /// There is no surface for this viewport (e.g. headless rendering).
+    NoSurface,
+}
+
 /// Information about the current viewport, given as input each frame.
 ///
 /// `None` means "unknown".
@@ -84,6 +115,22 @@ pub struct ViewportInfo {
     /// Not all platforms support this.
     /// On platforms that don't, this will be `None` or `Some(false)`.
     pub occluded: Option<bool>,
+
+    /// Does the rendering surface of this viewport honor the app's surface
+    /// preference (e.g. a request for a wide-gamut surface)?
+    ///
+    /// Set each frame by wgpu-based backends.
+    /// [`None`] means unknown, or not decided yet: the viewport has no
+    /// surface (headless), or the backend does not surface this (glow, web).
+    pub surface_status: Option<SurfaceStatus>,
+
+    /// Human-readable description of the configured rendering surface,
+    /// e.g. `"Bgra8Unorm + DisplayP3"` (texture format + color space).
+    ///
+    /// This is diagnostics only; the structured form is
+    /// [`Self::surface_status`]. [`None`] means unknown — same conditions as
+    /// [`Self::surface_status`].
+    pub surface_target: Option<String>,
 }
 
 impl ViewportInfo {
@@ -130,6 +177,8 @@ impl ViewportInfo {
             fullscreen: self.fullscreen,
             focused: self.focused,
             occluded: self.occluded,
+            surface_status: self.surface_status,
+            surface_target: self.surface_target.clone(),
         }
     }
 
@@ -147,6 +196,8 @@ impl ViewportInfo {
             fullscreen,
             focused,
             occluded,
+            surface_status,
+            surface_target,
         } = self;
 
         crate::Grid::new("viewport_info").show(ui, |ui| {
@@ -198,6 +249,14 @@ impl ViewportInfo {
             ui.label(opt_as_str(occluded));
             ui.end_row();
 
+            ui.label("Surface status:");
+            ui.label(opt_as_str(surface_status));
+            ui.end_row();
+
+            ui.label("Surface target:");
+            ui.label(surface_target.as_deref().unwrap_or(""));
+            ui.end_row();
+
             let visible = self.visible();
 
             ui.label("Visible:");
@@ -216,5 +275,38 @@ impl ViewportInfo {
                 v.as_ref().map_or(String::new(), |v| format!("{v:?}"))
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_fields_default_to_none() {
+        let info = ViewportInfo::default();
+        assert_eq!(info.surface_status, None);
+        assert_eq!(info.surface_target, None);
+    }
+
+    #[cfg(all(feature = "serde", feature = "ron"))]
+    #[test]
+    fn surface_fields_serde_round_trip() {
+        let mut info = ViewportInfo {
+            surface_status: Some(SurfaceStatus::FellBack(FallbackReason::NoPairedColorSpace)),
+            surface_target: Some("Bgra8Unorm + DisplayP3".to_owned()),
+            ..Default::default()
+        };
+
+        let serialized = ron::to_string(&info).unwrap();
+        assert_eq!(ron::from_str::<ViewportInfo>(&serialized).unwrap(), info);
+
+        info.surface_status = Some(SurfaceStatus::Granted);
+        let serialized = ron::to_string(&info).unwrap();
+        assert_eq!(ron::from_str::<ViewportInfo>(&serialized).unwrap(), info);
+
+        let minimal = ViewportInfo::default();
+        let serialized = ron::to_string(&minimal).unwrap();
+        assert_eq!(ron::from_str::<ViewportInfo>(&serialized).unwrap(), minimal);
     }
 }
