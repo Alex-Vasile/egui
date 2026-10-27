@@ -65,6 +65,8 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 # `monochrome_emoji_fonts` so that the snapshots keep their emoji:
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
+# The callback tests implement `egui_wgpu::CallbackTrait` against the wgpu types.
+egui-wgpu = { workspace = true }
 image = { workspace = true, features = ["png"] }
 egui_extras = { workspace = true, features = ["image", "http"] }
 tempfile.workspace = true

@@ -6,6 +6,26 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+
+### ⚠️ Breaking changes
+* `Renderer::new` no longer takes an output color format: render pipelines are created lazily, keyed by the render-target format
+* `Renderer::update_buffers`, `Renderer::render` and `CallbackTrait::prepare`/`CallbackTrait::paint` now receive the actual `wgpu::TextureFormat` of the render pass they paint into (it is decided per viewport and can change when a window moves between monitors)
+* Removed `RenderState::target_format` — there is no shared format anymore; each viewport stores its own decision
+
+### ⭐ Added
+* Add `SurfacePreference` (a new field on `WgpuConfiguration`): ask for `WideGamut` at create time and each viewport gets the best wide-gamut pairing the platform reports, or a plain SDR surface with an explanatory status — never an error
+* Add `SurfaceTarget` (format + color space), `SurfaceStatus` (`Granted` / `FellBack`), `FallbackReason`, `WIDE_GAMUT_ORDER`, and the `decide_surface_target` / `build_configuration` API that turns a preference into a validated `wgpu::SurfaceConfiguration`
+* Per-viewport surface decisions are stored by the winit painter and re-decided when a window moves to another monitor; the painter exposes the decision per viewport (surfaced to apps via `egui::ViewportInfo`)
+
+### 🐛 Fixed
+* Web now honors `WgpuConfiguration.surface.desired_maximum_frame_latency` instead of silently using wgpu's default (observable as changed frame latency on web)
+* The screen-capture state is recreated when the render-target format changes (e.g. after a monitor re-decide) instead of capturing into a stale-format texture
+
+### 🔧 Changed
+* `pollster` is now a dev-dependency (drives the crate's first runtime test, the pipeline-cache test)
+
+
 ## 0.37.0 - 2026-10-15
 * Fix `Frame::set_wgpu_surface_config` being ignored [#8442](https://github.com/emilk/egui/pull/8442) by [@chicoferreira](https://github.com/chicoferreira)
 

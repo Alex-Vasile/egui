@@ -1279,6 +1279,7 @@ dependencies = [
  "egui_glow",
  "egui_inspection",
  "egui_system_font_provider",
+ "env_logger",
  "glow",
  "glutin",
  "glutin-winit",

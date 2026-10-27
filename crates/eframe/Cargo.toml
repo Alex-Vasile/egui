@@ -299,3 +299,14 @@ wgpu = { workspace = true, optional = true }
 # Native dev dependencies for testing
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 directories.workspace = true
+
+# Drives the logging in the `hdr_smoke`/`hdr_wide_gamut` examples.
+env_logger = { workspace = true, features = ["auto-color", "humantime"] }
+
+[[example]]
+name = "hdr_smoke"
+required-features = ["wgpu"]
+
+[[example]]
+name = "hdr_wide_gamut"
+required-features = ["wgpu"]

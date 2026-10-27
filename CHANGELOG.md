@@ -14,6 +14,12 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+
+### ⭐ Added
+* `ViewportInfo::surface_status` and `ViewportInfo::surface_target`: wgpu-based backends now surface each viewport's rendering-surface decision (whether the app's surface preference was granted, and the configured format + color space, e.g. `"Bgra8Unorm + DisplayP3"`). Backends that don't track this (glow, web) leave both fields `None`. Comes with the new mirror enums `egui::SurfaceStatus` and `egui::FallbackReason`.
+
+
 ## 0.37.0 - Colored emojis! 🚀
 
 ### Highlights ✨

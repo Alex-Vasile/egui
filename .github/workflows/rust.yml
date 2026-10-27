@@ -270,6 +270,14 @@ jobs:
       - name: Run tests
         run: cargo test --all-features --no-fail-fast
 
+      # Windowed HDR smoke — see MANUAL_TESTING.md.
+      # macos runners have a window server, so this verifies real integration:
+      # actual window, surface configured with the wide-gamut policy, coherent
+      # `SurfaceStatus`, exit code 0.
+      - name: Run windowed HDR smoke
+        if: always()
+        run: cargo run --release -p eframe --example hdr_smoke
+
       - name: Run doc-tests
         if: always()
         run: cargo test --all-features --doc --no-fail-fast
