@@ -60,6 +60,36 @@ impl SurfaceTarget {
                 | wgpu::SurfaceColorSpace::ExtendedDisplayP3
         )
     }
+
+    /// The ITU-T H.273 cICP code points (color primaries, transfer function,
+    /// matrix coefficients, full-range flag) a PNG dump of this surface's
+    /// pixels must carry so readers interpret them the way the presentation
+    /// engine did.
+    ///
+    /// `Auto` maps to the sRGB points it resolves to on every surface this
+    /// crate configures. cICP cannot express *extended* range (values beyond
+    /// `[0, 1]`): extended-range surfaces aren't 8-bit-capturable anyway
+    /// (the capture path's `read_screen_rgba` only accepts `Rgba8Unorm` /
+    /// `Bgra8Unorm`), so their points are the base spaces.
+    ///
+    /// BT.2020 PQ/HLG points are included for completeness; no BT.2020
+    /// surface pairing is granted yet.
+    #[must_use]
+    pub const fn cicp_code_points(&self) -> [u8; 4] {
+        let (primaries, transfer) = match self.color_space {
+            wgpu::SurfaceColorSpace::Auto
+            | wgpu::SurfaceColorSpace::Srgb
+            | wgpu::SurfaceColorSpace::ExtendedSrgb => (1, 13),
+            wgpu::SurfaceColorSpace::DisplayP3 | wgpu::SurfaceColorSpace::ExtendedDisplayP3 => {
+                (12, 13)
+            }
+            wgpu::SurfaceColorSpace::ExtendedSrgbLinear => (1, 8),
+            wgpu::SurfaceColorSpace::Bt2100Pq => (9, 16),
+            wgpu::SurfaceColorSpace::Bt2100Hlg => (9, 18),
+        };
+        // Matrix coefficients: identity (RGB). Full range: 1.
+        [primaries, transfer, 0, 1]
+    }
 }
 
 impl core::fmt::Display for SurfaceTarget {

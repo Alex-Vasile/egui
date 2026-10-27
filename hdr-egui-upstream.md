@@ -37,7 +37,7 @@ gamut, diagnostics) that brightness plugs into.
 | **3** | HDR extended range: extended pair on `Rgba16Float` (>1.0, EDR); `Hdr`, `WideGamutHdr`; headroom pass-through (`ViewportInfo.hdr_headroom`, painter-fed); dither off on fp16 | brightness above SDR white, adaptive to live headroom | fp16 readback numeric tests, negative fp16 GPU round-trip (reusing 2a's vectors), capture branch, MSAA, windowed smoke asserts the headroom field |
 | **4** | scRGB-linear pairing (Windows/DX12) — HDR brightness **and** wide-gamut-*capable* surface (content conversion lands with §5's matrices) — activates the derived encoding path | Windows HDR (+ wide gamut once §5's matrices land) | per-platform (manual-heavy) |
 | **5** | `color_edit_button_hdr` + swatch widgets; the picker edits linear `Rgba` (the app-side math space), converting to encoded at paint | HDR editing UI | picker snapshots, decomposition tests |
-| — | Side items: docs, test app | adoption | compile-only + manual |
+| — | Side items: docs, test app; PNG colorspace tagging (cICP) **landed on the fork** (2026-10-27 — kittest snapshots/captures write tagged PNGs; see MANUAL_TESTING.md "How to interpret PNG dumps") | adoption | compile-only + manual |
 | — | Deferred: float vertex colors (§11) | vector-shaped HDR | — |
 
 **Binding rules:** every PR ships consumed, testable functionality — nothing dead,

@@ -29,6 +29,41 @@ show — some SDR displays still get `DisplayP3`. That grant is correct; the
 visible. Headroom readout (`hdr_headroom`) arrives with PR 3 and is
 deliberately absent from this checklist.
 
+## How to interpret PNG dumps
+
+Every PNG this branch's tooling writes now carries a **cICP chunk** (PNG
+third edition; code points per ITU-T H.273) stating how its bytes must be
+interpreted. Read it with `pngcheck -v <file>` or by decoding the four bytes
+after the `cICP` header (primaries, transfer, matrix, full-range):
+
+| cICP (p, t, m, r) | Meaning | Written by |
+|---|---|---|
+| absent | sRGB-referred by convention (see below) | all goldens predating this branch |
+| `(1, 13, 0, 1)` | sRGB: BT.709 primaries, sRGB transfer | kittest snapshots (default), 8-bit sRGB-surface captures |
+| `(12, 13, 0, 1)` | Display P3 primaries, sRGB transfer | kittest with `SnapshotOptions::color_space(DisplayP3)`, captures from a `DisplayP3` surface |
+| `(1, 8, 0, 1)` | linear-light sRGB | kittest with `SnapshotOptions::color_space(LinearSrgb)`; `ExtendedSrgbLinear` surface captures |
+| `(9, 16, 0, 1)` | BT.2020 primaries, PQ (ST 2084) transfer | future (no BT.2020 surface pairing is granted yet) |
+| `(9, 18, 0, 1)` | BT.2020 primaries, HLG (ARIB STD-B67) transfer | future (no BT.2100 HLG surface pairing is granted yet) |
+
+Rules of thumb:
+
+- **Untagged legacy goldens are sRGB-referred.** A decoder without cICP
+  support assumes sRGB, and everything written before this branch *is* sRGB,
+  so old files decode correctly either way.
+- **A tagged file is not retroactively convertible.** The tag says how the
+  bytes were encoded; it doesn't widen them. A P3-tagged dump viewed in an
+  sRGB-only viewer looks oversaturated — that is the mustard-vs-red trap this
+  branch hit: the bytes were P3, the tag was missing, and everyone read them
+  as sRGB.
+- **Capture tags reflect the surface, not the window.** egui-wgpu never
+  writes PNGs itself; pixels leave through `ScreenshotCallback`. Save them
+  with `egui_wgpu::capture::write_capture_png(image, path, target)`, passing
+  the viewport's `surface_decision(..)` target, and the tag matches what the
+  presentation engine interpreted.
+- cICP cannot express *extended* range (values beyond `[0, 1]`). 8-bit
+  captures are clamped anyway; extended-range (`Rgba16Float`) surfaces are
+  not capturable by the 8-bit capture path today.
+
 ## macOS — the only runtime-verified platform
 
 ### A. SDR panel (fallback path)

@@ -1,7 +1,11 @@
 use egui::ScreenshotCallback;
 use epaint::ColorImage;
+use std::io::BufWriter;
+use std::path::Path;
 use std::sync::Arc;
 use wgpu::{BindGroupLayout, MultisampleState, StoreOp};
+
+use crate::SurfaceTarget;
 
 /// A texture and a buffer for reading the rendered frame back to the cpu.
 ///
@@ -264,5 +268,298 @@ impl BufferPadding {
             unpadded_bytes_per_row,
             padded_bytes_per_row,
         }
+    }
+}
+
+/// Write captured pixels to a PNG tagged with a cICP chunk describing the
+/// [`SurfaceTarget`] the capture came from.
+///
+/// Captured pixels leave egui-wgpu as an untagged [`ColorImage`] through
+/// [`egui::ScreenshotCallback`], so whoever saves them to a file is the one
+/// who can tag them. Pass the `SurfaceTarget` of the capturing viewport —
+/// [`Painter::surface_decision`](crate::winit::Painter::surface_decision)
+/// returns it. Without a tag, a Display-P3-referred dump reads as sRGB and
+/// its colors shift (the mustard-vs-red trap).
+///
+/// # Errors
+/// Propagates filesystem and PNG-encoding errors.
+pub fn write_capture_png(
+    image: &ColorImage,
+    path: impl AsRef<Path>,
+    target: SurfaceTarget,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path.as_ref())?;
+    let mut encoder = png::Encoder::new(
+        BufWriter::new(file),
+        image.width() as u32,
+        image.height() as u32,
+    );
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
+    // cICP must come before PLTE and IDAT (PNG third edition), so right after
+    // the header is the earliest legal spot for it.
+    writer
+        .write_chunk(png::chunk::cICP, &target.cicp_code_points())
+        .map_err(std::io::Error::other)?;
+    writer
+        .write_image_data(bytemuck::cast_slice(image.pixels()))
+        .map_err(std::io::Error::other)?;
+    writer.finish().map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn target(color_space: wgpu::SurfaceColorSpace) -> SurfaceTarget {
+        SurfaceTarget {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            color_space,
+        }
+    }
+
+    #[test]
+    fn cicp_points_match_color_space() {
+        let expected: &[(wgpu::SurfaceColorSpace, [u8; 4])] = &[
+            (wgpu::SurfaceColorSpace::Auto, [1, 13, 0, 1]),
+            (wgpu::SurfaceColorSpace::Srgb, [1, 13, 0, 1]),
+            (wgpu::SurfaceColorSpace::ExtendedSrgbLinear, [1, 8, 0, 1]),
+            (wgpu::SurfaceColorSpace::DisplayP3, [12, 13, 0, 1]),
+            (wgpu::SurfaceColorSpace::Bt2100Pq, [9, 16, 0, 1]),
+            (wgpu::SurfaceColorSpace::Bt2100Hlg, [9, 18, 0, 1]),
+            (wgpu::SurfaceColorSpace::ExtendedSrgb, [1, 13, 0, 1]),
+            (wgpu::SurfaceColorSpace::ExtendedDisplayP3, [12, 13, 0, 1]),
+        ];
+        for (color_space, points) in expected {
+            assert_eq!(&target(*color_space).cicp_code_points(), points);
+        }
+    }
+
+    fn test_image() -> ColorImage {
+        let pixels = (0..3 * 2)
+            .map(|i| {
+                let i = i as u8;
+                epaint::Color32::from_rgba_premultiplied(200 + i, i * 30, 255 - i * 10, 255)
+            })
+            .collect();
+        ColorImage::new([3, 2], pixels)
+    }
+
+    #[test]
+    fn write_capture_png_tags_and_preserves_pixels() {
+        let dir = tempfile::tempdir().expect("failed to create a tempdir");
+        let image = test_image();
+
+        write_capture_png(
+            &image,
+            dir.path().join("capture.png"),
+            target(wgpu::SurfaceColorSpace::DisplayP3),
+        )
+        .expect("failed to write the tagged capture PNG");
+
+        let file = std::fs::File::open(dir.path().join("capture.png"))
+            .expect("failed to open the written capture PNG");
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file))
+            .read_info()
+            .expect("failed to read the capture PNG header");
+        let mut buffer = vec![
+            0;
+            reader
+                .output_buffer_size()
+                .expect("png reports buffer size")
+        ];
+        let output = reader
+            .next_frame(&mut buffer)
+            .expect("failed to decode the capture PNG");
+
+        let cicp = reader
+            .info()
+            .coding_independent_code_points
+            .expect("the capture PNG must carry a cICP chunk");
+        assert_eq!(cicp.color_primaries, 12);
+        assert_eq!(cicp.transfer_function, 13);
+        assert_eq!(cicp.matrix_coefficients, 0);
+        assert!(cicp.is_video_full_range_image);
+
+        assert_eq!(
+            &buffer[..output.buffer_size()],
+            bytemuck::cast_slice(image.pixels())
+        );
+    }
+
+    /// End-to-end through the capture path: render into the capture texture,
+    /// copy, read back, and write the tagged PNG from the screenshot
+    /// callback.
+    ///
+    /// Adapter-requiring: machines without any wgpu adapter skip with a
+    /// message, mirroring the pipeline-cache test.
+    #[test]
+    fn capture_readback_writes_tagged_png() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })) {
+                Ok(adapter) => adapter,
+                Err(err) => {
+                    #[expect(clippy::print_stderr)]
+                    {
+                        eprintln!(
+                            "skipping capture_readback_writes_tagged_png: no wgpu adapter: {err}"
+                        );
+                    }
+                    return;
+                }
+            };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("egui-wgpu capture tag test"),
+            ..Default::default()
+        }))
+        .expect("failed to request a wgpu device for the capture tag test");
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the capture tag test: {err}");
+        }));
+
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        };
+        let mut capture_state = CaptureState::new(&device, size, wgpu::TextureFormat::Rgba8Unorm);
+
+        // Paint a gradient into the capture texture so the readback has
+        // known, position-dependent content.
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("capture tag test gradient"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r"
+                @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                    var pos = array<vec2<f32>, 3>(
+                        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+                    return vec4<f32>(pos[i], 0.0, 1.0);
+                }
+                @fragment fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+                    return vec4<f32>(frag.x / 4.0, frag.y / 4.0, 0.25, 1.0);
+                }
+                ",
+            )),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("capture tag test gradient"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let view = capture_state.texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("capture tag test"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("capture tag test gradient"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+
+        let buffer = capture_state.copy_textures(&device, None, &mut encoder);
+        queue.submit([encoder.finish()]);
+
+        let dir = tempfile::tempdir().expect("failed to create a tempdir");
+        let (tx, rx) = mpsc::channel::<()>();
+        let path = dir.path().join("capture.png");
+        let callback = ScreenshotCallback::new(move |image| {
+            write_capture_png(&image, &path, target(wgpu::SurfaceColorSpace::DisplayP3))
+                .expect("failed to write the tagged capture PNG");
+            tx.send(()).expect("test channel closed early");
+        });
+        capture_state.read_screen_rgba(buffer, vec![callback]);
+
+        // `read_screen_rgba` maps the buffer asynchronously; pump the device
+        // until the callback runs.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
+        loop {
+            device
+                .poll(wgpu::PollType::Poll)
+                .expect("GPU poll failed while waiting for the capture readback");
+            if rx
+                .recv_timeout(core::time::Duration::from_millis(100))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screenshot callback never ran"
+            );
+        }
+
+        let file = std::fs::File::open(dir.path().join("capture.png"))
+            .expect("failed to open the captured PNG");
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file))
+            .read_info()
+            .expect("failed to read the captured PNG header");
+        let mut buffer = vec![
+            0;
+            reader
+                .output_buffer_size()
+                .expect("png reports buffer size")
+        ];
+        let output = reader
+            .next_frame(&mut buffer)
+            .expect("failed to decode the captured PNG");
+        let cicp = reader
+            .info()
+            .coding_independent_code_points
+            .expect("the captured PNG must carry a cICP chunk");
+        assert_eq!(
+            [
+                cicp.color_primaries,
+                cicp.transfer_function,
+                cicp.matrix_coefficients
+            ],
+            [12, 13, 0]
+        );
+        assert!(cicp.is_video_full_range_image);
+        assert_eq!(output.width, 4);
+        assert_eq!(output.height, 4);
     }
 }

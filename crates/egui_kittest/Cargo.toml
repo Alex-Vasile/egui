@@ -24,7 +24,7 @@ rustdoc-args = ["--generate-link-to-definition"]
 wgpu = ["dep:egui-wgpu", "dep:pollster", "dep:image", "dep:wgpu", "eframe?/wgpu"]
 
 ## Adds a dify-based image snapshot utility.
-snapshot = ["dep:dify", "dep:image", "dep:open", "dep:tempfile", "image/png"]
+snapshot = ["dep:dify", "dep:image", "dep:open", "dep:tempfile", "dep:png", "image/png"]
 
 ## Record a test session as an MP4 video.
 video = ["snapshot"]
@@ -53,6 +53,7 @@ wgpu = { workspace = true, features = ["metal", "dx12", "vulkan", "gles"], optio
 
 # snapshot dependencies
 dify = { workspace = true, optional = true }
+png = { workspace = true, optional = true }
 
 # Enable this when generating docs.
 document-features = { workspace = true, optional = true }

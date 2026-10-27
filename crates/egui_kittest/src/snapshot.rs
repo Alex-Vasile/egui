@@ -1,12 +1,62 @@
 use core::fmt::Display;
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufWriter, ErrorKind};
+use std::path::{Path, PathBuf};
 
 use image::ImageError;
 
 use crate::{Harness, config::config};
 
 pub type SnapshotResult = Result<(), SnapshotError>;
+
+/// The colorspace the snapshot pixels are referred to, written as a
+/// [cICP](https://www.w3.org/TR/png-3/#cICP-chunk) chunk into every PNG the
+/// snapshot machinery writes.
+///
+/// The headless harness renders sRGB-referred bytes, so the default is
+/// [`SnapshotColorSpace::Srgb`]. A future renderer that pairs an offscreen
+/// surface with a wider color space will override this via
+/// [`HarnessBuilder::with_options`](crate::HarnessBuilder::with_options);
+/// until then the knob exists so the tag never lies about the bytes.
+///
+/// Snapshots checked in before tagging (and any golden PNG without a cICP
+/// chunk) are sRGB-referred by convention — see `MANUAL_TESTING.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SnapshotColorSpace {
+    /// sRGB: BT.709 primaries, sRGB transfer function.
+    ///
+    /// ITU-T H.273 code points `(1, 13, 0, 1)`.
+    #[default]
+    Srgb,
+
+    /// Display P3 primaries with the sRGB transfer function.
+    ///
+    /// This is the *encoded* pairing the windowed wide-gamut surfaces use
+    /// (raw 8-bit view of a P3-referred swapchain), not linear P3.
+    ///
+    /// ITU-T H.273 code points `(12, 13, 0, 1)`.
+    DisplayP3,
+
+    /// Linear-light sRGB: BT.709 primaries, linear transfer function.
+    ///
+    /// ITU-T H.273 code points `(1, 8, 0, 1)`.
+    LinearSrgb,
+}
+
+impl SnapshotColorSpace {
+    /// The four cICP code points (primaries, transfer function, matrix
+    /// coefficients, full-range flag) describing this colorspace, per
+    /// ITU-T H.273. Matrix is always identity (RGB) and images are
+    /// full-range.
+    #[must_use]
+    pub const fn cicp_code_points(self) -> [u8; 4] {
+        match self {
+            Self::Srgb => [1, 13, 0, 1],
+            Self::DisplayP3 => [12, 13, 0, 1],
+            Self::LinearSrgb => [1, 8, 0, 1],
+        }
+    }
+}
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -48,6 +98,21 @@ pub struct SnapshotOptions {
     ///
     /// Can be configured via kittest.toml. The fallback is `tests/snapshots`.
     pub output_path: PathBuf,
+
+    /// The colorspace the snapshot pixels are referred to, written as a cICP
+    /// chunk into every PNG the snapshot machinery writes (the checked-in
+    /// snapshot, the `.new.png` actual, and the diff image).
+    ///
+    /// Defaults to [`SnapshotColorSpace::Srgb`], which is what the headless
+    /// harness renders. This is not read from kittest.toml; set it with
+    /// [`SnapshotOptions::color_space`] (or
+    /// [`crate::HarnessBuilder::with_options`]) when a renderer change makes
+    /// the bytes wide-gamut.
+    ///
+    /// Diff images are excluded: their pixels are dify's color-space-agnostic
+    /// sRGB failure markers, so they are always tagged
+    /// [`SnapshotColorSpace::Srgb`].
+    pub color_space: SnapshotColorSpace,
 }
 
 /// Helper struct to define a per-OS comparison tolerance.
@@ -176,6 +241,7 @@ impl Default for SnapshotOptions {
             threshold: config().threshold(),
             output_path: config().output_path(),
             max_failed_pixels: config().max_failed_pixels(),
+            color_space: SnapshotColorSpace::default(),
         }
     }
 }
@@ -208,6 +274,15 @@ impl SnapshotOptions {
     #[inline]
     pub fn output_path(mut self, output_path: impl Into<PathBuf>) -> Self {
         self.output_path = output_path.into();
+        self
+    }
+
+    /// Set the colorspace the snapshot pixels are referred to.
+    /// The default is [`SnapshotColorSpace::Srgb`], matching what the headless
+    /// harness renders.
+    #[inline]
+    pub fn color_space(mut self, color_space: SnapshotColorSpace) -> Self {
+        self.color_space = color_space;
         self
     }
 
@@ -410,6 +485,45 @@ impl Mode {
     }
 }
 
+/// Write `image` to `path` as a PNG tagged with a cICP chunk describing
+/// `color_space`.
+///
+/// `image::RgbaImage::save` can't carry chunks, so this goes through the `png`
+/// encoder directly.
+fn write_tagged_png(
+    image: &image::RgbaImage,
+    path: &Path,
+    color_space: SnapshotColorSpace,
+) -> Result<(), ImageError> {
+    let file = File::create(path).map_err(ImageError::IoError)?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), image.width(), image.height());
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(snapshot_png_error)?;
+    // cICP must come before PLTE and IDAT (PNG third edition), so right after
+    // the header is the earliest legal spot for it.
+    writer
+        .write_chunk(png::chunk::cICP, &color_space.cicp_code_points())
+        .map_err(snapshot_png_error)?;
+    writer
+        .write_image_data(image.as_raw())
+        .map_err(snapshot_png_error)?;
+    writer.finish().map_err(snapshot_png_error)?;
+    Ok(())
+}
+
+/// Map a `png` encoder error onto the `image` error type
+/// [`SnapshotError::WriteSnapshot`] carries.
+fn snapshot_png_error(err: png::EncodingError) -> ImageError {
+    match err {
+        png::EncodingError::IoError(err) => ImageError::IoError(err),
+        err => ImageError::Encoding(image::error::EncodingError::new(
+            image::error::ImageFormatHint::Exact(image::ImageFormat::Png),
+            err,
+        )),
+    }
+}
+
 /// Image snapshot test with custom options.
 ///
 /// If you want to change the default options for your whole project, it's recommended to create a
@@ -481,6 +595,7 @@ fn try_image_snapshot_options_impl(
         threshold,
         output_path,
         max_failed_pixels,
+        color_space,
     } = options;
 
     let parent_path = if let Some(parent) = PathBuf::from(&name).parent() {
@@ -508,11 +623,12 @@ fn try_image_snapshot_options_impl(
         std::fs::rename(&snapshot_path, &old_backup_path).ok();
 
         // Write the new file to the checked in path:
-        new.save(&snapshot_path)
-            .map_err(|err| SnapshotError::WriteSnapshot {
+        write_tagged_png(new, &snapshot_path, *color_space).map_err(|err| {
+            SnapshotError::WriteSnapshot {
                 err,
                 path: snapshot_path.clone(),
-            })?;
+            }
+        })?;
 
         // No need for an explicit `.new` file:
         std::fs::remove_file(&new_path).ok();
@@ -523,11 +639,12 @@ fn try_image_snapshot_options_impl(
     };
 
     let write_new_png = || {
-        new.save(&new_path)
-            .map_err(|err| SnapshotError::WriteSnapshot {
+        write_tagged_png(new, &new_path, *color_space).map_err(|err| {
+            SnapshotError::WriteSnapshot {
                 err,
                 path: new_path.clone(),
-            })?;
+            }
+        })?;
         Ok(())
     };
 
@@ -586,12 +703,15 @@ fn try_image_snapshot_options_impl(
     let below_threshold = num_wrong_pixels as i64 <= *max_failed_pixels as i64;
 
     if !below_threshold {
-        diff_image
-            .save(diff_path.clone())
-            .map_err(|err| SnapshotError::WriteSnapshot {
+        // Diff pixels are dify's color-space-agnostic sRGB markers (failure
+        // colors on transparent black), not source-colorspace data — always
+        // tag the diff sRGB so the markers render as intended.
+        write_tagged_png(&diff_image, &diff_path, SnapshotColorSpace::Srgb).map_err(|err| {
+            SnapshotError::WriteSnapshot {
                 path: diff_path.clone(),
                 err,
-            })?;
+            }
+        })?;
     }
 
     match mode {
@@ -813,8 +933,7 @@ impl<State> Harness<'_, State> {
 
         let path = temp_file.path();
 
-        image
-            .save(temp_file.path())
+        write_tagged_png(&image, path, self.default_snapshot_options.color_space)
             .map_err(|err| SnapshotError::WriteSnapshot {
                 err,
                 path: path.to_path_buf(),

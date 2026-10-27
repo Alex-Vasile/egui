@@ -33,7 +33,7 @@ default = [
 ]
 
 ## Enables the `capture` module for capturing screenshots.
-capture = ["dep:egui"]
+capture = ["dep:egui", "dep:png"]
 
 ## Enable [`winit`](https://docs.rs/winit) integration. On Linux, requires either `wayland` or `x11`
 winit = ["dep:winit", "winit/rwh_06", "dep:egui", "capture"]
@@ -72,8 +72,11 @@ wgpu = { workspace = true, features = ["wgsl"] }
 # Optional dependencies:
 
 egui = { workspace = true, optional = true, default-features = false }
+png = { workspace = true, optional = true }
 winit = { workspace = true, optional = true, default-features = false }
 
 [dev-dependencies]
 # Drives the adapter-requiring pipeline-cache test (the crate's first runtime test).
 pollster.workspace = true
+# Scratch PNGs for the capture-tagging tests (clippy.toml disallows `std::env::temp_dir`).
+tempfile.workspace = true
