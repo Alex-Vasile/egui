@@ -297,7 +297,26 @@ impl Renderer {
 
         let shader = wgpu::ShaderModuleDescriptor {
             label: Some("egui"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("egui.wgsl"))),
+            // The module is the shared transfer functions (`egui_transfer.wgsl`)
+            // concatenated with the entry points (`egui.wgsl`); the CPU↔GPU
+            // round-trip test concatenates the same helpers with its own entry
+            // points, so both exercise the same WGSL source. The allocation is
+            // once per `Renderer::new`, never per frame.
+            //
+            // Two maintainer traps:
+            // - WGSL error messages report line numbers against the
+            //   CONCATENATED source. To find a reported line in `egui.wgsl`,
+            //   subtract `egui_transfer.wgsl`'s line count plus the join
+            //   newline.
+            // - Nothing validates this concatenation at build time: `cargo
+            //   check`, clippy and the wasm32 CI job never parse WGSL. The
+            //   first validation of any edit to either file is this call, on
+            //   a machine with a real wgpu adapter.
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                "{}\n{}",
+                include_str!("egui_transfer.wgsl"),
+                include_str!("egui.wgsl")
+            ))),
         };
         let module = {
             profiling::scope!("create_shader_module");
@@ -1530,5 +1549,532 @@ mod tests {
             ),
             "distinct target formats must hold distinct pipelines"
         );
+    }
+
+    /// Guards the module split against drift at the name level.
+    ///
+    /// If a copy of the transfer functions (or a renamed re-implementation)
+    /// crept back into `egui.wgsl`, nothing would fail at build time — WGSL
+    /// is only parsed when a real device compiles the concatenated module in
+    /// `Renderer::new`, so duplicate names would only surface there, on a
+    /// GPU machine, and renamed local copies would never fail at all, silently
+    /// drifting from the shared file. This check keeps `egui.wgsl` free of
+    /// transfer-function *definitions* so the functions the round-trip test
+    /// exercises stay the functions production renders with — and keeps the
+    /// no-`pow`-on-negatives property auditable in the one shared file.
+    #[test]
+    fn egui_wgsl_does_not_inline_transfer_functions() {
+        let wgsl = include_str!("egui.wgsl");
+        for name in [
+            "fn linear_from_gamma_rgb",
+            "fn gamma_from_linear_rgb",
+            "fn gamma_from_linear_rgba",
+        ] {
+            assert!(
+                !wgsl.contains(name),
+                "`egui.wgsl` must not define `{name}`: the transfer functions live \
+                 in `egui_transfer.wgsl`, which the renderer concatenates and the \
+                 round-trip test exercises"
+            );
+        }
+    }
+
+    /// Test entry points concatenated with `egui_transfer.wgsl` — the exact
+    /// shared-helpers file `Renderer::new` concatenates into the production
+    /// module, so the tested functions cannot drift from the shipped ones.
+    ///
+    /// One instance per input covers one pixel of an 8×8 grid; a single draw
+    /// fills three `Rgba16Float` targets with the decode, the encode, and
+    /// their composition.
+    const TRANSFER_TEST_WGSL: &str = r"
+struct TestInputs {
+    // Must equal `NUM_TRANSFER_TEST_INPUTS` in `transfer_test_inputs`.
+    values: array<vec4<f32>, 32>,
+}
+@group(0) @binding(0) var<uniform> r_test_inputs: TestInputs;
+
+// Must equal the test target size.
+const GRID: u32 = 8u;
+
+struct TestVOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) index: u32,
+}
+
+@vertex
+fn vs_test(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> TestVOut {
+    let pixel = vec2<f32>(f32(ii % GRID), f32(ii / GRID));
+    let corner = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    let xy = (pixel + corner) * 2.0 / f32(GRID);
+    return TestVOut(vec4<f32>(xy.x - 1.0, 1.0 - xy.y, 0.0, 1.0), ii);
+}
+
+struct TestFOut {
+    @location(0) decoded: vec4<f32>,
+    @location(1) encoded: vec4<f32>,
+    @location(2) round_trip: vec4<f32>,
+}
+
+@fragment
+fn fs_test(in: TestVOut) -> TestFOut {
+    let v = r_test_inputs.values[in.index].rgb;
+    let encoded = gamma_from_linear_rgb(v);
+    return TestFOut(
+        vec4<f32>(linear_from_gamma_rgb(v), 1.0),
+        vec4<f32>(encoded, 1.0),
+        vec4<f32>(linear_from_gamma_rgb(encoded), 1.0),
+    );
+}
+";
+
+    /// The round-trip input set (plan §8 row 1): positives across the domain,
+    /// the exact toe boundaries (`0.0031308`, `0.04045`), both zeros,
+    /// negatives (deep toe, knee, power region), and mixed-sign vec3 lanes
+    /// for per-lane select correctness. Every input feeds all three targets.
+    const NUM_TRANSFER_TEST_INPUTS: usize = 32;
+
+    fn transfer_test_inputs() -> Vec<[f32; 4]> {
+        let scalars: [f32; 27] = [
+            // Positives across the domain.
+            0.0001,
+            0.001,
+            0.003_130_7, // just below the encode knee
+            0.003_130_8, // the encode knee itself
+            0.003_130_9, // just above it
+            0.01,
+            0.040_44, // just below the decode knee
+            0.040_45, // the decode knee itself
+            0.040_46, // just above it
+            0.1,
+            0.25,
+            0.5,
+            0.75,
+            1.0, // SDR reference white
+            2.0,
+            4.0,
+            10.0,
+            // Both zeros — `-0.0` must produce `-0.0`-symmetric results, never NaN.
+            0.0,
+            -0.0,
+            // Negatives: deep toe, toe, knee, mid, power region.
+            -0.0001,
+            -0.001,
+            -0.003_130_8,
+            -0.01,
+            -0.040_45,
+            -0.5,
+            -1.0,
+            -4.0,
+        ];
+        let mixed_sign: [[f32; 3]; 5] = [
+            [0.5, -0.5, 0.02],
+            [-1.0, 0.001, -0.003_130_8],
+            [4.0, -4.0, 1.0],
+            [-0.0, 0.0, 0.5],
+            [0.003_130_8, -0.040_45, 2.0],
+        ];
+        let mut inputs = Vec::with_capacity(NUM_TRANSFER_TEST_INPUTS);
+        for &v in &scalars {
+            inputs.push([v, v, v, 0.0]);
+        }
+        for m in mixed_sign {
+            inputs.push([m[0], m[1], m[2], 0.0]);
+        }
+        assert_eq!(
+            inputs.len(),
+            NUM_TRANSFER_TEST_INPUTS,
+            "the input list must fill the WGSL uniform array exactly"
+        );
+        inputs
+    }
+
+    /// Decode IEEE 754 binary16 bits to `f32`.
+    ///
+    /// Hand-rolled to keep the test dependency-free; sanity-checked by
+    /// [`f16_bits_to_f32_known_values`] below.
+    fn f16_bits_to_f32(h: u16) -> f32 {
+        let sign = u32::from(h & 0x8000) << 16;
+        let exp = u32::from((h >> 10) & 0x1f);
+        let frac = u32::from(h & 0x03ff);
+        let magnitude = match exp {
+            0 if frac == 0 => 0, // ±0
+            0 => {
+                // Subnormal: normalize. `ilog2` is the index of the highest
+                // set bit within the 10-bit fraction field.
+                let msb = frac.ilog2();
+                ((103 + msb) << 23) | ((frac << (23 - msb)) & 0x007f_ffff)
+            }
+            31 => 0x7f80_0000 | (frac << 13), // inf / NaN
+            exp => ((exp + 112) << 23) | (frac << 13),
+        };
+        f32::from_bits(sign | magnitude)
+    }
+
+    #[test]
+    fn f16_bits_to_f32_known_values() {
+        assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_bits_to_f32(0xBC00), -1.0);
+        assert_eq!(f16_bits_to_f32(0x0000), 0.0);
+        assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(f16_bits_to_f32(0x8000), 0.0);
+        assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(f16_bits_to_f32(0x8400), -2.0f32.powi(-14)); // sign + min normal
+        assert_eq!(f16_bits_to_f32(0xC400), -4.0);
+        assert_eq!(f16_bits_to_f32(0x0400), 2.0f32.powi(-14)); // smallest normal
+        assert_eq!(f16_bits_to_f32(0x0001), 2.0f32.powi(-24)); // smallest subnormal
+        assert_eq!(f16_bits_to_f32(0x03FF), 1023.0 * 2.0f32.powi(-24));
+        assert_eq!(f16_bits_to_f32(0x3555), 0.333_251_95);
+        assert_eq!(f16_bits_to_f32(0x7C00), f32::INFINITY);
+        assert!(f16_bits_to_f32(0x7E00).is_nan());
+    }
+
+    /// Smallest positive normal `f16` (= 2⁻¹⁴); below it half-precision steps
+    /// are subnormal-sized, so a relative tolerance would explode.
+    const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
+
+    /// Plan §8 tolerance: one full f16 quantization step of the CPU value in
+    /// the normal range (2⁻¹⁰ relative; round-to-nearest would only ever be
+    /// half a step, but the f16 stores of at least Apple-silicon Metal round
+    /// toward zero, so the bound must absorb a full step), plus an absolute
+    /// carve-out in the f16 subnormal range where a relative bound is
+    /// meaningless.
+    fn assert_f16_close(gpu: f32, cpu: f32, context: &str) {
+        assert!(
+            !gpu.is_nan(),
+            "GPU result must never be NaN ({context}): GPU {gpu}, CPU {cpu}"
+        );
+        let diff = (gpu - cpu).abs();
+        let limit = if cpu.abs() < F16_MIN_NORMAL {
+            1.192_092_9e-7 // 2⁻²³: a couple of f16 subnormal steps (2⁻²⁴ each)
+        } else {
+            cpu.abs() * 9.765_625e-4 // 2⁻¹⁰: one full f16 step
+        };
+        assert!(
+            diff <= limit,
+            "GPU/CPU mismatch ({context}): GPU {gpu}, CPU {cpu}, |Δ| {diff}, limit {limit}"
+        );
+    }
+
+    fn read_f16_pixels(
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+        size: u32,
+        bytes_per_row: u32,
+    ) -> Vec<[f32; 4]> {
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).expect("readback receiver hung up");
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the readback map");
+        receiver
+            .recv()
+            .expect("readback sender hung up")
+            .expect("failed to map the readback buffer");
+
+        let data = slice
+            .get_mapped_range()
+            .expect("failed to map the readback buffer");
+        let mut pixels = Vec::with_capacity((size * size) as usize);
+        for row in 0..size {
+            for col in 0..size {
+                let offset = (row * bytes_per_row + col * 8) as usize; // 4 × f16
+                let texel: [u16; 4] = bytemuck::cast_slice(&data[offset..offset + 8])
+                    .try_into()
+                    .expect("each f16 texel is exactly eight bytes");
+                pixels.push([
+                    f16_bits_to_f32(texel[0]),
+                    f16_bits_to_f32(texel[1]),
+                    f16_bits_to_f32(texel[2]),
+                    f16_bits_to_f32(texel[3]),
+                ]);
+            }
+        }
+        pixels
+    }
+
+    /// Round-trips the REAL production WGSL transfer functions against the
+    /// CPU `ecolor` functions, negative inputs included (plan §4 "Negative
+    /// extension", §8 test-matrix row 1).
+    ///
+    /// Asserts, per input lane on `Rgba16Float` targets (i.e. genuinely f16
+    /// quantized, as a real egui frame would store them):
+    /// - the GPU result is never NaN (the regression the `sign·f(|x|)` fix
+    ///   guards against on drivers that lower `select` to arithmetic blends),
+    /// - decode/encode match `epaint::ecolor::{linear_from_gamma,
+    ///   gamma_from_linear}` within the §8 tolerance,
+    /// - `decode ∘ encode ≈ identity`.
+    ///
+    /// Adapter-requiring like the pipeline-cache test: machines without any
+    /// wgpu adapter skip with a message, never silently.
+    #[test]
+    fn transfer_functions_match_ecolor_on_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            },
+        )) {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                // Machines without any wgpu adapter skip; CI (macos) and dev
+                // machines with GPUs (or software rasterizers) always run this.
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!(
+                        "skipping transfer_functions_match_ecolor_on_gpu: no wgpu adapter: {err}"
+                    );
+                }
+                return;
+            }
+        };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("egui-wgpu transfer round-trip test"),
+            ..Default::default()
+        }))
+        .expect("failed to request a wgpu device for the transfer round-trip test");
+
+        // Any device error (validation or otherwise) fails the test.
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the transfer round-trip test: {err}");
+        }));
+
+        let inputs = transfer_test_inputs();
+
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("egui-wgpu transfer round-trip test"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                "{}\n{}",
+                include_str!("egui_transfer.wgsl"),
+                TRANSFER_TEST_WGSL
+            ))),
+        });
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("transfer round-trip test inputs"),
+            contents: bytemuck::cast_slice(&inputs),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("transfer round-trip test inputs layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new((NUM_TRANSFER_TEST_INPUTS * 16) as _),
+                },
+                count: None,
+            }],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transfer round-trip test inputs"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        const SIZE: u32 = 8; // must equal `GRID` in `TRANSFER_TEST_WGSL`
+        const BYTES_PER_ROW: u32 = 256; // 8 px × 8 B of data, padded to wgpu's alignment
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transfer round-trip test layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("transfer round-trip test pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_test"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                unclipped_depth: false,
+                conservative: false,
+                cull_mode: None,
+                front_face: wgpu::FrontFace::default(),
+                polygon_mode: wgpu::PolygonMode::default(),
+                strip_index_format: None,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                alpha_to_coverage_enabled: false,
+                count: 1,
+                mask: !0,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_test"),
+                compilation_options: Default::default(),
+                targets: &[const {
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None, // replace: raw function outputs, no blending
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                }; 3],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let make_target = |label: &'static str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let decode_target = make_target("transfer round-trip test decode target");
+        let encode_target = make_target("transfer round-trip test encode target");
+        let round_trip_target = make_target("transfer round-trip test round-trip target");
+
+        let make_readback = |label: &'static str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (BYTES_PER_ROW * SIZE) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let decode_readback = make_readback("transfer round-trip test decode readback");
+        let encode_readback = make_readback("transfer round-trip test encode readback");
+        let round_trip_readback = make_readback("transfer round-trip test round-trip readback");
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("transfer round-trip test encoder"),
+        });
+        {
+            let decode_view = decode_target.create_view(&wgpu::TextureViewDescriptor::default());
+            let encode_view = encode_target.create_view(&wgpu::TextureViewDescriptor::default());
+            let round_trip_view =
+                round_trip_target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("transfer round-trip test pass"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &decode_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &encode_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &round_trip_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        }),
+                    ],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            render_pass.set_pipeline(&pipeline);
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.draw(0..4, 0..NUM_TRANSFER_TEST_INPUTS as u32);
+        }
+        for (texture, buffer) in [
+            (&decode_target, &decode_readback),
+            (&encode_target, &encode_readback),
+            (&round_trip_target, &round_trip_readback),
+        ] {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(BYTES_PER_ROW),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the transfer round-trip frame");
+
+        let decode_pixels = read_f16_pixels(&device, &decode_readback, SIZE, BYTES_PER_ROW);
+        let encode_pixels = read_f16_pixels(&device, &encode_readback, SIZE, BYTES_PER_ROW);
+        let round_trip_pixels = read_f16_pixels(&device, &round_trip_readback, SIZE, BYTES_PER_ROW);
+
+        let mut checked = 0usize;
+        for (i, input) in inputs.iter().enumerate() {
+            for (lane, &x) in input[..3].iter().enumerate() {
+                let context = format!("input {i} lane {lane} (x = {x})");
+                assert_f16_close(
+                    decode_pixels[i][lane],
+                    epaint::ecolor::linear_from_gamma(x),
+                    &format!("decode of {context}"),
+                );
+                assert_f16_close(
+                    encode_pixels[i][lane],
+                    epaint::ecolor::gamma_from_linear(x),
+                    &format!("encode of {context}"),
+                );
+                assert_f16_close(
+                    round_trip_pixels[i][lane],
+                    x,
+                    &format!("decode∘encode round-trip of {context}"),
+                );
+                checked += 3;
+            }
+        }
+        assert_eq!(checked, NUM_TRANSFER_TEST_INPUTS * 3 * 3);
     }
 }

@@ -40,26 +40,9 @@ fn dither_interleaved(rgb: vec3<f32>, levels: f32, frag_coord: vec4<f32>) -> vec
     return rgb + noise / (levels - 1.0);
 }
 
-// 0-1 linear  from  0-1 sRGB gamma
-fn linear_from_gamma_rgb(srgb: vec3<f32>) -> vec3<f32> {
-    let cutoff = srgb < vec3<f32>(0.04045);
-    let lower = srgb / vec3<f32>(12.92);
-    let higher = pow((srgb + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-    return select(higher, lower, cutoff);
-}
-
-// 0-1 sRGB gamma  from  0-1 linear
-fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
-    let cutoff = rgb < vec3<f32>(0.0031308);
-    let lower = rgb * vec3<f32>(12.92);
-    let higher = vec3<f32>(1.055) * pow(rgb, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    return select(higher, lower, cutoff);
-}
-
-// 0-1 sRGBA gamma  from  0-1 linear
-fn gamma_from_linear_rgba(linear_rgba: vec4<f32>) -> vec4<f32> {
-    return vec4<f32>(gamma_from_linear_rgb(linear_rgba.rgb), linear_rgba.a);
-}
+// The color transfer functions (`linear_from_gamma_rgb`, `gamma_from_linear_rgb`,
+// `gamma_from_linear_rgba`) live in `egui_transfer.wgsl`, which `renderer.rs`
+// concatenates in front of this file.
 
 // [u8; 4] SRGB as u32 -> [r, g, b, a] in 0.-1
 fn unpack_color(color: u32) -> vec4<f32> {

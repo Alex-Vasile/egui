@@ -19,6 +19,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 * Per-viewport surface decisions are stored by the winit painter and re-decided when a window moves to another monitor; the painter exposes the decision per viewport (surfaced to apps via `egui::ViewportInfo`)
 
 ### 🐛 Fixed
+* WGSL transfer functions no longer evaluate `pow` on possibly-negative values (WGSL-undefined, NaN-prone on drivers that lower `select` to arithmetic blends): negatives take the odd-symmetric `sign(x)·f(|x|)` extension, matching `ecolor`; results for positive values are bit-identical (at `-0.0` the zero's sign bit can differ; the values compare equal)
 * Web now honors `WgpuConfiguration.surface.desired_maximum_frame_latency` instead of silently using wgpu's default (observable as changed frame latency on web)
 * The screen-capture state is recreated when the render-target format changes (e.g. after a monitor re-decide) instead of capturing into a stale-format texture
 

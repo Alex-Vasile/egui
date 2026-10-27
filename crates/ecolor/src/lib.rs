@@ -179,6 +179,99 @@ pub fn gamma_from_linear(linear: f32) -> f32 {
     }
 }
 
+/// Values straddling both transfer functions' interesting regions: the exact
+/// toe boundaries, both sides of them, the zeros, and negatives.
+#[cfg(test)]
+const GAMMA_TEST_VALUES: [f32; 12] = [
+    -10.0,
+    -4.0,
+    -0.5,
+    -0.040_45,    // the decode knee, negative side
+    -0.003_130_8, // the encode knee, negative side
+    -0.001,
+    0.0,
+    0.003_130_8, // the encode knee
+    0.040_45,    // the decode knee
+    0.5,
+    1.0,
+    10.0,
+];
+
+#[test]
+fn test_gamma_round_trip() {
+    // The float content contract (§4) needs both compositions to be the
+    // identity, including over the negative extension and at the toe
+    // boundaries.
+    for &v in &GAMMA_TEST_VALUES {
+        let tol = (v.abs() * 1e-5).max(1e-9);
+        let encoded_then_decoded = linear_from_gamma(gamma_from_linear(v));
+        assert!(
+            (encoded_then_decoded - v).abs() <= tol,
+            "encode∘decode of {v} gave {encoded_then_decoded}"
+        );
+        let decoded_then_encoded = gamma_from_linear(linear_from_gamma(v));
+        assert!(
+            (decoded_then_encoded - v).abs() <= tol,
+            "decode∘encode of {v} gave {decoded_then_encoded}"
+        );
+    }
+}
+
+#[test]
+fn test_gamma_odd_symmetry() {
+    // The negative extension is odd-symmetric: `f(-x) == -f(x)` (the same
+    // convention as IEC 61966-2-1 extended range / CSS Color 4).
+    for &v in &GAMMA_TEST_VALUES {
+        let tol = (v.abs() * 1e-6).max(1e-9);
+        assert!(
+            (linear_from_gamma(-v) + linear_from_gamma(v)).abs() <= tol,
+            "linear_from_gamma is not odd at ±{v}"
+        );
+        assert!(
+            (gamma_from_linear(-v) + gamma_from_linear(v)).abs() <= tol,
+            "gamma_from_linear is not odd at ±{v}"
+        );
+    }
+}
+
+#[test]
+fn test_premultiply_rule_is_gamma_space() {
+    // The §4 float-color contract stores float texels as
+    // `stored = a × enc(L)` — exactly `Color32`'s convention of premultiplied
+    // alpha in gamma space, which `from_rgba_unmultiplied` embodies: it
+    // multiplies the already-gamma-encoded components by the alpha. Assert
+    // the u8 product matches the f32 rule (± 1 for u8 rounding), and that the
+    // photometric misreading — premultiplying in linear, then encoding,
+    // `enc(a × L)` — is measurably different for a translucent mid-tone.
+    let cases: [(u8, u8); 4] = [(200, 128), (51, 128), (255, 64), (17, 255)];
+    for &(enc_u8, a_u8) in &cases {
+        let color = Color32::from_rgba_unmultiplied(enc_u8, enc_u8, enc_u8, a_u8);
+        let a = f32::from(a_u8) / 255.0;
+        let enc = f32::from(enc_u8) / 255.0;
+        let expected = (a * enc * 255.0).round();
+        for channel in [color.r(), color.g(), color.b()] {
+            assert!(
+                (f32::from(channel) - expected).abs() <= 1.0,
+                "stored {channel} for enc {enc_u8}, a {a_u8}, expected {expected}"
+            );
+        }
+    }
+
+    // enc 51, a 128: `a × enc` stores ~26; `enc(a × L)` would store ~35.
+    let enc = 51.0 / 255.0;
+    let a = 128.0 / 255.0;
+    let stored = Color32::from_rgba_unmultiplied(51, 51, 51, 128).r();
+    let photometric = (gamma_from_linear(a * linear_from_gamma(enc)) * 255.0).round();
+    assert!(
+        (f32::from(stored) - a * enc * 255.0).abs() <= 1.0,
+        "stored {stored} must match a × enc"
+    );
+    assert!(
+        (photometric - f32::from(stored)).abs() > 2.0,
+        "photometric reading ({photometric}) must be distinguishable from the stored {stored}"
+    );
+}
+
 // ----------------------------------------------------------------------------
 
 /// Cheap and ugly.
