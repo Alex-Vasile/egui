@@ -3,7 +3,11 @@
 #![expect(clippy::unwrap_used)] // TODO(emilk): avoid unwraps
 #![expect(unsafe_code)]
 
-use crate::{RenderState, SurfaceConfig, SurfaceErrorAction, WgpuConfiguration, renderer};
+use crate::renderer;
+use crate::{
+    RenderState, SurfaceConfig, SurfaceErrorAction, SurfaceStatus, SurfaceTarget,
+    WgpuConfiguration, build_configuration, decide_surface_target,
+};
 use crate::{RendererOptions, capture::CaptureState};
 use core::num::NonZeroU32;
 use egui::{Context, ViewportId, ViewportIdMap, ViewportIdSet};
@@ -11,6 +15,24 @@ use std::sync::Arc;
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
+
+    /// The decided surface target (format + color space) for this viewport.
+    ///
+    /// Decided once per viewport by [`decide_surface_target`] and reused for
+    /// every reconfiguration; only a monitor change re-runs the decision.
+    target: SurfaceTarget,
+
+    /// Whether the surface preference was granted, or fell back, for this viewport.
+    status: SurfaceStatus,
+
+    /// The last monitor this viewport was seen on, used to detect the monitor
+    /// changes that trigger a re-decide (plan §7).
+    ///
+    /// Note: after a failed re-decide this is updated while the decision in
+    /// [`Self::target`] still belongs to the older monitor — the failed attempt
+    /// is not retried every frame.
+    monitor: Option<winit::monitor::MonitorHandle>,
+
     alpha_mode: wgpu::CompositeAlphaMode,
     width: u32,
     height: u32,
@@ -38,6 +60,14 @@ pub struct Painter {
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
     msaa_texture_view: ViewportIdMap<wgpu::TextureView>,
     surfaces: ViewportIdMap<SurfaceState>,
+    /// Retained per-viewport windows.
+    ///
+    /// Keeps the [`winit::window::Window`] alive as long as a viewport's surface
+    /// uses it — a surface created from raw window handles
+    /// ([`Self::set_window_unsafe`]) retains nothing itself. Refreshed on every
+    /// paint, which also fills the map for viewports installed through the
+    /// unsafe path.
+    windows: ViewportIdMap<Arc<winit::window::Window>>,
 }
 
 impl Painter {
@@ -74,6 +104,7 @@ impl Painter {
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
             msaa_texture_view: Default::default(),
+            windows: Default::default(),
         }
     }
 
@@ -87,6 +118,19 @@ impl Painter {
     /// The surface configuration (present mode, frame latency) the surfaces are configured with.
     pub fn surface_config(&self) -> SurfaceConfig {
         self.config.surface
+    }
+
+    /// The per-viewport surface decision (target + status), if the viewport has a surface.
+    ///
+    /// The target answers *what is configured*; the status answers *was the
+    /// preference honored*. Headless/no-surface viewports have no decision.
+    pub fn surface_decision(
+        &self,
+        viewport_id: ViewportId,
+    ) -> Option<(SurfaceTarget, SurfaceStatus)> {
+        self.surfaces
+            .get(&viewport_id)
+            .map(|state| (state.target, state.status))
     }
 
     /// Change the surface configuration (present mode, frame latency) at runtime.
@@ -107,6 +151,11 @@ impl Painter {
         }
     }
 
+    /// Reconfigures the surface from the viewport's stored decision.
+    ///
+    /// Always builds the configuration from the stored
+    /// [`SurfaceTarget`](crate::SurfaceTarget) — reconfigurations
+    /// (`needs_reconfigure`, `Suboptimal`, `Outdated`, resize) never re-decide.
     fn configure_surface(
         surface_state: &SurfaceState,
         render_state: &RenderState,
@@ -115,7 +164,7 @@ impl Painter {
         profiling::function_scope!();
 
         let SurfaceConfig {
-            present_mode,
+            present_mode: _,
             desired_maximum_frame_latency,
         } = *config;
 
@@ -128,20 +177,16 @@ impl Painter {
             desired_maximum_frame_latency
         };
 
-        let width = surface_state.width;
-        let height = surface_state.height;
-
-        let mut surf_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: render_state.target_format,
-            present_mode,
-            alpha_mode: surface_state.alpha_mode,
-            view_formats: vec![render_state.target_format],
-            ..surface_state
-                .surface
-                .get_default_config(&render_state.adapter, width, height)
-                .expect("The surface isn't supported by this adapter")
-        };
+        let surface_capabilities = surface_state
+            .surface
+            .get_capabilities(&render_state.adapter);
+        let mut surf_config = build_configuration(
+            &surface_capabilities,
+            &surface_state.target,
+            [surface_state.width, surface_state.height],
+            config,
+            surface_state.alpha_mode,
+        );
 
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
@@ -169,14 +214,15 @@ impl Painter {
         };
 
         let surface = self.instance.create_surface(Arc::clone(window))?;
+        self.windows.insert(viewport_id, Arc::clone(window));
         self.install_surface(
             surface,
             viewport_id,
+            window.current_monitor(),
             old_state.width,
             old_state.height,
             old_state.resizing,
-        );
-        Ok(())
+        )
     }
 
     /// Updates (or clears) the [`winit::window::Window`] associated with the [`Painter`]
@@ -208,14 +254,18 @@ impl Painter {
         profiling::scope!("Painter::set_window"); // profile_function gives bad names for async functions
 
         if let Some(window) = window {
+            self.windows.insert(viewport_id, Arc::clone(&window));
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
+                let monitor = window.current_monitor();
                 let surface = self.instance.create_surface(window)?;
-                self.add_surface(surface, viewport_id, size).await?;
+                self.add_surface(surface, viewport_id, monitor, size)
+                    .await?;
             }
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            self.windows.clear();
         }
         Ok(())
     }
@@ -240,11 +290,16 @@ impl Painter {
                     self.instance
                         .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window)?)?
                 };
-                self.add_surface(surface, viewport_id, size).await?;
+                // The window is only borrowed here, so it cannot be retained;
+                // [`Self::paint_and_update_textures`] fills in the retention on
+                // its first frame.
+                self.add_surface(surface, viewport_id, window.current_monitor(), size)
+                    .await?;
             }
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            self.windows.clear();
         }
         Ok(())
     }
@@ -253,6 +308,7 @@ impl Painter {
         &mut self,
         surface: wgpu::Surface<'static>,
         viewport_id: ViewportId,
+        monitor: Option<winit::monitor::MonitorHandle>,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<(), crate::WgpuError> {
         if self.render_state.is_none() {
@@ -261,11 +317,22 @@ impl Painter {
                     .await?;
             self.render_state = Some(render_state);
         }
-        self.install_surface(surface, viewport_id, size.width, size.height, false);
+        self.install_surface(
+            surface,
+            viewport_id,
+            monitor,
+            size.width,
+            size.height,
+            false,
+        )?;
         Ok(())
     }
 
     /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
+    ///
+    /// Decides the viewport's [`SurfaceTarget`](crate::SurfaceTarget) from the
+    /// surface's actual capabilities (fetched once, shared with the alpha-mode
+    /// pick) and stores the decision for every future reconfiguration.
     ///
     /// Render state must already be initialised before calling this.
     // NOTE: The same assumption is already required by `resize_and_generate_depth_texture_view_and_msaa_view`.
@@ -273,39 +340,55 @@ impl Painter {
         &mut self,
         surface: wgpu::Surface<'static>,
         viewport_id: ViewportId,
+        monitor: Option<winit::monitor::MonitorHandle>,
         width: u32,
         height: u32,
         resizing: bool,
-    ) {
-        let alpha_mode = {
-            // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
-            let render_state = self
-                .render_state
-                .as_ref()
-                .expect("install_surface called before render_state initialization");
-            if self.support_transparent_backbuffer {
-                let supported_alpha_modes =
-                    surface.get_capabilities(&render_state.adapter).alpha_modes;
-                // Prefer pre multiplied over post multiplied!
-                if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                    wgpu::CompositeAlphaMode::PreMultiplied
-                } else if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-                {
-                    wgpu::CompositeAlphaMode::PostMultiplied
-                } else {
-                    log::warn!(
-                        "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
-                    );
-                    wgpu::CompositeAlphaMode::Auto
-                }
+    ) -> Result<(), crate::WgpuError> {
+        // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
+        let render_state = self
+            .render_state
+            .as_ref()
+            .expect("install_surface called before render_state initialization");
+
+        // One capabilities fetch, shared by the alpha-mode pick and the decider.
+        let surface_capabilities = surface.get_capabilities(&render_state.adapter);
+
+        let alpha_mode = if self.support_transparent_backbuffer {
+            let supported_alpha_modes = &surface_capabilities.alpha_modes;
+            // Prefer pre multiplied over post multiplied!
+            if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+                wgpu::CompositeAlphaMode::PostMultiplied
             } else {
+                log::warn!(
+                    "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
+                );
                 wgpu::CompositeAlphaMode::Auto
             }
+        } else {
+            wgpu::CompositeAlphaMode::Auto
         };
+
+        let (target, status) =
+            decide_surface_target(&surface_capabilities, self.config.surface_preference)?;
+        if let SurfaceStatus::FellBack { reason } = status {
+            log::info!(
+                "Surface preference {:?} not grantable for viewport {viewport_id:?} ({reason:?}); using {:?} + {:?}",
+                self.config.surface_preference,
+                target.format,
+                target.color_space
+            );
+        }
+
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
                 surface,
+                target,
+                status,
+                monitor,
                 width,
                 height,
                 alpha_mode,
@@ -316,13 +399,14 @@ impl Painter {
         );
         let Some(width) = NonZeroU32::new(width) else {
             log::debug!("The window width was zero; skipping generate textures");
-            return;
+            return Ok(());
         };
         let Some(height) = NonZeroU32::new(height) else {
             log::debug!("The window height was zero; skipping generate textures");
-            return;
+            return Ok(());
         };
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
+        Ok(())
     }
 
     /// Returns the maximum texture dimension supported if known
@@ -383,28 +467,48 @@ impl Painter {
             .then_some(self.render_state.as_ref())
             .flatten()
         {
-            let texture_format = render_state.target_format;
+            let texture_format = surface_state.target.format;
             self.msaa_texture_view.insert(
                 viewport_id,
-                render_state
-                    .device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some("egui_msaa_texture"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: self.options.msaa_samples.max(1),
-                        dimension: wgpu::TextureDimension::D2,
-                        format: texture_format,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[texture_format],
-                    })
-                    .create_view(&wgpu::TextureViewDescriptor::default()),
+                Self::generate_msaa_texture_view(
+                    render_state,
+                    self.options.msaa_samples,
+                    texture_format,
+                    width,
+                    height,
+                ),
             );
         }
+    }
+
+    /// Creates an MSAA texture view for `width` x `height` at `target_format`.
+    ///
+    /// The MSAA intermediate must always match the render-pass target format,
+    /// so it is regenerated whenever a viewport's stored target changes.
+    fn generate_msaa_texture_view(
+        render_state: &RenderState,
+        msaa_samples: u32,
+        target_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> wgpu::TextureView {
+        render_state
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("egui_msaa_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: msaa_samples.max(1),
+                dimension: wgpu::TextureDimension::D2,
+                format: target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[target_format],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     /// Handles changes of the resizing state.
@@ -550,6 +654,64 @@ impl Painter {
             return vsync_sec;
         };
 
+        // Retain the window for this viewport (fills the gap for viewports
+        // installed via `set_window_unsafe`, which cannot retain their window).
+        self.windows.insert(viewport_id, Arc::clone(window));
+
+        // Monitor-driven re-decide (plan §7): capability follows the display.
+        // The decision is re-run only when the viewport's monitor changed; an
+        // error keeps the old target and never wedges the frame loop.
+        {
+            let current_monitor = window.current_monitor();
+            if surface_state.monitor != current_monitor {
+                let surface_capabilities = surface_state
+                    .surface
+                    .get_capabilities(&render_state.adapter);
+                match decide_surface_target(&surface_capabilities, self.config.surface_preference) {
+                    Ok((target, status)) => {
+                        if surface_state.target != target {
+                            log::info!(
+                                "Viewport {viewport_id:?} changed monitors; surface target {:?} + {:?} -> {:?} + {:?}",
+                                surface_state.target.format,
+                                surface_state.target.color_space,
+                                target.format,
+                                target.color_space
+                            );
+                            surface_state.target = target;
+                            // The MSAA intermediate must match the target format.
+                            if self.options.msaa_samples > 1
+                                && let (Some(width), Some(height)) = (
+                                    NonZeroU32::new(surface_state.width),
+                                    NonZeroU32::new(surface_state.height),
+                                )
+                            {
+                                let view = Self::generate_msaa_texture_view(
+                                    render_state,
+                                    self.options.msaa_samples,
+                                    target.format,
+                                    width.get(),
+                                    height.get(),
+                                );
+                                self.msaa_texture_view.insert(viewport_id, view);
+                            }
+                            surface_state.needs_reconfigure = true;
+                        }
+                        surface_state.status = status;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Re-deciding the surface target for viewport {viewport_id:?} after a monitor change failed; keeping {:?} + {:?}: {err}",
+                            surface_state.target.format,
+                            surface_state.target.color_space
+                        );
+                    }
+                }
+                // Stored even on failure, so a transient error is not re-hit
+                // (and re-logged) every frame.
+                surface_state.monitor = current_monitor;
+            }
+        }
+
         let mut encoder =
             render_state
                 .device
@@ -583,6 +745,7 @@ impl Painter {
                 &mut encoder,
                 clipped_primitives,
                 &screen_descriptor,
+                surface_state.target.format,
             )
         };
 
@@ -651,7 +814,7 @@ impl Painter {
                             height: surface_state.height,
                             depth_or_array_layers: 1,
                         },
-                        render_state.target_format,
+                        surface_state.target.format,
                     ),
                 };
                 if size.width == 0 || size.height == 0 {
@@ -662,6 +825,12 @@ impl Painter {
                 let capture_state = self
                     .screen_capture_state
                     .get_or_insert_with(|| CaptureState::new(&render_state.device, size, format));
+                // The capture state is format-locked, but the target format is
+                // decided per viewport and can change under it (monitor
+                // re-decide); recreate when it drifted.
+                if capture_state.texture.format() != format {
+                    *capture_state = CaptureState::new(&render_state.device, size, format);
+                }
                 capture_state.update(&render_state.device, size);
 
                 &capture_state.texture
@@ -736,6 +905,7 @@ impl Painter {
                 &mut render_pass.forget_lifetime(),
                 clipped_primitives,
                 &screen_descriptor,
+                surface_state.target.format,
             );
 
             if capture && let Some(capture_state) = &mut self.screen_capture_state {
@@ -802,6 +972,7 @@ impl Painter {
             .retain(|id, _| active_viewports.contains(id));
         self.msaa_texture_view
             .retain(|id, _| active_viewports.contains(id));
+        self.windows.retain(|id, _| active_viewports.contains(id));
     }
 
     #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]

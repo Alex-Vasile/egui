@@ -73,3 +73,7 @@ wgpu = { workspace = true, features = ["wgsl"] }
 
 egui = { workspace = true, optional = true, default-features = false }
 winit = { workspace = true, optional = true, default-features = false }
+
+[dev-dependencies]
+# Drives the adapter-requiring pipeline-cache test (the crate's first runtime test).
+pollster.workspace = true

@@ -44,28 +44,6 @@ impl Custom3d {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("custom3d"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: None,
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu_render_state.target_format.into())],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("custom3d"),
             contents: bytemuck::cast_slice(&[0.0_f32; 4]), // 16 bytes aligned!
@@ -83,6 +61,11 @@ impl Custom3d {
             }],
         });
 
+        // The render pipeline is created in `prepare` on first use, for the
+        // `target_format` of the render pass the callback paints into: the
+        // format is decided per viewport and can change when the window moves
+        // between monitors, so it cannot be known at creation time.
+        //
         // Because the graphics pipeline must have the same lifetime as the egui render pass,
         // instead of storing the pipeline in our `Custom3D` struct, we insert it into the
         // `paint_callback_resources` type map, which is stored alongside the render pass.
@@ -91,7 +74,9 @@ impl Custom3d {
             .write()
             .callback_resources
             .insert(TriangleRenderResources {
-                pipeline,
+                pipeline: None,
+                pipeline_layout,
+                shader,
                 bind_group,
                 uniform_buffer,
             });
@@ -154,11 +139,13 @@ impl egui_wgpu::CallbackTrait for CustomTriangleCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &TriangleRenderResources = resources.get().unwrap();
+        let resources: &mut TriangleRenderResources = resources.get_mut().unwrap();
+        resources.pipeline_for(device, target_format);
         resources.prepare(device, queue, self.angle);
         Vec::new()
     }
@@ -166,11 +153,22 @@ impl egui_wgpu::CallbackTrait for CustomTriangleCallback {
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
+        target_format: wgpu::TextureFormat,
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources,
     ) {
         let resources: &TriangleRenderResources = resources.get().unwrap();
-        resources.paint(render_pass);
+        match resources.pipeline.as_ref() {
+            Some((format, pipeline)) if *format == target_format => {
+                resources.paint(render_pass, pipeline);
+            }
+            _ => {
+                // `prepare` ran earlier in this frame and creates (or re-creates)
+                // the pipeline for the target format, so this is unreachable in
+                // practice.
+                log::warn!("custom3d has no pipeline for target format {target_format:?}");
+            }
+        }
     }
 }
 
@@ -188,12 +186,55 @@ impl Custom3d {
 }
 
 struct TriangleRenderResources {
-    pipeline: wgpu::RenderPipeline,
+    /// The render pipeline for the format it was built for, created in
+    /// `prepare` on first use and re-created when the target format changes.
+    pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
 }
 
 impl TriangleRenderResources {
+    /// Returns the pipeline for `target_format`, (re-)creating it if needed.
+    fn pipeline_for(
+        &mut self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+    ) -> &wgpu::RenderPipeline {
+        if self
+            .pipeline
+            .as_ref()
+            .is_none_or(|(format, _)| *format != target_format)
+        {
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("custom3d"),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &self.shader,
+                    entry_point: None,
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(target_format.into())],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipeline = Some((target_format, pipeline));
+        }
+
+        // Set above
+        &self.pipeline.as_ref().unwrap().1
+    }
+
     fn prepare(&self, _device: &wgpu::Device, queue: &wgpu::Queue, angle: f32) {
         // Update our uniform buffer with the angle from the UI
         queue.write_buffer(
@@ -203,9 +244,9 @@ impl TriangleRenderResources {
         );
     }
 
-    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline) {
         // Draw our triangle!
-        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }

@@ -128,9 +128,6 @@ pub struct RenderState {
     /// Wgpu queue used for rendering, created from the adapter.
     pub queue: wgpu::Queue,
 
-    /// The target texture format used for presenting to the window.
-    pub target_format: wgpu::TextureFormat,
-
     /// Egui renderer responsible for drawing the UI.
     pub renderer: Arc<RwLock<Renderer>>,
 }
@@ -267,16 +264,11 @@ impl RenderState {
 
         log_adapter_info(&adapter.get_info());
 
-        let surface_formats = {
-            profiling::scope!("get_capabilities");
-            compatible_surface.map_or_else(
-                || vec![wgpu::TextureFormat::Rgba8Unorm],
-                |s| s.get_capabilities(&adapter).formats,
-            )
-        };
-        let target_format = crate::preferred_framebuffer_format(&surface_formats)?;
-
-        let renderer = Renderer::new(&device, target_format, options);
+        // The renderer creates its pipelines lazily, keyed by the format of the
+        // actual render-pass target, which is decided per viewport
+        // (see [`decide_surface_target`]) — a shared render state cannot answer
+        // that question.
+        let renderer = Renderer::new(&device, options);
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
@@ -288,7 +280,6 @@ impl RenderState {
             available_adapters,
             device,
             queue,
-            target_format,
             renderer: Arc::new(RwLock::new(renderer)),
         })
     }

@@ -11,6 +11,9 @@ pub(crate) struct WebPainterWgpu {
     canvas: HtmlCanvasElement,
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
+    /// The decided surface target (format + color space) for the canvas,
+    /// decided once at creation against the canvas' actual capabilities.
+    surface_target: egui_wgpu::SurfaceTarget,
     surface_configuration: wgpu::SurfaceConfiguration,
     render_state: Option<RenderState>,
     on_surface_status: Arc<dyn Fn(&wgpu::CurrentSurfaceTexture) -> SurfaceErrorAction>,
@@ -109,16 +112,28 @@ impl WebPainterWgpu {
         .await
         .map_err(|err| err.to_string())?;
 
-        let default_configuration = surface
-            .get_default_config(&render_state.adapter, 0, 0) // Width/height is set later.
-            .ok_or("The surface isn't supported by this adapter")?;
+        let surface_capabilities = surface.get_capabilities(&render_state.adapter);
+        let (surface_target, status) = egui_wgpu::decide_surface_target(
+            &surface_capabilities,
+            wgpu_options.surface_preference,
+        )
+        .map_err(|err| format!("failed to decide a surface target for the canvas: {err}"))?;
+        if let egui_wgpu::SurfaceStatus::FellBack { reason } = status {
+            log::info!(
+                "Surface preference {:?} not grantable for the canvas ({reason:?}); using {:?} + {:?}",
+                wgpu_options.surface_preference,
+                surface_target.format,
+                surface_target.color_space
+            );
+        }
 
-        let surface_configuration = wgpu::SurfaceConfiguration {
-            format: render_state.target_format,
-            present_mode: wgpu_options.surface.present_mode,
-            view_formats: vec![render_state.target_format],
-            ..default_configuration
-        };
+        let surface_configuration = egui_wgpu::build_configuration(
+            &surface_capabilities,
+            &surface_target,
+            [0, 0], // Width/height is set later.
+            &wgpu_options.surface,
+            wgpu::CompositeAlphaMode::Auto,
+        );
 
         log::debug!("wgpu painter initialized.");
 
@@ -127,6 +142,7 @@ impl WebPainterWgpu {
             instance,
             render_state: Some(render_state),
             surface,
+            surface_target,
             surface_configuration,
             depth_stencil_format,
             depth_texture_view: None,
@@ -219,6 +235,7 @@ impl WebPainter for WebPainterWgpu {
                 &mut encoder,
                 clipped_primitives,
                 &screen_descriptor,
+                self.surface_target.format,
             )
         };
 
@@ -344,6 +361,7 @@ impl WebPainter for WebPainterWgpu {
                     &mut render_pass.forget_lifetime(),
                     clipped_primitives,
                     &screen_descriptor,
+                    self.surface_target.format,
                 );
             }
 

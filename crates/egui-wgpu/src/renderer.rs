@@ -1,8 +1,10 @@
 use core::{num::NonZeroU64, ops::Range};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use ahash::HashMap;
 use bytemuck::Zeroable as _;
+use epaint::mutex::Mutex;
 use epaint::{PaintCallbackInfo, Primitive, Vertex, emath::NumExt as _};
 
 use wgpu::util::DeviceExt as _;
@@ -90,6 +92,7 @@ pub trait CallbackTrait: Send + Sync {
         &self,
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
+        _target_format: wgpu::TextureFormat,
         _screen_descriptor: &ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut CallbackResources,
@@ -112,9 +115,15 @@ pub trait CallbackTrait: Send + Sync {
     ///
     /// It is given access to the [`wgpu::RenderPass`] so that it can issue draw commands
     /// into the same [`wgpu::RenderPass`] that is used for all other egui elements.
+    ///
+    /// `target_format` is the format of the color attachment the render pass draws
+    /// into — the same value [`CallbackTrait::prepare`] received. Pipelines must be
+    /// created for (and keyed by) this format: it can differ between viewports and
+    /// change over a viewport's lifetime, so it cannot be known up front.
     fn paint(
         &self,
         info: PaintCallbackInfo,
+        target_format: wgpu::TextureFormat,
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &CallbackResources,
     );
@@ -235,7 +244,18 @@ impl Default for RendererOptions {
 
 /// Renderer for a egui based GUI.
 pub struct Renderer {
-    pipeline: wgpu::RenderPipeline,
+    /// Render pipelines keyed by the format of the render-pass target.
+    ///
+    /// Created lazily on first use of each format, in
+    /// [`Self::update_buffers`]. Only the target format bakes a pipeline:
+    /// a color-space change is a surface reconfigure, never a pipeline change.
+    pipelines: Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
+
+    /// The egui shader module, from which all pipelines in the cache are built.
+    shader_module: wgpu::ShaderModule,
+
+    /// The pipeline layout, shared by all pipelines in the cache.
+    pipeline_layout: wgpu::PipelineLayout,
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
@@ -268,13 +288,11 @@ pub struct Renderer {
 impl Renderer {
     /// Creates a renderer for a egui UI.
     ///
-    /// `output_color_format` should preferably be [`wgpu::TextureFormat::Rgba8Unorm`] or
-    /// [`wgpu::TextureFormat::Bgra8Unorm`], i.e. in gamma-space.
-    pub fn new(
-        device: &wgpu::Device,
-        output_color_format: wgpu::TextureFormat,
-        options: RendererOptions,
-    ) -> Self {
+    /// Render pipelines are created lazily, keyed by the format of the
+    /// render-pass target, the first time [`Self::update_buffers`] sees a
+    /// format. Pass the actual target format of each render pass to
+    /// [`Self::render`] and [`Self::update_buffers`].
+    pub fn new(device: &wgpu::Device, options: RendererOptions) -> Self {
         profiling::function_scope!();
 
         let shader = wgpu::ShaderModuleDescriptor {
@@ -386,89 +404,15 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let depth_stencil = options
-            .depth_stencil_format
-            .map(|format| wgpu::DepthStencilState {
-                format,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            });
-
-        let pipeline = {
-            profiling::scope!("create_render_pipeline");
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("egui_pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    entry_point: Some("vs_main"),
-                    module: &module,
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: 5 * 4,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        // 0: vec2 position
-                        // 1: vec2 texture coordinates
-                        // 2: uint color
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default()
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    unclipped_depth: false,
-                    conservative: false,
-                    cull_mode: None,
-                    front_face: wgpu::FrontFace::default(),
-                    polygon_mode: wgpu::PolygonMode::default(),
-                    strip_index_format: None,
-                },
-                depth_stencil,
-                multisample: wgpu::MultisampleState {
-                    alpha_to_coverage_enabled: false,
-                    count: options.msaa_samples.max(1),
-                    mask: !0,
-                },
-
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(if output_color_format.is_srgb() {
-                        log::warn!("Detected a linear (sRGBA aware) framebuffer {output_color_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm");
-                        "fs_main_linear_framebuffer"
-                    } else {
-                        "fs_main_gamma_framebuffer" // this is what we prefer
-                    }),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: output_color_format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default()
-                }),
-                multiview_mask: None,
-                cache: None,
-            }
-        )
-        };
-
         const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (core::mem::size_of::<Vertex>() * 1024) as _;
         const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (core::mem::size_of::<u32>() * 1024 * 3) as _;
 
         Self {
-            pipeline,
+            pipelines: Mutex::new(HashMap::default()),
+            shader_module: module,
+            pipeline_layout,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -493,6 +437,32 @@ impl Renderer {
         }
     }
 
+    /// Creates (if needed) the render pipeline for `target_format`.
+    ///
+    /// Exactly one pipeline is cached per target format; the cache is shared by
+    /// all viewports, so viewports rendering at different formats coexist.
+    ///
+    /// The pipeline is compiled outside the lock: pipeline creation is expensive
+    /// and must not stall a concurrent `render` reading the cache. A racing
+    /// double compile is benign — the first pipeline inserted wins.
+    fn ensure_pipeline(&self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+        if self.pipelines.lock().contains_key(&target_format) {
+            return;
+        }
+
+        let pipeline = Arc::new(create_pipeline(
+            device,
+            &self.shader_module,
+            &self.pipeline_layout,
+            &self.options,
+            target_format,
+        ));
+        self.pipelines
+            .lock()
+            .entry(target_format)
+            .or_insert(pipeline);
+    }
+
     /// Executes the egui renderer onto an existing wgpu renderpass.
     ///
     /// Note that the lifetime of `render_pass` is `'static` which requires a call to [`wgpu::RenderPass::forget_lifetime`].
@@ -501,15 +471,28 @@ impl Renderer {
     /// The only consequence of `forget_lifetime` is that any operation on the parent encoder will cause a runtime error
     /// instead of a compile time error.
     ///
+    /// `target_format` is the format of the color attachment the render pass draws into.
+    /// It selects the cached pipeline, so [`Self::update_buffers`] must have been
+    /// called with it at some point before (viewports rendering at different
+    /// formats can interleave their `update_buffers` calls freely).
+    ///
     /// # Panic
-    /// Always ensure that [`Renderer::update_buffers`] has been called otherwise calling [`Renderer::render`] will panic!
+    /// Panics if [`Renderer::update_buffers`] has never been called with this `target_format`!
     pub fn render(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
         paint_jobs: &[epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
+        target_format: wgpu::TextureFormat,
     ) {
         profiling::function_scope!();
+
+        let pipeline = {
+            let pipelines = self.pipelines.lock();
+            pipelines.get(&target_format).cloned().expect(
+                "You must call .update_buffers() with the same target format before .render()",
+            )
+        };
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
@@ -535,7 +518,7 @@ impl Renderer {
                     0.0,
                     1.0,
                 );
-                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_pipeline(&pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 needs_reset = false;
             }
@@ -624,7 +607,8 @@ impl Renderer {
                             1.0,
                         );
 
-                        cbfn.0.paint(info, render_pass, &self.callback_resources);
+                        cbfn.0
+                            .paint(info, target_format, render_pass, &self.callback_resources);
                     }
                 }
             }
@@ -952,6 +936,10 @@ impl Renderer {
     /// Uploads the uniform, vertex and index data used by the renderer.
     /// Should be called before [`Self::render`].
     ///
+    /// `target_format` is the format of the color attachment the upcoming render
+    /// pass draws into; the pipeline for it is created here if this is its first
+    /// use.
+    ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
     pub fn update_buffers(
         &mut self,
@@ -960,8 +948,11 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         paint_jobs: &[epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
+        target_format: wgpu::TextureFormat,
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
+
+        self.ensure_pipeline(device, target_format);
 
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
@@ -1099,6 +1090,7 @@ impl Renderer {
                 user_cmd_bufs.extend(callback.prepare(
                     device,
                     queue,
+                    target_format,
                     screen_descriptor,
                     encoder,
                     &mut self.callback_resources,
@@ -1193,6 +1185,93 @@ fn create_sampler(
     })
 }
 
+/// Creates the egui render pipeline for one render-pass target format.
+///
+/// The per-format entry-point choice is the gamma-passthrough sniff it has
+/// always been ([`wgpu::TextureFormat::is_srgb`]); deriving the encoding from
+/// anything richer is future work (plan §3).
+fn create_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    options: &RendererOptions,
+    target_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    profiling::scope!("create_render_pipeline");
+
+    let depth_stencil = options
+        .depth_stencil_format
+        .map(|format| wgpu::DepthStencilState {
+            format,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("egui_pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            entry_point: Some("vs_main"),
+            module,
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 5 * 4,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                // 0: vec2 position
+                // 1: vec2 texture coordinates
+                // 2: uint color
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default()
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            unclipped_depth: false,
+            conservative: false,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::default(),
+            polygon_mode: wgpu::PolygonMode::default(),
+            strip_index_format: None,
+        },
+        depth_stencil,
+        multisample: wgpu::MultisampleState {
+            alpha_to_coverage_enabled: false,
+            count: options.msaa_samples.max(1),
+            mask: !0,
+        },
+
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(if target_format.is_srgb() {
+                log::warn!("Detected a linear (sRGBA aware) framebuffer {target_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm");
+                "fs_main_linear_framebuffer"
+            } else {
+                "fs_main_gamma_framebuffer" // this is what we prefer
+            }),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default()
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_vertex_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     profiling::function_scope!();
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -1265,3 +1344,191 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    use core::time::Duration;
+
+    /// Renders one empty egui frame offscreen through [`Renderer::update_buffers`]
+    /// and [`Renderer::render`], as a real render pass onto a real texture.
+    fn render_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        target_format: wgpu::TextureFormat,
+    ) {
+        const SIZE: u32 = 64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui-wgpu pipeline cache test"),
+        });
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [SIZE, SIZE],
+            pixels_per_point: 1.0,
+        };
+        renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            &[],
+            &screen_descriptor,
+            target_format,
+        );
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("egui-wgpu pipeline cache test target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        {
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-wgpu pipeline cache test pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            renderer.render(&mut render_pass, &[], &screen_descriptor, target_format);
+        }
+
+        queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the pipeline cache test frame");
+    }
+
+    /// The pipeline cache is keyed by target format: repeated renders at one
+    /// format reuse one pipeline, a second format gets its own entry, and no
+    /// device error surfaces along the way (plan §8, row 1).
+    ///
+    /// Adapter-requiring: this is egui-wgpu's first runtime test. Machines
+    /// without any wgpu adapter skip with a message; CI and normal dev
+    /// machines (hardware GPU or software rasterizer) always run it.
+    #[test]
+    fn pipeline_cache_is_keyed_by_target_format() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            },
+        )) {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                // Machines without any wgpu adapter skip; CI (macos) and dev
+                // machines with GPUs (or software rasterizers) always run this.
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!(
+                        "skipping pipeline_cache_is_keyed_by_target_format: no wgpu adapter: {err}"
+                    );
+                }
+                return;
+            }
+        };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("egui-wgpu pipeline cache test"),
+            ..Default::default()
+        }))
+        .expect("failed to request a wgpu device for the pipeline cache test");
+
+        // Any device error (validation or otherwise) fails the test.
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the pipeline cache test: {err}");
+        }));
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        assert!(
+            renderer.pipelines.lock().is_empty(),
+            "pipelines must be created lazily, not in Renderer::new"
+        );
+
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let first_bgra = renderer
+            .pipelines
+            .lock()
+            .get(&wgpu::TextureFormat::Bgra8Unorm)
+            .cloned()
+            .expect("the Bgra8Unorm pipeline must be cached after the first render");
+
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+
+        {
+            let pipelines = renderer.pipelines.lock();
+            assert_eq!(
+                pipelines.len(),
+                1,
+                "repeated renders at the same format must not add cache entries"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &first_bgra,
+                    pipelines
+                        .get(&wgpu::TextureFormat::Bgra8Unorm)
+                        .expect("the Bgra8Unorm cache entry must survive")
+                ),
+                "repeated renders at the same format must reuse the cached pipeline"
+            );
+        }
+
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let pipelines = renderer.pipelines.lock();
+        assert_eq!(
+            pipelines.len(),
+            2,
+            "a second target format must get its own cache entry"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &first_bgra,
+                pipelines
+                    .get(&wgpu::TextureFormat::Rgba8Unorm)
+                    .expect("the Rgba8Unorm pipeline must be cached"),
+            ),
+            "distinct target formats must hold distinct pipelines"
+        );
+    }
+}

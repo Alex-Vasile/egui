@@ -7,6 +7,13 @@ use image::RgbaImage;
 
 use crate::texture_to_image::texture_to_image;
 
+/// The format of the offscreen render target.
+///
+/// Matches what `RenderState::create` used to pick for a surface-less render
+/// state ([`egui_wgpu::preferred_framebuffer_format`] over its `[Rgba8Unorm]`
+/// no-surface stub).
+const OFFSCREEN_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 /// Timeout for waiting on the GPU to finish rendering.
 ///
 /// Windows will reset native drivers after 2 seconds of being stuck (known was TDR - timeout detection & recovery).
@@ -186,6 +193,7 @@ impl crate::TestRenderer for WgpuTestRenderer {
             &mut encoder,
             &tessellated,
             &screen,
+            OFFSCREEN_TARGET_FORMAT,
         );
 
         let texture = self
@@ -201,7 +209,7 @@ impl crate::TestRenderer for WgpuTestRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.render_state.target_format,
+                format: OFFSCREEN_TARGET_FORMAT,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
@@ -225,7 +233,7 @@ impl crate::TestRenderer for WgpuTestRenderer {
                 })
                 .forget_lifetime();
 
-            renderer.render(&mut pass, &tessellated, &screen);
+            renderer.render(&mut pass, &tessellated, &screen, OFFSCREEN_TARGET_FORMAT);
         }
 
         self.render_state
