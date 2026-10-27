@@ -23,10 +23,16 @@ mod renderer;
 
 mod setup;
 
+mod surface_policy;
+
 pub use renderer::*;
 pub use setup::{
     EguiDisplayHandle, NativeAdapterSelectorMethod, WgpuSetup, WgpuSetupCreateNew,
     WgpuSetupExisting,
+};
+pub use surface_policy::{
+    FallbackReason, SurfacePreference, SurfaceStatus, SurfaceTarget, WIDE_GAMUT_ORDER,
+    build_configuration, decide_surface_target,
 };
 
 /// Helpers for capturing screenshots of the UI.
@@ -327,6 +333,15 @@ pub struct WgpuConfiguration {
     /// Runtime-mutable configuration for the surface (present mode, frame latency).
     pub surface: SurfaceConfig,
 
+    /// How far beyond plain SDR sRGB to push the surface, decided per viewport
+    /// against its actual capabilities.
+    ///
+    /// Create-time app policy. The decision (target + status) lands in
+    /// [`crate::decide_surface_target`]'s result and is re-run on monitor
+    /// changes; an ungrantable preference falls back to plain SDR rather than
+    /// failing.
+    pub surface_preference: SurfacePreference,
+
     /// How to create the wgpu adapter & device
     pub wgpu_setup: WgpuSetup,
 
@@ -361,11 +376,13 @@ impl core::fmt::Debug for WgpuConfiguration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self {
             surface,
+            surface_preference,
             wgpu_setup,
             on_surface_status: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
+            .field("surface_preference", &surface_preference)
             .field("wgpu_setup", &wgpu_setup)
             .finish_non_exhaustive()
     }
@@ -383,6 +400,10 @@ impl Default for WgpuConfiguration {
     fn default() -> Self {
         Self {
             surface: SurfaceConfig::HIGH_THROUGHPUT,
+
+            // Off is the rollout default: the surface stays plain SDR unless
+            // the app asks for more.
+            surface_preference: SurfacePreference::Off,
 
             // No display handle available at this point — callers should replace this with
             // `WgpuSetup::from_display_handle(...)` before creating the instance if one is available.
