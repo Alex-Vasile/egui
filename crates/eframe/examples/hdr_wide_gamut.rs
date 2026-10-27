@@ -3,14 +3,24 @@
 //! Opts into [`SurfacePreference::WideGamut`] and paints a large quad through
 //! a wgpu callback whose pipeline is built lazily against whatever
 //! `target_format` the callback receives — the same per-format pattern as the
-//! `custom3d` demo. The shader encodes the pure Display P3 primaries with the
-//! sRGB transfer, which a P3-referred surface displays outside the sRGB
-//! gamut; an SDR fallback surface displays the same bytes as ordinary colors.
+//! `custom3d` demo. The quad draws the surface's native primaries as
+//! full-range bytes: (255, 0, 0), (0, 255, 0), (0, 0, 255). On a P3-referred
+//! surface those bytes ARE the Display P3 primaries and display outside the
+//! sRGB gamut; an SDR fallback surface displays the same bytes as the
+//! ordinary sRGB primaries. (The P3 primaries are *defined* by their xy
+//! chromaticities — (0.680, 0.320) etc. Those are coordinates in the CIE
+//! chromaticity diagram, not colors: encoding them as linear RGB and applying
+//! the sRGB transfer yields mixes like the orange (215, 153, 0) on any
+//! surface.)
 //!
 //! The side panel shows the live surface decision
 //! ([`egui::ViewportInfo::surface_status`] / `surface_target`) plus an
-//! "sRGB red" vs "P3 red" swatch row, so machines without a P3 display can
-//! still tell which path produced which bytes.
+//! "sRGB red (converted)" vs "P3 red (native)" swatch row — the same physical
+//! red written once in the surface's P3-referred encoding (≈ (234, 51, 35))
+//! and once as the native primary (255, 0, 0). On a P3 display the native
+//! primary is visibly deeper; on an SDR fallback both swatches just display
+//! their raw bytes, so machines without a P3 display can still tell which
+//! path produced which bytes.
 //!
 //! The effect needs a P3-capable display. Everything here stays SDR — the u8
 //! surface clamps at 1.0; HDR brightness is PR 3.
@@ -50,7 +60,11 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-struct WideGamutApp;
+struct WideGamutApp {
+    /// sRGB red mapped into the surface's P3-referred encoding, computed in
+    /// [`Self::new`] from [`SRGB_TO_P3_LINEAR`] — bytes (234, 51, 35).
+    srgb_red_converted: egui::Color32,
+}
 
 impl WideGamutApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
@@ -72,7 +86,9 @@ impl WideGamutApp {
                 shader,
             });
 
-        Some(Self)
+        Some(Self {
+            srgb_red_converted: srgb_red_converted_to_p3(),
+        })
     }
 }
 
@@ -107,17 +123,20 @@ impl eframe::App for WideGamutApp {
                 target.as_deref().unwrap_or("(unknown)")
             ));
             ui.label(
-                "The quad above holds the pure Display P3 primaries, sRGB-encoded. \
-                 On a P3-referred surface they display outside the sRGB gamut; \
-                 on an SDR fallback the same bytes read as ordinary colors. \
-                 Needs a P3-capable display.",
+                "The quad above holds the surface's native primaries as \
+                 full-range bytes. On a P3-referred surface they display \
+                 outside the sRGB gamut; on an SDR fallback the same bytes \
+                 read as ordinary sRGB primaries. Needs a P3-capable display.",
             );
             ui.separator();
             let swatch_row = ui.horizontal(|ui| {
-                swatch(ui, "sRGB red", egui::Color32::from_rgb(255, 0, 0));
-                // The quad's red band, sRGB-encoded: identical bytes, painted
-                // by egui's mesh pipeline instead of the callback pipeline.
-                swatch(ui, "P3 red", egui::Color32::from_rgb(215, 153, 0));
+                // sRGB red (1, 0, 0) converted into the surface's P3-referred
+                // encoding: the bytes that make a P3 surface show the
+                // ordinary sRGB red.
+                swatch(ui, "sRGB red (converted)", self.srgb_red_converted);
+                // The native primary the quad's red band writes — the same
+                // bytes on any surface, deeper only on a P3 panel.
+                swatch(ui, "P3 red (native)", egui::Color32::from_rgb(255, 0, 0));
             });
 
             // Layout probe: the readout must lay out inside the visible
@@ -144,6 +163,41 @@ fn swatch(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 16.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 2.0, color);
     ui.label(name);
+}
+
+/// Linear-light sRGB → Display P3 conversion, both D65-referred: the product
+/// `M_P3⁻¹ · M_sRGB` of each system's RGB→XYZ matrix (built from the CIE xy
+/// chromaticities of the primaries and the D65 white point (0.3127, 0.3290)).
+/// Published verbatim in CSS Color 4 ("predefined-display-p3"); rows sum to 1
+/// because both systems share the D65 white. Column 1 applied to sRGB red
+/// (1, 0, 0) gives the P3-linear color (0.82246, 0.03319, 0.01708).
+const SRGB_TO_P3_LINEAR: [[f32; 3]; 3] = [
+    [0.822_461_97, 0.177_538_03, 0.0],
+    [0.033_194_2, 0.966_805_8, 0.0],
+    [0.017_082_63, 0.072_397_44, 0.910_519_93],
+];
+
+/// The sRGB transfer function (IEC 61966-2-1), same as the shader's
+/// `srgb_encode`: the u8 surface formats are non-Srgb, so values written to
+/// them must arrive already encoded.
+fn srgb_encode(channel: f32) -> f32 {
+    if channel <= 0.003_130_8 {
+        12.92 * channel
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// sRGB red expressed in the P3-referred encoding: bytes (234, 51, 35).
+fn srgb_red_converted_to_p3() -> egui::Color32 {
+    // Column 1 of the matrix: sRGB red (1, 0, 0) in P3-linear terms.
+    let linear = [
+        SRGB_TO_P3_LINEAR[0][0],
+        SRGB_TO_P3_LINEAR[1][0],
+        SRGB_TO_P3_LINEAR[2][0],
+    ];
+    let [r, g, b] = linear.map(|c| (srgb_encode(c) * 255.0).round() as u8);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 struct QuadRenderResources {
@@ -253,13 +307,21 @@ var<private> QUAD: array<vec2<f32>, 6> = array(
     vec2<f32>(1.0, 1.0),
 );
 
-// Pure Display P3 primaries (D65), linear light.
-var<private> P3_PRIMARIES: array<vec3<f32>, 3> = array(
-    vec3<f32>(0.680, 0.320, 0.000), // red
-    vec3<f32>(0.265, 0.690, 0.044), // green
-    vec3<f32>(0.150, 0.060, 0.790), // blue
+// The surface's native primaries as full-range linear values: on a
+// P3-referred surface these bytes are the Display P3 primaries, on an SDR
+// fallback the same bytes are the sRGB primaries. These are NOT the P3 xy
+// chromaticities (0.680, 0.320) etc. — those are CIE chromaticity-diagram
+// coordinates that define the primaries, not colors.
+var<private> PRIMARIES: array<vec3<f32>, 3> = array(
+    vec3<f32>(1.0, 0.0, 0.0), // red
+    vec3<f32>(0.0, 1.0, 0.0), // green
+    vec3<f32>(0.0, 0.0, 1.0), // blue
 );
 
+// The sRGB transfer function (IEC 61966-2-1). The u8 surface format is
+// non-Srgb, so anything written to it must arrive pre-encoded; on the
+// primaries themselves it is the identity (0.0 and 1.0 are fixed points),
+// kept so real content dropped in later encodes correctly.
 fn srgb_encode(linear: vec3<f32>) -> vec3<f32> {
     let low = vec3<f32>(12.92) * linear;
     let high = vec3<f32>(1.055) * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
@@ -278,6 +340,6 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let band = min(u32(in.uv.x * 3.0), 2u);
-    return vec4<f32>(srgb_encode(P3_PRIMARIES[band]), 1.0);
+    return vec4<f32>(srgb_encode(PRIMARIES[band]), 1.0);
 }
 ";
