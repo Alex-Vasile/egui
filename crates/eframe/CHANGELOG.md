@@ -7,6 +7,10 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+* Add `hdr_float_image` example: an sRGB-tagged `FloatImage` gradient and a DisplayP3-tagged primary strip through `ui.image()`, demonstrating the content↔surface pairing's native and loud-reject outcomes
+
+
 ## 0.37.0 - 2026-10-15
 ### ⭐ Added
 * Add option to turn off the default clipboard keyboard shortcuts in egui-winit and eframe [#5615](https://github.com/emilk/egui/pull/5615) by [@YgorSouza](https://github.com/YgorSouza)

@@ -17,6 +17,10 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 * Add `SurfacePreference` (a new field on `WgpuConfiguration`): ask for `WideGamut` at create time and each viewport gets the best wide-gamut pairing the platform reports, or a plain SDR surface with an explanatory status — never an error
 * Add `SurfaceTarget` (format + color space), `SurfaceStatus` (`Granted` / `FellBack`), `FallbackReason`, `WIDE_GAMUT_ORDER`, and the `decide_surface_target` / `build_configuration` API that turns a preference into a validated `wgpu::SurfaceConfiguration`
 * Per-viewport surface decisions are stored by the winit painter and re-decided when a window moves to another monitor; the painter exposes the decision per viewport (surfaced to apps via `egui::ViewportInfo`)
+* Tagged float content (`ImageData::Float`) now uploads: float textures are created as `Rgba16Float` (zero-copy from the f16 pixels), and `bytes_per_row` for the float path is f16-aware (`8 * width`, padded to wgpu's 256-byte alignment with rows repacked to match)
+* Add `Renderer::set_active_surface_color_space`: the painter (winit / web) feeds each frame's granted surface color space in under its renderer lock, before the per-frame `update_texture` calls. Unset (the default) keeps today's sRGB semantics, so app-driven/headless uploads (kittest, custom integrations) are unchanged
+* The content↔surface upload pairing (plan §4) gates float uploads inside `update_texture` without a signature change: sRGB-tagged content is native on sRGB spaces and shifts on DisplayP3 like the chrome; DisplayP3-tagged content is native only on DisplayP3 (± extended) and is **loudly rejected** on sRGB spaces (and on the scRGB-linear pairing, which arrives with the linear stage) — the upload is not performed, a warning logs once per texture id (carrying the evaluated content primaries and active surface color space), and egui's standard placeholder renders. Partial patches whose content kind does not match the texture's format (Color onto float, float onto Color) are likewise skipped with a once-per-id warning — the previous content stays. The pairing function is table data; nothing outside it names primaries for content pairing (plan §5)
+* `Renderer::update_texture`-created textures now carry `COPY_SRC` so uploads can be read back for verification (plan §8 row 2b)
 
 ### 🐛 Fixed
 * WGSL transfer functions no longer evaluate `pow` on possibly-negative values (WGSL-undefined, NaN-prone on drivers that lower `select` to arithmetic blends): negatives take the odd-symmetric `sign(x)·f(|x|)` extension, matching `ecolor`; results for positive values are bit-identical (at `-0.0` the zero's sign bit can differ; the values compare equal)
@@ -25,6 +29,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 ### 🔧 Changed
 * `pollster` is now a dev-dependency (drives the crate's first runtime test, the pipeline-cache test)
+* `half` (already locked at 2.7.1, `bytemuck` feature) is a direct dependency of `epaint` (the f16 content type) and a dev-dependency here (exact-bit round-trip assertions)
 
 
 ## 0.37.0 - 2026-10-15

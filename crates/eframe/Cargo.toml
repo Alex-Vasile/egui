@@ -310,3 +310,7 @@ required-features = ["wgpu"]
 [[example]]
 name = "hdr_wide_gamut"
 required-features = ["wgpu"]
+
+[[example]]
+name = "hdr_float_image"
+required-features = ["wgpu"]

@@ -8,14 +8,20 @@ use alloc::sync::Arc;
 ///
 /// To load an image file, see [`ColorImage::from_rgba_unmultiplied`].
 ///
-/// This is currently an enum with only one variant, but more image types may be added in the future.
-///
-/// See also: [`ColorImage`].
-#[derive(Clone, PartialEq, Eq)]
+/// See also: [`ColorImage`], [`FloatImage`].
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum ImageData {
-    /// RGBA image.
+    /// RGBA image with 8-bit texels (`Color32`: gamma-encoded, premultiplied,
+    /// sRGB-referred).
     Color(Arc<ColorImage>),
+
+    /// High-precision RGBA image with 16-bit float texels ([`FloatImage`]).
+    ///
+    /// The float path carries the HDR / wide-gamut content: the pixels follow
+    /// the [`FloatImage`] contract, and the upload to the GPU is gated by the
+    /// content↔surface pairing (see `FloatImage`'s documentation).
+    Float(Arc<FloatImage>),
 }
 
 impl ImageData {
@@ -24,6 +30,7 @@ impl ImageData {
     pub fn resolution(&self) -> [usize; 2] {
         match self {
             Self::Color(image) => image.resolution,
+            Self::Float(image) => image.resolution,
         }
     }
 
@@ -45,6 +52,7 @@ impl ImageData {
     pub fn bytes_per_pixel(&self) -> usize {
         match self {
             Self::Color(_) => 4,
+            Self::Float(_) => 8, // 4 × f16
         }
     }
 }
@@ -402,6 +410,309 @@ impl core::fmt::Debug for ColorImage {
 
 // ----------------------------------------------------------------------------
 
+/// The color primaries the content refers to.
+///
+/// Content tags its primaries so the upload path can decide what to do with
+/// it on each granted surface (the content↔surface pairing table in
+/// `egui-wgpu`): a tag the surface cannot honor is loudly rejected instead
+/// of silently gamut-clipped.
+///
+/// `Srgb` is the implicit default: every [`ColorImage`] is sRGB-referred,
+/// which is why the tag is optional there.
+///
+/// New primaries arrive as an enum variant + a pairing-table row + a
+/// conversion matrix, in one change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum Primaries {
+    /// The sRGB primaries (IEC 61966-2-1), the implicit default for all
+    /// existing content.
+    #[default]
+    Srgb,
+
+    /// The Display P3 primaries (as used by DCI-P3-derived display color
+    /// spaces, D65 white).
+    DisplayP3,
+}
+
+// ----------------------------------------------------------------------------
+
+/// A 2D RGBA image in RAM with 16-bit float texels: the HDR / wide-gamut
+/// content type.
+///
+/// # Pixel contract
+///
+/// Each texel is **gamma-encoded in the declared `primaries`**,
+/// **premultiplied in the encoded components** (`stored = a × enc(L)` —
+/// exactly [`Color32`]'s convention, not `enc(a·L)`), **unclamped above 1.0**,
+/// **odd-symmetric for negatives** (the same extension convention as IEC
+/// 61966-2-1's extended range and CSS Color 4); **1.0 = SDR reference white**.
+///
+/// Display: a surface whose color space honors the declared primaries shows
+/// the values as-is (the values ARE the surface encoding). Surfaces that
+/// cannot honor the tag **loudly reject** the upload at paint time (the
+/// standard placeholder renders and a warning logs) — egui never silently
+/// gamut-clips or re-interprets tagged content **at upload time**. The
+/// pairing is evaluated per *upload*, against the surface of the viewport
+/// being painted: a texture already uploaded renders as-is in viewports
+/// with a different granted space, and keeps rendering as-is if the granted
+/// space later changes (e.g. a monitor move) — no delta is re-emitted, so
+/// there is no re-evaluation and no warning either: the stored values are
+/// then interpreted by whatever space the presenting surface has.
+///
+/// Storing values above 1.0 is allowed (the HDR extension lives in the
+/// values); displaying them above SDR white is a later stage.
+///
+/// The RAM format is one [`half::f16`] per component — 1:1 with the
+/// `Rgba16Float` GPU format, so uploads are zero-copy on the CPU side.
+/// Helpers take `f32` at the edges and convert lossily (round-to-nearest).
+#[derive(Clone, PartialEq)]
+pub struct FloatImage {
+    /// width, height in texels.
+    resolution: [usize; 2],
+
+    /// The primaries the (gamma-encoded) pixel values refer to.
+    pub primaries: Primaries,
+
+    /// The pixels, row by row, from top to bottom.
+    pixels: Vec<[half::f16; 4]>,
+}
+
+impl FloatImage {
+    /// Create an image from the given pixels, row by row, from top to bottom.
+    ///
+    /// Panics if `resolution[0] * resolution[1] != pixels.len()`.
+    pub fn new(resolution: [usize; 2], primaries: Primaries, pixels: Vec<[half::f16; 4]>) -> Self {
+        assert!(
+            resolution[0] * resolution[1] == pixels.len(),
+            "resolution: {resolution:?}, pixels.len(): {}",
+            pixels.len()
+        );
+        Self {
+            resolution,
+            primaries,
+            pixels,
+        }
+    }
+
+    /// Create an image filled with the given color.
+    ///
+    /// The color is in contract layout: gamma-encoded in `primaries`,
+    /// premultiplied in the encoded components.
+    pub fn filled(resolution: [usize; 2], primaries: Primaries, rgba: [f32; 4]) -> Self {
+        Self::new(
+            resolution,
+            primaries,
+            vec![Self::texel(rgba); resolution[0] * resolution[1]],
+        )
+    }
+
+    /// Create a [`FloatImage`] from flat RGBA data in contract layout:
+    /// gamma-encoded in `primaries`, premultiplied in the encoded components,
+    /// unclamped above 1.0, odd-symmetric for negatives.
+    ///
+    /// This is the boundary conversion for apps that already hold
+    /// contract-layout pixels (e.g. rendered HDR content). If you hold
+    /// linear-light values, encode them first (`ecolor::gamma_from_linear`).
+    ///
+    /// Panics if `resolution[0] * resolution[1] * 4 != rgba.len()`.
+    pub fn from_rgba(resolution: [usize; 2], primaries: Primaries, rgba: &[f32]) -> Self {
+        assert_eq!(
+            resolution[0] * resolution[1] * 4,
+            rgba.len(),
+            "resolution: {:?}, rgba.len(): {}",
+            resolution,
+            rgba.len()
+        );
+        let pixels = rgba
+            .chunks_exact(4)
+            .map(|p| Self::texel([p[0], p[1], p[2], p[3]]))
+            .collect();
+        Self::new(resolution, primaries, pixels)
+    }
+
+    /// Lossily convert an 8-bit [`ColorImage`] into a [`FloatImage`].
+    ///
+    /// `Color32` texels are gamma-encoded, premultiplied in the encoded
+    /// components and sRGB-referred — the float contract at 8-bit precision —
+    /// so the conversion is a per-component rescale from `[0, 255]` to
+    /// `[0.0, 1.0]` (lossy: it cannot recover the quantization). The result
+    /// carries [`Primaries::Srgb`].
+    pub fn from_color_image(image: &ColorImage) -> Self {
+        let pixels = image
+            .pixels()
+            .iter()
+            .map(|c| {
+                [
+                    half::f16::from_f32(f32::from(c.r()) / 255.0),
+                    half::f16::from_f32(f32::from(c.g()) / 255.0),
+                    half::f16::from_f32(f32::from(c.b()) / 255.0),
+                    half::f16::from_f32(f32::from(c.a()) / 255.0),
+                ]
+            })
+            .collect();
+        Self::new(image.resolution(), Primaries::Srgb, pixels)
+    }
+
+    /// Image resolution in texels.
+    #[inline]
+    pub fn resolution(&self) -> [usize; 2] {
+        self.resolution
+    }
+
+    /// Image width in texels.
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.resolution[0]
+    }
+
+    /// Image height in texels.
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.resolution[1]
+    }
+
+    /// The pixels in the image, row-major.
+    #[inline]
+    pub fn pixels(&self) -> &[[half::f16; 4]] {
+        &self.pixels
+    }
+
+    /// The pixels in the image, row-major.
+    #[inline]
+    pub fn pixels_mut(&mut self) -> &mut [[half::f16; 4]] {
+        &mut self.pixels
+    }
+
+    /// A view of the underlying data as `&[u8]` (IEEE 754 binary16
+    /// bit-patterns, ready for a zero-copy `Rgba16Float` upload).
+    #[cfg(feature = "bytemuck")]
+    pub fn as_raw(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.pixels)
+    }
+
+    /// Convert contract-layout `f32` RGBA into one f16 texel (lossy,
+    /// round-to-nearest).
+    #[inline]
+    fn texel(rgba: [f32; 4]) -> [half::f16; 4] {
+        [
+            half::f16::from_f32(rgba[0]),
+            half::f16::from_f32(rgba[1]),
+            half::f16::from_f32(rgba[2]),
+            half::f16::from_f32(rgba[3]),
+        ]
+    }
+}
+
+impl core::ops::Index<(usize, usize)> for FloatImage {
+    type Output = [half::f16; 4];
+
+    #[inline]
+    fn index(&self, (x, y): (usize, usize)) -> &[half::f16; 4] {
+        let [w, h] = self.resolution;
+        assert!(x < w && y < h, "x: {x}, y: {y}, w: {w}, h: {h}");
+        &self.pixels[y * w + x]
+    }
+}
+
+impl core::ops::IndexMut<(usize, usize)> for FloatImage {
+    #[inline]
+    fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut [half::f16; 4] {
+        let [w, h] = self.resolution;
+        assert!(x < w && y < h, "x: {x}, y: {y}, w: {w}, h: {h}");
+        &mut self.pixels[y * w + x]
+    }
+}
+
+impl From<FloatImage> for ImageData {
+    #[inline]
+    fn from(image: FloatImage) -> Self {
+        Self::Float(Arc::new(image))
+    }
+}
+
+impl From<Arc<FloatImage>> for ImageData {
+    #[inline]
+    fn from(image: Arc<FloatImage>) -> Self {
+        Self::Float(image)
+    }
+}
+
+impl core::fmt::Debug for FloatImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FloatImage")
+            .field("resolution", &self.resolution)
+            .field("primaries", &self.primaries)
+            .field("pixel-count", &self.pixels.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for FloatImage {
+    /// The `f16` texels are stored as their IEEE 754 binary16 **bit
+    /// patterns** (`u16`), not via `half`'s `serde` feature: the bit-pattern
+    /// representation is stable on the wire (it does not depend on how
+    /// `half` chooses to represent the value) and round-trips exactly.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+
+        let pixels: Vec<u16> = self
+            .pixels
+            .iter()
+            .flat_map(|texel| texel.map(half::f16::to_bits))
+            .collect();
+        let mut state = serializer.serialize_struct("FloatImage", 3)?;
+        state.serialize_field("resolution", &self.resolution)?;
+        state.serialize_field("primaries", &self.primaries)?;
+        state.serialize_field("pixels", &pixels)?;
+        state.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for FloatImage {
+    /// The inverse of [`serde::Serialize::serialize`] for this type;
+    /// validates the pixel count.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            resolution: [usize; 2],
+            primaries: Primaries,
+            pixels: Vec<u16>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        let [w, h] = fields.resolution;
+        // Checked: a hostile payload can carry a huge resolution, and
+        // wrapping arithmetic would admit it (length match modulo 2^N).
+        let expected_len = w.checked_mul(h).and_then(|wh| wh.checked_mul(4));
+        if expected_len != Some(fields.pixels.len()) {
+            return Err(D::Error::invalid_length(
+                fields.pixels.len(),
+                &format!("{expected_len:?} (4 per texel of {w}x{h})").as_str(),
+            ));
+        }
+        let pixels = fields
+            .pixels
+            .chunks_exact(4)
+            .map(|texel| {
+                [
+                    half::f16::from_bits(texel[0]),
+                    half::f16::from_bits(texel[1]),
+                    half::f16::from_bits(texel[2]),
+                    half::f16::from_bits(texel[3]),
+                ]
+            })
+            .collect();
+        Ok(Self::new(fields.resolution, fields.primaries, pixels))
+    }
+}
+
+// ----------------------------------------------------------------------------
+
 /// How to convert font coverage values into alpha and color values.
 ///
 /// epaint stores all glyphs in the font atlas as white (with varying opacity),
@@ -506,7 +817,10 @@ impl FontColorTransferFunction {
 /// A change to an image.
 ///
 /// Either a whole new image, or an update to a rectangular region of it.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Does not implement `Eq`: float content (`ImageData::Float`) only offers
+/// `PartialEq` (matching `ecolor::Rgba`'s precedent for float types).
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[must_use = "The painter must take care of this"]
 pub struct ImageDelta {
@@ -548,5 +862,133 @@ impl ImageDelta {
     /// If `false`, this is a partial (sub-region) update.
     pub fn is_whole(&self) -> bool {
         self.pos.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_image_helpers_match_resolution_and_layout() {
+        let image = FloatImage::from_rgba([3, 2], Primaries::Srgb, &[1.0; 24]);
+        assert_eq!(image.resolution(), [3, 2]);
+        assert_eq!(image.width(), 3);
+        assert_eq!(image.height(), 2);
+        assert_eq!(image.primaries, Primaries::Srgb);
+        assert_eq!(image.pixels().len(), 6);
+        assert_eq!(image[(2, 1)], [half::f16::from_f32(1.0); 4]);
+
+        let filled = FloatImage::filled([2, 2], Primaries::DisplayP3, [0.5, 0.25, -1.0, 1.0]);
+        assert_eq!(filled.primaries, Primaries::DisplayP3);
+        assert_eq!(filled[(1, 1)][0], half::f16::from_f32(0.5));
+        assert_eq!(filled[(1, 1)][1], half::f16::from_f32(0.25));
+        // Unclamped above/below: the contract passes values through.
+        assert_eq!(filled[(0, 0)][2], half::f16::from_f32(-1.0));
+        assert_eq!(filled[(0, 0)][3], half::f16::from_f32(1.0));
+
+        let from_flat = FloatImage::from_rgba(
+            [1, 2],
+            Primaries::Srgb,
+            &[
+                2.0, -2.0, 0.0, 1.0, // row 0
+                0.5, 0.5, 0.5, 0.5, // row 1
+            ],
+        );
+        assert_eq!(from_flat[(0, 0)][0], half::f16::from_f32(2.0));
+        assert_eq!(from_flat[(0, 0)][1], half::f16::from_f32(-2.0));
+        assert_eq!(from_flat[(0, 1)][3], half::f16::from_f32(0.5));
+    }
+
+    /// `from_color_image`: the u8 encoded components rescale to `[0, 1]`,
+    /// and the premultiply rule survives the conversion — `ColorImage` stores
+    /// `stored = a × enc(L)` (gamma-space premultiplied, exactly the float
+    /// contract), so the converted pixels must still satisfy it.
+    #[test]
+    fn from_color_image_rescales_and_keeps_premultiply() {
+        let image =
+            ColorImage::from_rgba_unmultiplied([2, 1], &[255, 0, 0, 128, 64, 128, 192, 255]);
+        let float = FloatImage::from_color_image(&image);
+
+        assert_eq!(float.primaries, Primaries::Srgb);
+
+        // Red pixel: r = enc(1.0) × a = 255 × 128/255 = 128 stored.
+        let red = float[(0, 0)];
+        assert_eq!(red[0], half::f16::from_f32(128.0 / 255.0));
+        assert_eq!(red[1], half::f16::from_f32(0.0));
+        assert_eq!(red[3], half::f16::from_f32(128.0 / 255.0));
+
+        // Opaque pixel: premultiply is identity at a = 1.
+        let mixed = float[(1, 0)];
+        assert_eq!(mixed[0], half::f16::from_f32(64.0 / 255.0));
+        assert_eq!(mixed[1], half::f16::from_f32(128.0 / 255.0));
+        assert_eq!(mixed[2], half::f16::from_f32(192.0 / 255.0));
+        assert_eq!(mixed[3], half::f16::from_f32(1.0));
+
+        // `ColorImage::filled` takes `Color32::TRANSPARENT` by default
+        // (already premultiplied): every stored component is 0.
+        let transparent =
+            FloatImage::from_color_image(&ColorImage::filled([1, 1], Color32::TRANSPARENT));
+        assert_eq!(transparent[(0, 0)], [half::f16::from_f32(0.0); 4]);
+    }
+
+    /// `ImageData::Float` round-trips through serde exactly, and the wire
+    /// representation is the f16 bit pattern (stable across `half` versions).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn float_image_serde_round_trip_and_bit_pattern_stability() {
+        let image = FloatImage::from_rgba(
+            [2, 1],
+            Primaries::DisplayP3,
+            // 1.0, -1.0, f16-max, and a negative subnormal: exact in f16.
+            &[1.0, -1.0, 65504.0, 0.5, 0.25, -6.0e-8, 2.0, 0.0],
+        );
+        let data = ImageData::Float(Arc::new(image));
+
+        let json = serde_json::to_string(&data).unwrap();
+        // `ImageData` has no `Debug` impl (pre-existing) — compare via `==`.
+        assert!(serde_json::from_str::<ImageData>(&json).unwrap() == data);
+
+        // Representation stability: the pixels field is the raw `u16` bits.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let pixels = value["Float"]["pixels"].as_array().unwrap();
+        let expected_bits: Vec<u16> = [1.0, -1.0, 65504.0, 0.5, 0.25, -6.0e-8, 2.0, 0.0]
+            .map(half::f16::from_f32)
+            .map(half::f16::to_bits)
+            .to_vec();
+        let wire: Vec<u16> = pixels.iter().map(|p| p.as_u64().unwrap() as u16).collect();
+        assert_eq!(wire, expected_bits);
+        // And the primaries tag travels with the image.
+        assert_eq!(value["Float"]["primaries"].as_str().unwrap(), "DisplayP3");
+    }
+
+    /// The `Eq` drop compiles as a `PartialEq`-only surface: `ImageData`
+    /// (including float content), `ImageDelta` and `TexturesDelta` compare
+    /// but make no `Eq` promise (matching `ecolor::Rgba`).
+    #[test]
+    fn image_types_remain_partial_eq_after_eq_drop() {
+        let float = ImageData::Float(Arc::new(FloatImage::filled(
+            [1, 1],
+            Primaries::Srgb,
+            [1.0, 0.0, 0.0, 1.0],
+        )));
+        let color = ImageData::Color(Arc::new(ColorImage::filled([1, 1], Color32::WHITE)));
+
+        // `ImageData` has no `Debug` impl (pre-existing) — compare via `==`.
+        assert!(float.clone() == float);
+        assert!(float != color);
+
+        let delta_a = ImageDelta::full(float.clone(), TextureOptions::LINEAR);
+        let delta_b = ImageDelta::full(float, TextureOptions::LINEAR);
+        assert!(delta_a == delta_b);
+
+        let mut textures_a = crate::textures::TexturesDelta::default();
+        textures_a.push(crate::TextureId::Managed(1), delta_a);
+        let mut textures_b = crate::textures::TexturesDelta::default();
+        textures_b.push(crate::TextureId::Managed(1), delta_b);
+        assert_eq!(textures_a, textures_b); // `TexturesDelta` has a `Debug` impl
+        // `TexturesDelta` debug-panics when dropped with unapplied deltas.
+        textures_a.clear();
+        textures_b.clear();
     }
 }

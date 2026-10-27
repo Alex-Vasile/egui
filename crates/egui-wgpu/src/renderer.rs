@@ -2,7 +2,7 @@ use core::{num::NonZeroU64, ops::Range};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use bytemuck::Zeroable as _;
 use epaint::mutex::Mutex;
 use epaint::{PaintCallbackInfo, Primitive, Vertex, emath::NumExt as _};
@@ -277,6 +277,25 @@ pub struct Renderer {
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
 
+    /// The color space of the surface this renderer currently presents to, as
+    /// granted by the surface decision. Set by the painter (winit / web) each
+    /// frame, under its renderer lock, before the per-frame
+    /// [`Self::update_texture`] calls; `None` (the default) means "unknown /
+    /// no surface", which pairs content with today's SDR-sRGB semantics.
+    ///
+    /// This is the other half of the content↔surface upload pairing table:
+    /// the pairing function in this file is the table, this is the surface
+    /// row it looks up. Never branch on it anywhere else (plan §5 design
+    /// rule: concrete color spaces are named only in the pairing tables).
+    active_surface_color_space: Option<wgpu::SurfaceColorSpace>,
+
+    /// Texture ids whose upload was already rejected-and-warned about — a
+    /// pairing rejection or a content-kind/format mismatch logs once per
+    /// texture id (egui's warn-once convention for content the surface or
+    /// texture cannot take). Cleared on [`Self::free_texture`] so a freed
+    /// id can warn again.
+    upload_rejections_warned: HashSet<epaint::TextureId>,
+
     options: RendererOptions,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
@@ -451,6 +470,8 @@ impl Renderer {
             textures: HashMap::default(),
             next_user_texture_id: 0,
             samplers: HashMap::default(),
+            active_surface_color_space: None,
+            upload_rejections_warned: HashSet::default(),
             options,
             callback_resources: CallbackResources::default(),
         }
@@ -636,6 +657,28 @@ impl Renderer {
         render_pass.set_scissor_rect(0, 0, size_in_pixels[0], size_in_pixels[1]);
     }
 
+    /// Tell the renderer which color space the presenting surface was
+    /// granted, so the content↔surface upload pairing can gate
+    /// [`Self::update_texture`].
+    ///
+    /// Called by the painter (winit / web) each frame, under its renderer
+    /// write lock, before the per-frame `update_texture` calls, with the
+    /// viewport's granted [`SurfaceTarget::color_space`]. `None` (the
+    /// default) pairs content with today's SDR-sRGB semantics, so
+    /// app-driven/headless `update_texture` calls (kittest, custom
+    /// integrations) keep working unchanged.
+    ///
+    /// The value is trusted, not verified: misreporting it re-arms exactly
+    /// the misinterpretation the pairing gate exists to prevent (a wrong
+    /// space "honors" tags it doesn't, instead of loudly rejecting) — always
+    /// pass the viewport's actual granted space. It also *persists*: every
+    /// `update_texture` is evaluated against the value from the most recent
+    /// call, so an app driving uploads directly is paired against the last
+    /// painted viewport's space.
+    pub fn set_active_surface_color_space(&mut self, color_space: Option<wgpu::SurfaceColorSpace>) {
+        self.active_surface_color_space = color_space;
+    }
+
     /// Should be called before [`Self::render`].
     pub fn update_texture(
         &mut self,
@@ -646,6 +689,46 @@ impl Renderer {
     ) {
         profiling::function_scope!();
 
+        // The content↔surface upload pairing lives here, inside
+        // `update_texture` (plan §4), WITHOUT changing its signature:
+        // rejection is not an error — the upload is not performed, a warning
+        // logs once per texture id, and egui's standard placeholder renders.
+        // A `Result`-returning upload is future work.
+        let upload: UploadData<'_> = match &image_delta.image {
+            epaint::ImageData::Color(image) => UploadData {
+                bytes: bytemuck::cast_slice(image.pixels()),
+                bytes_per_pixel: 4,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+            },
+            epaint::ImageData::Float(image) => {
+                match pair_float_content_with_surface(
+                    image.primaries,
+                    self.active_surface_color_space,
+                ) {
+                    Ok(()) => UploadData {
+                        bytes: bytemuck::cast_slice(image.pixels()),
+                        bytes_per_pixel: 8,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                    },
+                    Err(rejection) => {
+                        if self.upload_rejections_warned.insert(id) {
+                            // The warning must state the honest reason for the
+                            // ACTUAL inputs: every rejection message carries
+                            // the evaluated (content primaries, active
+                            // surface color space) pair.
+                            log::warn!(
+                                "egui texture {id:?}: {rejection} (content primaries: {:?}, \
+                                 active surface color space: {:?})",
+                                image.primaries,
+                                self.active_surface_color_space,
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        };
+
         let width = image_delta.image.width() as u32;
         let height = image_delta.image.height() as u32;
 
@@ -655,8 +738,27 @@ impl Renderer {
             depth_or_array_layers: 1,
         };
 
-        let data_bytes: &[u8] = match &image_delta.image {
-            epaint::ImageData::Color(image) => bytemuck::cast_slice(image.pixels()),
+        // `bytes_per_row` for the float path is padded to wgpu's 256-byte
+        // alignment (plan §4) so `write_texture` needs no internal staging
+        // pass; rows are repacked accordingly. The u8 color path keeps
+        // today's exact layout.
+        let raw_bytes_per_row = upload.bytes_per_pixel * width;
+        let bytes_per_row = if upload.format == wgpu::TextureFormat::Rgba16Float {
+            raw_bytes_per_row.div_ceil(WGPU_BYTES_PER_ROW_ALIGNMENT) * WGPU_BYTES_PER_ROW_ALIGNMENT
+        } else {
+            raw_bytes_per_row
+        };
+        let padded_bytes: Cow<'_, [u8]> = if bytes_per_row == raw_bytes_per_row {
+            Cow::Borrowed(upload.bytes)
+        } else {
+            let mut padded = vec![0u8; bytes_per_row as usize * height as usize];
+            for row in 0..height {
+                let src = (row * raw_bytes_per_row) as usize;
+                let dst = (row * bytes_per_row) as usize;
+                padded[dst..dst + raw_bytes_per_row as usize]
+                    .copy_from_slice(&upload.bytes[src..src + raw_bytes_per_row as usize]);
+            }
+            Cow::Owned(padded)
         };
 
         let queue_write_data_to_texture = |texture, origin| {
@@ -668,10 +770,10 @@ impl Renderer {
                     origin,
                     aspect: wgpu::TextureAspect::All,
                 },
-                data_bytes,
+                &padded_bytes,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * width),
+                    bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(height),
                 },
                 size,
@@ -683,7 +785,30 @@ impl Renderer {
         let label = Some(label_str.as_str());
 
         let (texture, origin, bind_group) = if let Some(pos) = image_delta.pos {
-            // update the existing texture
+            // Content-kind consistency: a patch's texel layout must match
+            // the format the managed texture was created with. A Color patch
+            // onto a float texture fails wgpu's size validation (a confusing
+            // device error); a float patch onto an 8-bit texture would write
+            // an 8-byte-per-texel payload into a 4-byte-texel texture
+            // (silent corruption). Bail like the pairing gate: warn once per
+            // texture id, skip the patch — the previous content stays.
+            let existing_format = self
+                .textures
+                .get(&id)
+                .and_then(|t| t.texture.as_ref().map(wgpu::Texture::format));
+            if existing_format.is_some_and(|existing| existing != upload.format) {
+                if self.upload_rejections_warned.insert(id) {
+                    log::warn!(
+                        "egui texture {id:?}: skipping partial update at {pos:?}: the patch's \
+                         texels are {:?} but the texture was created as {:?} — re-upload the \
+                         whole texture to change its kind",
+                        upload.format,
+                        existing_format,
+                    );
+                }
+                return;
+            }
+
             let Texture {
                 texture,
                 bind_group,
@@ -721,9 +846,13 @@ impl Renderer {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                    format: upload.format,
+                    // `COPY_SRC` enables the upload-verification readbacks
+                    // (plan §8 row 2b: "read the GPU texture back").
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[upload.format],
                 })
             };
             let origin = wgpu::Origin3d::ZERO;
@@ -786,6 +915,9 @@ impl Renderer {
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
             texture.destroy();
         }
+        // A freed texture id may come back with different content; let the
+        // next pairing rejection for it warn again.
+        self.upload_rejections_warned.remove(id);
     }
 
     /// Get the WGPU texture and bind group associated to a texture that has been allocated by egui.
@@ -1129,6 +1261,131 @@ impl Renderer {
         }
 
         user_cmd_bufs
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Content↔surface upload pairing (plan §4's pairing table, §5's design rule)
+// ----------------------------------------------------------------------------
+
+/// wgpu's `TEXEL_COPY_BUFFER_HEIGHT`/`MAP` row alignment in bytes; uploads
+/// whose row pitch is a multiple of it need no internal staging pass.
+const WGPU_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+
+/// One texture upload, after the pairing gate: raw texel bytes, their pitch
+/// contribution, and the GPU format to allocate for them.
+struct UploadData<'a> {
+    bytes: &'a [u8],
+    bytes_per_pixel: u32,
+    format: wgpu::TextureFormat,
+}
+
+/// Why a float-content upload was rejected by the pairing table.
+///
+/// Rendered into the once-per-texture-id `log::warn!`; egui's standard
+/// placeholder renders instead of the image — never a panic, and
+/// [`Renderer::update_texture`]'s signature is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairingRejection {
+    /// The content claims primaries the active surface cannot honor: showing
+    /// the values as-is would gamut-clip them, and there is no honest guess.
+    GamutClipped,
+    /// The active surface pairs a linear-storage color space (scRGB); the
+    /// gamma-encoded float contract has no row there yet — that pairing
+    /// (with its linear conversion) is a later stage.
+    LinearStorageNotPairedYet,
+    /// The surface's color space is not resolved (`Auto`), so its
+    /// interpretation depends on the format: no honest row for tagged
+    /// content.
+    UnresolvedSurfaceSpace,
+}
+
+impl core::fmt::Display for PairingRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = match self {
+            // The evaluated (content primaries, surface color space) pair is
+            // appended by the warn site, so this reason stays honest for
+            // every row that maps to it (sRGB spaces, unresolved BT.2100).
+            Self::GamutClipped => {
+                "tagged float content has no native pairing on this surface's color space: \
+                 showing the values as-is would re-interpret the tag (gamut-clip or wrong \
+                 primaries), and egui does not silently re-interpret tagged content. Skipping \
+                 the upload (the placeholder renders). Re-encode the image app-side, or grant \
+                 the viewport a surface whose color space honors the tag \
+                 (SurfacePreference::WideGamut)"
+            }
+            Self::LinearStorageNotPairedYet => {
+                "this surface's color space (scRGB-linear) stores linear values, but the float \
+                 content contract is gamma-encoded; the linear pairing arrives with egui's \
+                 scRGB stage. Skipping the upload (the placeholder renders)"
+            }
+            Self::UnresolvedSurfaceSpace => {
+                "this surface's color space is unresolved (Auto), so tagged float content has no \
+                 honest interpretation on it. Skipping the upload (the placeholder renders)"
+            }
+        };
+        f.write_str(text)
+    }
+}
+
+/// The content↔surface pairing table for float content: does a
+/// [`epaint::FloatImage`] with `content_primaries` upload natively onto a
+/// surface whose granted color space is `active_surface_color_space`?
+///
+/// This function IS the pairing table (plan §4) — the one place outside
+/// `Primaries` itself that names concrete color spaces for content pairing
+/// (plan §5 design rule). Semantics per row:
+///
+/// | Content tag | Granted surface space        | Behavior            |
+/// |-------------|------------------------------|---------------------|
+/// | `Srgb`      | sRGB space (any format)      | native              |
+/// | `Srgb`      | `DisplayP3`                  | native (shifts like the chrome) |
+/// | `DisplayP3` | `DisplayP3` (± extended)     | native              |
+/// | `DisplayP3` | sRGB / extended-sRGB         | loud reject         |
+/// | either      | scRGB-linear                 | loud reject (linear pairing is a later stage) |
+///
+/// `None` (no surface known — app-driven/headless uploads) pairs with
+/// today's SDR-sRGB semantics.
+///
+/// The arms mirror the plan's table rows 1:1 on purpose; some bodies
+/// coincide, and merging them would erase the row structure.
+#[expect(clippy::match_same_arms)]
+fn pair_float_content_with_surface(
+    content_primaries: epaint::Primaries,
+    active_surface_color_space: Option<wgpu::SurfaceColorSpace>,
+) -> Result<(), PairingRejection> {
+    use wgpu::SurfaceColorSpace as Scs;
+
+    let space = active_surface_color_space.unwrap_or(Scs::Srgb);
+    match (content_primaries, space) {
+        // sRGB content follows the surface's interpretation, the same shift
+        // the chrome gets on a P3-referred surface (§4 row 2; §5).
+        (
+            epaint::Primaries::Srgb,
+            Scs::Auto | Scs::Srgb | Scs::ExtendedSrgb | Scs::DisplayP3 | Scs::ExtendedDisplayP3,
+        ) => Ok(()),
+
+        // Explicit P3 is native only on P3 spaces (± extended).
+        (epaint::Primaries::DisplayP3, Scs::DisplayP3 | Scs::ExtendedDisplayP3) => Ok(()),
+
+        // An explicit claim the surface cannot honor is gamut-clipped there:
+        // no silent guess is honest (§4).
+        (epaint::Primaries::DisplayP3, Scs::Srgb | Scs::ExtendedSrgb) => {
+            Err(PairingRejection::GamutClipped)
+        }
+
+        // `Auto` is unresolved: its interpretation depends on the format
+        // (sRGB on 8-bit, scRGB-linear on fp16), so tagged content has no
+        // honest row.
+        (epaint::Primaries::DisplayP3, Scs::Auto) => Err(PairingRejection::UnresolvedSurfaceSpace),
+
+        // scRGB-linear stores linear values; the gamma-encoded contract has
+        // no row there until the linear pairing lands (§4's PR 4 row, kept).
+        (_, Scs::ExtendedSrgbLinear) => Err(PairingRejection::LinearStorageNotPairedYet),
+
+        // Totality: BT.2100 surfaces are not grantable in v1; tagged content
+        // has no honest row on them.
+        (_, Scs::Bt2100Pq | Scs::Bt2100Hlg) => Err(PairingRejection::GamutClipped),
     }
 }
 
@@ -2076,5 +2333,512 @@ fn fs_test(in: TestVOut) -> TestFOut {
             }
         }
         assert_eq!(checked, NUM_TRANSFER_TEST_INPUTS * 3 * 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Float content upload pairing + f16 upload (plan §8, row 2b)
+    // ------------------------------------------------------------------
+
+    /// The pairing table is total over `Primaries` × `SurfaceColorSpace` and
+    /// matches plan §4's rows exactly. Pure function — runs everywhere.
+    ///
+    /// One arm per plan row (some bodies coincide — that's the point: the
+    /// arms document the rows, not the outcomes).
+    #[expect(clippy::match_same_arms)]
+    #[test]
+    fn pairing_table_matches_plan_rows() {
+        use wgpu::SurfaceColorSpace as Scs;
+
+        let spaces = [
+            Scs::Auto,
+            Scs::Srgb,
+            Scs::ExtendedSrgb,
+            Scs::ExtendedSrgbLinear,
+            Scs::DisplayP3,
+            Scs::ExtendedDisplayP3,
+            Scs::Bt2100Pq,
+            Scs::Bt2100Hlg,
+        ];
+        for primaries in [epaint::Primaries::Srgb, epaint::Primaries::DisplayP3] {
+            for space in spaces {
+                let result = pair_float_content_with_surface(primaries, Some(space));
+                match (primaries, space) {
+                    // Srgb content: native on sRGB spaces and on DisplayP3
+                    // (shifts like the chrome); rejected on the linear
+                    // scRGB pairing and on non-grantable BT.2100 spaces.
+                    (
+                        epaint::Primaries::Srgb,
+                        Scs::Auto
+                        | Scs::Srgb
+                        | Scs::ExtendedSrgb
+                        | Scs::DisplayP3
+                        | Scs::ExtendedDisplayP3,
+                    ) => {
+                        assert_eq!(result, Ok(()), "{primaries:?} on {space:?}");
+                    }
+                    (epaint::Primaries::Srgb, Scs::ExtendedSrgbLinear) => {
+                        assert_eq!(
+                            result,
+                            Err(PairingRejection::LinearStorageNotPairedYet),
+                            "{primaries:?} on {space:?}"
+                        );
+                    }
+                    // DisplayP3 content: native on P3 (± extended), loud
+                    // reject everywhere else (sRGB spaces gamut-clip; scRGB
+                    // is the later linear pairing; BT.2100 not grantable).
+                    (epaint::Primaries::DisplayP3, Scs::DisplayP3 | Scs::ExtendedDisplayP3) => {
+                        assert_eq!(result, Ok(()), "{primaries:?} on {space:?}");
+                    }
+                    (epaint::Primaries::DisplayP3, Scs::Srgb | Scs::ExtendedSrgb) => {
+                        assert_eq!(
+                            result,
+                            Err(PairingRejection::GamutClipped),
+                            "{primaries:?} on {space:?}"
+                        );
+                    }
+                    (epaint::Primaries::DisplayP3, Scs::Auto) => {
+                        assert_eq!(
+                            result,
+                            Err(PairingRejection::UnresolvedSurfaceSpace),
+                            "{primaries:?} on {space:?}"
+                        );
+                    }
+                    (epaint::Primaries::DisplayP3, Scs::ExtendedSrgbLinear) => {
+                        assert_eq!(
+                            result,
+                            Err(PairingRejection::LinearStorageNotPairedYet),
+                            "{primaries:?} on {space:?}"
+                        );
+                    }
+                    (_, Scs::Bt2100Pq | Scs::Bt2100Hlg) => {
+                        assert_eq!(
+                            result,
+                            Err(PairingRejection::GamutClipped),
+                            "{primaries:?} on {space:?}"
+                        );
+                    }
+                }
+            }
+            // Unset active space (None) pairs with Srgb semantics.
+            assert_eq!(
+                pair_float_content_with_surface(primaries, None),
+                pair_float_content_with_surface(primaries, Some(Scs::Srgb)),
+                "None must pair like Srgb"
+            );
+        }
+    }
+
+    /// Every f16-exact value used by the round-trip test: SDR white, >1.0,
+    /// negatives, ±0.0 (sign bit), and f16-max. `width` is 3 on purpose:
+    /// 3 × 8 = 24 bytes/row, forcing the 256-byte pitch padding (plan §4).
+    fn roundtrip_float_image(primaries: epaint::Primaries) -> epaint::FloatImage {
+        let texels: [[f32; 4]; 6] = [
+            [1.0, 0.5, 0.25, 1.0],
+            [2.0, -1.0, 4.0, 0.5],
+            [10.0, -0.25, 0.0, 1.0],
+            [65504.0, 0.5, -2.0, 1.0],
+            [0.25, 0.25, 0.25, 0.25],
+            [-4.0, 4.0, -0.0, 1.0],
+        ];
+        let mut rgba = Vec::with_capacity(24);
+        for texel in &texels {
+            rgba.extend_from_slice(texel);
+        }
+        epaint::FloatImage::from_rgba([3, 2], primaries, &rgba)
+    }
+
+    /// The expected f16 bit patterns of [`roundtrip_float_image`], row-major.
+    fn roundtrip_expected_bits() -> Vec<[u16; 4]> {
+        roundtrip_float_image(epaint::Primaries::Srgb)
+            .pixels()
+            .iter()
+            .map(|texel| texel.map(half::f16::to_bits))
+            .collect()
+    }
+
+    /// Reads back an `Rgba16Float` texture as exact `u16` texel bit patterns.
+    fn read_rgba16float_bits(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Vec<[u16; 4]> {
+        let bytes_per_row = (width * 8).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("egui-wgpu float upload round-trip readback"),
+            size: (bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui-wgpu float upload round-trip copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the float upload copy");
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).expect("readback receiver hung up");
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the float upload map");
+        receiver
+            .recv()
+            .expect("readback sender hung up")
+            .expect("failed to map the float upload readback buffer");
+
+        let data = slice
+            .get_mapped_range()
+            .expect("failed to map the float upload readback buffer");
+        let mut texels = Vec::with_capacity((width * height) as usize);
+        for row in 0..height {
+            let row_start = (row * bytes_per_row) as usize;
+            for col in 0..width {
+                let offset = row_start + (col * 8) as usize;
+                let texel: [u16; 4] = bytemuck::cast_slice(&data[offset..offset + 8])
+                    .try_into()
+                    .expect("each f16 texel is exactly eight bytes");
+                texels.push(texel);
+            }
+        }
+        texels
+    }
+
+    /// Float content uploads as `Rgba16Float` with f16-exact bits, including
+    /// a width whose row pitch forces the 256-byte padding, and a
+    /// `Primaries::DisplayP3` native pairing. Adapter-requiring (2a
+    /// conventions): machines without any wgpu adapter skip with a message.
+    #[test]
+    fn float_upload_roundtrips_f16_bits_exactly() {
+        let Some((device, queue)) = test_device("float_upload_roundtrips_f16_bits_exactly") else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+
+        // Srgb-tagged content, sRGB active space: native.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let image = roundtrip_float_image(epaint::Primaries::Srgb);
+        let id = epaint::TextureId::Managed(101);
+        let delta = epaint::ImageDelta::full(image, epaint::textures::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, id, &delta);
+
+        let texture = renderer
+            .texture(&id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("Srgb float content on an sRGB surface must allocate a texture");
+        assert_eq!(
+            texture.format(),
+            wgpu::TextureFormat::Rgba16Float,
+            "float content must upload as Rgba16Float"
+        );
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, texture, 3, 2),
+            roundtrip_expected_bits(),
+            "the uploaded texels must be f16-bit-exact (padded 3-wide rows included)"
+        );
+
+        // DisplayP3-tagged content, DisplayP3 active space: native.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::DisplayP3));
+        let p3_image = roundtrip_float_image(epaint::Primaries::DisplayP3);
+        let p3_id = epaint::TextureId::Managed(102);
+        let p3_delta = epaint::ImageDelta::full(p3_image, epaint::textures::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, p3_id, &p3_delta);
+
+        let p3_texture = renderer
+            .texture(&p3_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("DisplayP3 content on a DisplayP3 surface must allocate a texture");
+        assert_eq!(p3_texture.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, p3_texture, 3, 2),
+            roundtrip_expected_bits(),
+            "the native DisplayP3 upload must also be f16-bit-exact"
+        );
+
+        // Partial (sub-region) float updates ride the same padded path: a
+        // 3×2 patch written into a 3×4 texture (width 3 keeps forcing the
+        // 256-byte pitch), then verified region-exact.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let patch_id = epaint::TextureId::Managed(103);
+        let base =
+            epaint::FloatImage::filled([3, 4], epaint::Primaries::Srgb, [0.5, 0.5, 0.5, 1.0]);
+        renderer.update_texture(
+            &device,
+            &queue,
+            patch_id,
+            &epaint::ImageDelta::full(base, epaint::textures::TextureOptions::LINEAR),
+        );
+        let patch = roundtrip_float_image(epaint::Primaries::Srgb);
+        renderer.update_texture(
+            &device,
+            &queue,
+            patch_id,
+            &epaint::ImageDelta::partial([0, 2], patch, epaint::textures::TextureOptions::LINEAR),
+        );
+        let patched_texture = renderer
+            .texture(&patch_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("the patched texture must exist");
+        assert_eq!(patched_texture.format(), wgpu::TextureFormat::Rgba16Float);
+        let patched_bits = read_rgba16float_bits(&device, &queue, patched_texture, 3, 4);
+        let expected = roundtrip_expected_bits();
+        let base_texel = [
+            half::f16::from_f32(0.5).to_bits(),
+            half::f16::from_f32(0.5).to_bits(),
+            half::f16::from_f32(0.5).to_bits(),
+            half::f16::from_f32(1.0).to_bits(),
+        ];
+        // 3-wide: rows are texels 0..3, 3..6, 6..9, 9..12; the patch is rows 2+3.
+        assert_eq!(
+            &patched_bits[0..6],
+            &[base_texel; 6],
+            "rows above the patch are untouched"
+        );
+        assert_eq!(
+            &patched_bits[6..12],
+            &expected[..],
+            "the patch region is f16-bit-exact"
+        );
+        assert!(
+            renderer.upload_rejections_warned.is_empty(),
+            "no pairing rejection may fire in this test"
+        );
+    }
+
+    /// DisplayP3-tagged float content on an sRGB surface is loudly rejected:
+    /// no texture is created, a warning logs once per texture id, and the
+    /// gate does not poison other uploads. Adapter-requiring (the reject
+    /// path returns before touching the device, but `update_texture` takes
+    /// device/queue references).
+    #[test]
+    fn display_p3_float_content_is_loudly_rejected_on_srgb_surface() {
+        let Some((device, queue)) =
+            test_device("display_p3_float_content_is_loudly_rejected_on_srgb_surface")
+        else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+
+        let p3_id = epaint::TextureId::Managed(201);
+        let p3_delta = epaint::ImageDelta::full(
+            roundtrip_float_image(epaint::Primaries::DisplayP3),
+            epaint::textures::TextureOptions::LINEAR,
+        );
+        renderer.update_texture(&device, &queue, p3_id, &p3_delta);
+
+        // The texture was NOT created/updated — observable via the map.
+        assert!(
+            !renderer.textures.contains_key(&p3_id),
+            "a rejected upload must not allocate a texture"
+        );
+        // The honest warn assertion: the warn-once state (the log::warn! ran).
+        assert!(
+            renderer.upload_rejections_warned.contains(&p3_id),
+            "a rejected upload must warn (once) for its texture id"
+        );
+        // Rejecting is not sticky: the same id with Srgb content uploads.
+        let srgb_delta = epaint::ImageDelta::full(
+            roundtrip_float_image(epaint::Primaries::Srgb),
+            epaint::textures::TextureOptions::LINEAR,
+        );
+        renderer.update_texture(&device, &queue, p3_id, &srgb_delta);
+        assert!(
+            renderer.texture(&p3_id).is_some(),
+            "the gate must not poison later, pairable uploads for the same id"
+        );
+
+        // The scRGB-linear row is kept rejected for BOTH tags (PR 4 pairing).
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
+        let p3_id_scrgb = epaint::TextureId::Managed(202);
+        renderer.update_texture(&device, &queue, p3_id_scrgb, &p3_delta);
+        assert!(renderer.texture(&p3_id_scrgb).is_none());
+        let srgb_id_scrgb = epaint::TextureId::Managed(203);
+        renderer.update_texture(&device, &queue, srgb_id_scrgb, &srgb_delta);
+        assert!(renderer.texture(&srgb_id_scrgb).is_none());
+        assert!(
+            renderer.upload_rejections_warned.contains(&srgb_id_scrgb),
+            "gamma-encoded content on the linear pairing must reject loudly"
+        );
+    }
+
+    /// A partial patch whose content kind does not match the texture's
+    /// format is loudly rejected in both directions: a Color patch onto a
+    /// float texture (would fail wgpu's size validation) and a float patch
+    /// onto an 8-bit texture (would silently corrupt). The patch is skipped,
+    /// the previous content is untouched, and no device error fires
+    /// (the `on_uncaptured_error` panic in [`test_device`] fails the test on
+    /// any validation error). Adapter-requiring (2a conventions).
+    #[test]
+    fn partial_patch_kind_mismatch_is_loudly_rejected() {
+        let Some((device, queue)) = test_device("partial_patch_kind_mismatch_is_loudly_rejected")
+        else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+
+        // Float texture, then a Color patch onto it: skipped, texture
+        // bit-identical.
+        let float_id = epaint::TextureId::Managed(301);
+        renderer.update_texture(
+            &device,
+            &queue,
+            float_id,
+            &epaint::ImageDelta::full(
+                roundtrip_float_image(epaint::Primaries::Srgb),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        let texture = renderer
+            .texture(&float_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("the float texture must exist");
+        let before = read_rgba16float_bits(&device, &queue, texture, 3, 2);
+
+        renderer.update_texture(
+            &device,
+            &queue,
+            float_id,
+            &epaint::ImageDelta::partial(
+                [0, 0],
+                epaint::ColorImage::filled([1, 2], egui::Color32::RED),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        assert!(
+            renderer.upload_rejections_warned.contains(&float_id),
+            "a Color patch onto a float texture must warn (once)"
+        );
+        let texture = renderer
+            .texture(&float_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("the skipped patch must not remove the texture");
+        assert_eq!(texture.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, texture, 3, 2),
+            before,
+            "the skipped patch must leave the texture bit-identical"
+        );
+
+        // Color texture, then a Float patch onto it: skipped, format and
+        // content unchanged.
+        let color_id = epaint::TextureId::Managed(302);
+        renderer.update_texture(
+            &device,
+            &queue,
+            color_id,
+            &epaint::ImageDelta::full(
+                epaint::ColorImage::filled([3, 2], egui::Color32::RED),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        renderer.update_texture(
+            &device,
+            &queue,
+            color_id,
+            &epaint::ImageDelta::partial(
+                [0, 0],
+                roundtrip_float_image(epaint::Primaries::Srgb),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        assert!(
+            renderer.upload_rejections_warned.contains(&color_id),
+            "a float patch onto a Color texture must warn (once)"
+        );
+        let texture = renderer
+            .texture(&color_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("the skipped patch must not remove the texture");
+        assert_eq!(
+            texture.format(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            "the skipped patch must not change the texture's format"
+        );
+
+        // The same kind re-uploaded whole still works after a mismatch (the
+        // rejection is not sticky for valid uploads).
+        renderer.update_texture(
+            &device,
+            &queue,
+            color_id,
+            &epaint::ImageDelta::full(
+                epaint::ColorImage::filled([3, 2], egui::Color32::BLUE),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        assert!(
+            renderer.texture(&color_id).is_some(),
+            "a whole upload of the matching kind must succeed after a mismatch"
+        );
+    }
+
+    /// Adapter/device bootstrap shared by the runtime tests: skips with a
+    /// message on machines without any wgpu adapter (2a conventions).
+    fn test_device(context: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })) {
+                Ok(adapter) => adapter,
+                Err(err) => {
+                    // Machines without any wgpu adapter skip; CI (macos) and dev
+                    // machines with GPUs (or software rasterizers) always run this.
+                    #[expect(clippy::print_stderr)]
+                    {
+                        eprintln!("skipping {context}: no wgpu adapter: {err}");
+                    }
+                    return None;
+                }
+            };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some(context),
+            ..Default::default()
+        }))
+        .unwrap_or_else(|err| panic!("failed to request a wgpu device for {context}: {err}"));
+
+        // Any device error (validation or otherwise) fails the test.
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the egui-wgpu runtime test: {err}");
+        }));
+
+        Some((device, queue))
     }
 }

@@ -727,6 +727,10 @@ impl Painter {
 
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
+            // Surface half of the content↔surface upload pairing: the
+            // uploads below are gated on the space this viewport's surface
+            // was granted (plan §4). We hold the renderer write lock.
+            renderer.set_active_surface_color_space(Some(surface_state.target.color_space));
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

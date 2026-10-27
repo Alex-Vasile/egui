@@ -2,7 +2,7 @@
 #![expect(unsafe_code)]
 
 use core::mem::offset_of;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use egui::{
     emath::Rect,
@@ -95,6 +95,10 @@ pub struct Painter {
     element_array_buffer: glow::Buffer,
 
     textures: HashMap<egui::TextureId, glow::Texture>,
+
+    /// Texture ids whose float-content upload was already warned about
+    /// (warn once per texture id; glow stays SDR by design — plan §9).
+    float_content_warned: HashSet<egui::TextureId>,
 
     next_native_tex_id: u64,
 
@@ -265,6 +269,7 @@ impl Painter {
                 vbo,
                 element_array_buffer,
                 textures: Default::default(),
+                float_content_warned: HashSet::new(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
                 destroyed: false,
@@ -512,6 +517,20 @@ impl Painter {
 
         self.assert_not_destroyed();
 
+        // glow stays SDR by design (plan §9): float content has no runtime
+        // support here. Warn once per texture id and skip the upload — the
+        // standard missing-texture behavior renders instead.
+        let egui::ImageData::Color(image) = &delta.image else {
+            if self.float_content_warned.insert(tex_id) {
+                log::warn!(
+                    "egui texture {tex_id:?}: float content (ImageData::Float) is not supported \
+                     by the glow painter — skipping the upload (the image will not render)"
+                );
+            }
+            return;
+        };
+        let data: &[u8] = bytemuck::cast_slice(image.pixels());
+
         let glow_texture = *self
             .textures
             .entry(tex_id)
@@ -520,12 +539,7 @@ impl Painter {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(glow_texture));
         }
 
-        match &delta.image {
-            egui::ImageData::Color(image) => {
-                let data: &[u8] = bytemuck::cast_slice(image.pixels());
-                self.upload_texture_srgb(delta.pos, image.resolution(), delta.options, data);
-            }
-        }
+        self.upload_texture_srgb(delta.pos, image.resolution(), delta.options, data);
     }
 
     fn upload_texture_srgb(
@@ -632,6 +646,10 @@ impl Painter {
         if let Some(old_tex) = self.textures.remove(&tex_id) {
             unsafe { self.gl.delete_texture(old_tex) };
         }
+        // A freed texture id may come back with different content; let the
+        // next skipped float upload for it warn again (mirrors the wgpu
+        // renderer's re-arm-on-free).
+        self.float_content_warned.remove(&tex_id);
     }
 
     /// Get the [`glow::Texture`] bound to a [`egui::TextureId`].

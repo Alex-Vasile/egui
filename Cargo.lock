@@ -1337,6 +1337,7 @@ dependencies = [
  "document-features",
  "egui",
  "epaint",
+ "half",
  "log",
  "png 0.18.1",
  "pollster 1.0.1",
@@ -1659,6 +1660,7 @@ dependencies = [
  "emath",
  "epaint_default_fonts",
  "font-types",
+ "half",
  "harfrust",
  "log",
  "mimalloc",
@@ -1668,6 +1670,7 @@ dependencies = [
  "rayon",
  "self_cell",
  "serde",
+ "serde_json",
  "similar-asserts",
  "skrifa",
  "smallvec",
@@ -2213,6 +2216,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "num-traits",

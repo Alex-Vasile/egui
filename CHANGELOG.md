@@ -18,6 +18,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 ### ⭐ Added
 * `ViewportInfo::surface_status` and `ViewportInfo::surface_target`: wgpu-based backends now surface each viewport's rendering-surface decision (whether the app's surface preference was granted, and the configured format + color space, e.g. `"Bgra8Unorm + DisplayP3"`). Backends that don't track this (glow, web) leave both fields `None`. Comes with the new mirror enums `egui::SurfaceStatus` and `egui::FallbackReason`.
+* Tagged float content: `egui::FloatImage` and `egui::Primaries` are re-exported, and `ImageData::Float` makes wide-gamut (and later HDR) *images* possible. Float images display through the plain `ui.image()`; the wgpu backend pairs the content's primaries with the granted surface color space (native or loud reject with a warning and the placeholder), and the glow backend skips float content with a warning. Note: `ImageData`/`ImageDelta`/`TexturesDelta` no longer implement `Eq` (float content is `PartialEq`-only), and the closed serde enum gained a variant.
 
 
 ## 0.37.0 - Colored emojis! 🚀

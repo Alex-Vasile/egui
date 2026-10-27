@@ -86,6 +86,7 @@ ecolor.workspace = true
 
 ahash.workspace = true
 font-types.workspace = true
+half.workspace = true
 harfrust.workspace = true
 log.workspace = true
 nohash-hasher.workspace = true
@@ -115,6 +116,7 @@ epaint_default_fonts = { workspace = true, optional = true }
 [dev-dependencies]
 criterion.workspace = true
 mimalloc.workspace = true
+serde_json.workspace = true
 similar-asserts.workspace = true
 
 

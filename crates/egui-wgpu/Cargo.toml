@@ -80,3 +80,5 @@ winit = { workspace = true, optional = true, default-features = false }
 pollster.workspace = true
 # Scratch PNGs for the capture-tagging tests (clippy.toml disallows `std::env::temp_dir`).
 tempfile.workspace = true
+# The upload round-trip test asserts exact f16 bit patterns against the CPU values.
+half.workspace = true

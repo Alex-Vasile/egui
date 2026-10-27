@@ -5,6 +5,20 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+
+### ⭐ Added
+* Add `Primaries` and `FloatImage` plus `ImageData::Float`: tagged float content (HDR / wide-gamut images). Float pixels are gamma-encoded in the declared primaries, premultiplied in the encoded components (`stored = a × enc(L)`), unclamped above 1.0, odd-symmetric for negatives; 1.0 = SDR reference white. Stored as f16 (`half`), 1:1 with the `Rgba16Float` GPU upload. Helpers: `new`, `filled`, `from_rgba`, lossy `from_color_image` (result carries `Primaries::Srgb`)
+* `FloatImage` serializes its texels as raw IEEE 754 binary16 bit patterns (`u16`) — a stable on-the-wire representation that does not depend on `half`'s serde support
+
+### ⚠️ Breaking changes
+* `Eq` is dropped from `ImageData`, `ImageDelta` and `TexturesDelta` (float content only offers `PartialEq`, matching `ecolor::Rgba`); `ImageData` gains the `Float` variant, extending the closed serde enum
+* `ImageData::bytes_per_pixel` returns `8` for float content
+
+### 🔧 Changed
+* Upstream note for the eventual PR: this fork's constructor-based `ColorImage` (private `resolution` field) already matches upstream `main` after #8714 renamed `size`→`resolution`; `FloatImage` follows that same house style. Re-verify against `main` before drafting the PR (plan §10)
+
+
 ## 0.37.0 - 2026-10-15
 ### ⭐ Added
 * Add `epaint::RoundedRect` primitive [#8440](https://github.com/emilk/egui/pull/8440) by [@emilk](https://github.com/emilk)

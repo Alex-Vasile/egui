@@ -6,6 +6,10 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 
 
+## Unreleased
+* Compile-only support for the new `ImageData::Float` content type: the glow painter stays SDR by design (no wide-gamut/HDR runtime claims), so float-content uploads are skipped with a warning (once per texture id) and the standard missing-texture behavior renders instead
+
+
 ## 0.37.0 - 2026-10-15
 * Eframe: fall back to a compatibility-profile OpenGL context [#8655](https://github.com/emilk/egui/pull/8655) by [@crmne](https://github.com/crmne)
 
