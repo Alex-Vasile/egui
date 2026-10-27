@@ -10,7 +10,7 @@ Each step is marked **CI cannot validate this.**
 | Command | What it shows |
 |---|---|
 | `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamut`, asserts the surfaced decision is coherent, logs the pairing, exits 0 after a few frames. |
-| `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target`, a callback quad holding the surface's native primaries as full-range bytes, and an "sRGB red (converted)" (≈ (234, 51, 35)) vs "P3 red (native)" ((255, 0, 0)) swatch row. |
+| `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target` and a full-width 2×3 primaries grid canvas (bold "sRGB primaries" / "display primaries" labels sandwich it) — top row the sRGB primaries converted at runtime into the granted color space's encoding, bottom row the display's native primaries as full-range bytes ((255, 0, 0), (0, 255, 0), (0, 0, 255)). |
 
 The log line `Surface decision: Bgra8Unorm + DisplayP3 (Granted)` (or the
 example's on-screen readout) is the primary reading throughout.
@@ -35,10 +35,10 @@ deliberately absent from this checklist.
 
 1. Run `cargo run -p eframe --example hdr_wide_gamut` on an SDR display.
    Expected: `Surface status: FellBack(NoPairedColorSpace)`, `Surface target:
-   Bgra8Unorm + Srgb`; the quad reads as the ordinary sRGB primaries, and the
-   quad's red band matches the "P3 red (native)" swatch, not the "sRGB red
-   (converted)" one — both swatches just display their raw bytes ((255, 0, 0)
-   vs (234, 51, 35)). **CI cannot validate this.**
+   Bgra8Unorm + Srgb`; the `Srgb` conversion is the identity, so the grid's
+   two rows are byte-identical ((255, 0, 0) / (0, 255, 0) / (0, 0, 255) on
+   both) — identical rows are the tell for the fallback path. **CI cannot
+   validate this.**
 2. Run `cargo run -p eframe --example hdr_smoke`. Expected: exits 0 within a
    few seconds and logs the `FellBack` decision. (CI runs this step on
    macos-latest, but confirming it on *your* SDR hardware is manual.)
@@ -48,26 +48,25 @@ deliberately absent from this checklist.
 
 1. Run `hdr_wide_gamut` on an EDR iMac or Pro Display XDR.
    Expected: `Surface status: Granted`, `Surface target:
-   Bgra8Unorm + DisplayP3`. The quad's bands are visibly more saturated than
-   the sRGB primaries; the "sRGB red (converted)" and "P3 red (native)"
-   swatches read as the same hue with the native one visibly deeper.
-   **CI cannot validate this.**
+   Bgra8Unorm + DisplayP3`. The grid's top row reads as the familiar sRGB
+   primaries while the bottom row is visibly deeper and more saturated —
+   outside the sRGB gamut. **CI cannot validate this.**
 2. Instrumented check (screenshot piped through a color-managed viewer or a
-   colorimeter): the quad's red band measures inside Display P3, outside
-   sRGB; the "sRGB red (converted)" swatch measures as ordinary sRGB red.
-   **CI cannot validate this.**
+   colorimeter): the bottom-row red patch measures
+   inside Display P3, outside sRGB; the top-row red patch measures as
+   ordinary sRGB red. **CI cannot validate this.**
 3. Compositor-capture discriminator: answers whether the granted
    `DisplayP3` surface is actually P3-referred at the compositor, or wgpu
    merely reports the pairing. Capture the window with Screen Recording
    permission (`screencapture -x -o -l<windowid>`), convert the capture to
    sRGB (`sips --matchTo '/System/Library/ColorSync/Profiles/sRGB
-   Profile.icc'`), and decode the "sRGB red (converted)" swatch patch (swatch
-   bytes (234, 51, 35), physically ordinary sRGB red): reading ≈ (255, 0, 0)
+   Profile.icc'`), and decode the top-row red patch (bytes (234, 51, 35),
+   physically ordinary sRGB red): reading ≈ (255, 0, 0)
    means the P3-referred encoding round-tripped back to sRGB red — the layer
    is P3-referred; reading ≈ (234, 51, 35) means the bytes passed through
-   untouched — the layer is still sRGB-referred despite the pairing. The "P3
-   red (native)" patch reads (255, 0, 0) either way (the P3 primary lies
-   outside the sRGB gamut and clips on conversion), so it is not
+   untouched — the layer is still sRGB-referred despite the pairing. The
+   bottom-row (native) red patch reads (255, 0, 0) either way (the P3 primary
+   lies outside the sRGB gamut and clips on conversion), so it is not
    discriminative on its own. Tolerances ±3 per channel for capture and
    quantization noise. **CI cannot validate this.**
 4. Run `hdr_smoke` on the same display. Expected: exit 0, log shows the

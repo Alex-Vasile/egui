@@ -1,29 +1,35 @@
 //! Wide-gamut callback demo: saturation outside the sRGB gamut.
 //!
-//! Opts into [`SurfacePreference::WideGamut`] and paints a large quad through
-//! a wgpu callback whose pipeline is built lazily against whatever
-//! `target_format` the callback receives — the same per-format pattern as the
-//! `custom3d` demo. The quad draws the surface's native primaries as
-//! full-range bytes: (255, 0, 0), (0, 255, 0), (0, 0, 255). On a P3-referred
-//! surface those bytes ARE the Display P3 primaries and display outside the
-//! sRGB gamut; an SDR fallback surface displays the same bytes as the
-//! ordinary sRGB primaries. (The P3 primaries are *defined* by their xy
+//! Opts into [`SurfacePreference::WideGamut`] and paints a 2×3 grid of
+//! primaries through a wgpu callback whose pipeline is built lazily against
+//! whatever `target_format` the callback receives — the same per-format
+//! pattern as the `custom3d` demo. The bottom row is the surface's native
+//! primaries as full-range bytes; the top row is the three sRGB primaries
+//! converted at runtime into whatever color space the surface was actually
+//! granted. The grant is parsed from the `surface_target` diagnostics
+//! string ([`egui::ViewportInfo::surface_target`], e.g.
+//! "`Bgra8Unorm + DisplayP3`"): PR 1's structured per-viewport decision is
+//! not app-reachable — the painter accessor lives below eframe — so that
+//! string is the channel, and its color-space suffix maps 1:1 onto the
+//! conversion table. `Srgb` and unrecognized spaces convert with the
+//! identity matrix (unrecognized says so in the hint).
+//!
+//! That makes the grid a self-contained check: identical rows mean the
+//! surface is not wide-gamut (the bytes are re-read as-is); the top row
+//! visibly muted relative to the bottom means wide gamut is working — on a
+//! P3-referred surface the bottom row IS the Display P3 primaries, outside
+//! the sRGB gamut. (The P3 primaries are *defined* by their xy
 //! chromaticities — (0.680, 0.320) etc. Those are coordinates in the CIE
-//! chromaticity diagram, not colors: encoding them as linear RGB and applying
-//! the sRGB transfer yields mixes like the orange (215, 153, 0) on any
-//! surface.)
+//! chromaticity diagram, not colors: encoding them as linear RGB and
+//! applying the sRGB transfer yields mixes like the orange (215, 153, 0) on
+//! any surface.)
 //!
-//! The side panel shows the live surface decision
-//! ([`egui::ViewportInfo::surface_status`] / `surface_target`) plus an
-//! "sRGB red (converted)" vs "P3 red (native)" swatch row — the same physical
-//! red written once in the surface's P3-referred encoding (≈ (234, 51, 35))
-//! and once as the native primary (255, 0, 0). On a P3 display the native
-//! primary is visibly deeper; on an SDR fallback both swatches just display
-//! their raw bytes, so machines without a P3 display can still tell which
-//! path produced which bytes.
+//! The canvas is sandwiched between bold "sRGB primaries" / "display
+//! primaries" labels; below it the panel shows the live surface decision
+//! ([`egui::ViewportInfo::surface_status`] / `surface_target`) and a hint.
 //!
-//! The effect needs a P3-capable display. Everything here stays SDR — the u8
-//! surface clamps at 1.0; HDR brightness is PR 3.
+//! Everything here stays SDR — the u8 surface clamps at 1.0; HDR brightness
+//! is PR 3. The wide-gamut effect needs a P3-capable display.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 #![expect(rustdoc::missing_crate_level_docs, clippy::unwrap_used)] // it's an example
@@ -60,11 +66,7 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-struct WideGamutApp {
-    /// sRGB red mapped into the surface's P3-referred encoding, computed in
-    /// [`Self::new`] from [`SRGB_TO_P3_LINEAR`] — bytes (234, 51, 35).
-    srgb_red_converted: egui::Color32,
-}
+struct WideGamutApp;
 
 impl WideGamutApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
@@ -77,6 +79,57 @@ impl WideGamutApp {
                 source: wgpu::ShaderSource::Wgsl(SHADER.into()),
             });
 
+        // The six grid cell colors travel to the fragment shader through a
+        // small uniform buffer so the conversion can follow the granted
+        // color space at runtime (see [`GrantedSpace`]).
+        let cells_bgl =
+            wgpu_render_state
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("hdr_wide_gamut cells layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: Some(wgpu::BufferSize::new(96).unwrap()),
+                        },
+                        count: None,
+                    }],
+                });
+        let cells = wgpu_render_state
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hdr_wide_gamut cells"),
+                size: 96,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            });
+        let cells_bind_group =
+            wgpu_render_state
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("hdr_wide_gamut cells"),
+                    layout: &cells_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &cells,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }],
+                });
+        let pipeline_layout =
+            wgpu_render_state
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("hdr_wide_gamut"),
+                    bind_group_layouts: &[Some(&cells_bgl)],
+                    immediate_size: 0,
+                });
+
         wgpu_render_state
             .renderer
             .write()
@@ -84,11 +137,13 @@ impl WideGamutApp {
             .insert(QuadRenderResources {
                 pipeline: None,
                 shader,
+                pipeline_layout,
+                cells,
+                cells_bind_group,
+                uploaded: [egui::Color32::BLACK; 6],
             });
 
-        Some(Self {
-            srgb_red_converted: srgb_red_converted_to_p3(),
-        })
+        Some(Self)
     }
 }
 
@@ -104,17 +159,31 @@ impl eframe::App for WideGamutApp {
             )
         });
 
+        let space = GrantedSpace::from_target(target.as_deref());
+
         egui::CentralPanel::default().show(ui, |ui| {
-            // The canvas gets the top 60% of the panel: sizing it to the full
-            // available space would push every widget after it past the clip
-            // rect, invisibly.
+            // The canvas IS the 2×3 grid: it takes the top ~60% of the panel
+            // (sizing it to the full available space would push every widget
+            // after it past the clip rect, invisibly) and the shader splits
+            // it pixel-flush into six full-size cells. The bold labels
+            // sandwich it, naming the rows.
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("sRGB primaries").strong());
+            });
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(
                     ui.available_size() * egui::vec2(1.0, 0.6),
                     egui::Sense::hover(),
                 );
-                ui.painter()
-                    .add(egui_wgpu::Callback::new_paint_callback(rect, WideGamutQuad));
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    WideGamutQuad {
+                        cells: grid_cells(space),
+                    },
+                ));
+            });
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("display primaries").strong());
             });
 
             ui.label(format!("Surface status: {status:?}"));
@@ -122,64 +191,101 @@ impl eframe::App for WideGamutApp {
                 "Surface target: {}",
                 target.as_deref().unwrap_or("(unknown)")
             ));
-            ui.label(
-                "The quad above holds the surface's native primaries as \
-                 full-range bytes. On a P3-referred surface they display \
-                 outside the sRGB gamut; on an SDR fallback the same bytes \
-                 read as ordinary sRGB primaries. Needs a P3-capable display.",
+            let mut hint = String::from(
+                "The check: identical rows mean no wide gamut — the surface \
+                 re-reads the top row's bytes as-is. The top row visibly \
+                 muted relative to the bottom row means wide gamut is \
+                 working: on a P3-referred surface the top row reads as the \
+                 familiar sRGB primaries while the bottom row is the Display \
+                 P3 primaries, outside the sRGB gamut.",
             );
-            ui.separator();
-            let swatch_row = ui.horizontal(|ui| {
-                // sRGB red (1, 0, 0) converted into the surface's P3-referred
-                // encoding: the bytes that make a P3 surface show the
-                // ordinary sRGB red.
-                swatch(ui, "sRGB red (converted)", self.srgb_red_converted);
-                // The native primary the quad's red band writes — the same
-                // bytes on any surface, deeper only on a P3 panel.
-                swatch(ui, "P3 red (native)", egui::Color32::from_rgb(255, 0, 0));
-            });
+            if space == GrantedSpace::Unrecognized {
+                hint.push_str(
+                    " The granted color space is not recognized — the top \
+                     row is showing raw sRGB bytes.",
+                );
+            }
+            let hint = ui.label(hint);
 
             // Layout probe: the readout must lay out inside the visible
             // screen — a canvas consuming the whole panel would push every
             // widget after it below the window, invisibly (egui's panel rect
             // itself expands with overflowing content, so the screen rect is
-            // the only honest boundary). The swatch row is the last widget,
+            // the only honest boundary). The hint label is the last widget,
             // so its placed rect is the canary.
-            let row_rect = swatch_row.response.rect;
+            let hint_rect = hint.rect;
             let screen = ui.ctx().content_rect();
             assert!(
-                row_rect.is_finite() && row_rect.height() > 0.0 && screen.contains_rect(row_rect),
+                hint_rect.is_finite()
+                    && hint_rect.height() > 0.0
+                    && screen.contains_rect(hint_rect),
                 "the status readout must lay out on screen \
-                 (swatch row {row_rect:?}, screen {screen:?})"
+                 (hint label {hint_rect:?}, screen {screen:?})"
             );
             log::info!(
-                "hdr_wide_gamut readout laid out: swatch row {row_rect:?} on screen {screen:?}"
+                "hdr_wide_gamut readout laid out: hint label {hint_rect:?} on screen {screen:?}"
             );
         });
     }
 }
 
-fn swatch(ui: &mut egui::Ui, name: &str, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 16.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 2.0, color);
-    ui.label(name);
+/// The color space the surface was actually granted, parsed from the
+/// app-visible diagnostics string
+/// ([`egui::ViewportInfo::surface_target`], e.g. "`Bgra8Unorm + DisplayP3`").
+///
+/// PR 1's structured per-viewport decision is not app-reachable — the
+/// painter accessor lives below eframe — so this diagnostics string is the
+/// channel. That string is pairing-table data (`SurfaceTarget`'s `Display`
+/// impl writes "`format + color_space`"), and its suffix matches
+/// [`wgpu::SurfaceColorSpace`]'s `Debug` name 1:1, so this is a table
+/// lookup, not guesswork.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GrantedSpace {
+    /// The fallback: bytes are re-read as ordinary sRGB.
+    Srgb,
+    /// The wide-gamut grant: bytes are read as Display P3.
+    DisplayP3,
+    /// Anything else (or no string at all): the conversion falls back to
+    /// identity and the hint says so — raw bytes, loudly shown, never
+    /// silently wrong.
+    Unrecognized,
 }
 
-/// Linear-light sRGB → Display P3 conversion, both D65-referred: the product
-/// `M_P3⁻¹ · M_sRGB` of each system's RGB→XYZ matrix (built from the CIE xy
-/// chromaticities of the primaries and the D65 white point (0.3127, 0.3290)).
-/// Published verbatim in CSS Color 4 ("predefined-display-p3"); rows sum to 1
-/// because both systems share the D65 white. Column 1 applied to sRGB red
-/// (1, 0, 0) gives the P3-linear color (0.82246, 0.03319, 0.01708).
-const SRGB_TO_P3_LINEAR: [[f32; 3]; 3] = [
-    [0.822_461_97, 0.177_538_03, 0.0],
-    [0.033_194_2, 0.966_805_8, 0.0],
-    [0.017_082_63, 0.072_397_44, 0.910_519_93],
-];
+impl GrantedSpace {
+    fn from_target(target: Option<&str>) -> Self {
+        match target.and_then(|t| t.rsplit_once(" + ").map(|(_, space)| space)) {
+            Some("Srgb") => Self::Srgb,
+            Some("DisplayP3") => Self::DisplayP3,
+            _ => Self::Unrecognized,
+        }
+    }
+}
 
-/// The sRGB transfer function (IEC 61966-2-1), same as the shader's
-/// `srgb_encode`: the u8 surface formats are non-Srgb, so values written to
-/// them must arrive already encoded.
+/// Linear-light conversion from sRGB into the granted space's primaries, per
+/// column: column j maps sRGB primary j (red (1, 0, 0), green (0, 1, 0),
+/// blue (0, 0, 1)).
+fn srgb_to_granted_linear(space: GrantedSpace) -> [[f32; 3]; 3] {
+    match space {
+        // Identity: those spaces re-read the bytes as-is.
+        GrantedSpace::Srgb | GrantedSpace::Unrecognized => {
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        }
+        // Display P3 (both D65-referred): `M_P3⁻¹ · M_sRGB`, published
+        // verbatim in CSS Color 4 ("predefined-display-p3"); rows sum to 1
+        // because both systems share the D65 white. NOT built from the P3 xy
+        // chromaticities (0.680, 0.320) etc. — those are CIE
+        // chromaticity-diagram coordinates that define the primaries, not
+        // colors.
+        GrantedSpace::DisplayP3 => [
+            [0.822_461_97, 0.177_538_03, 0.0],
+            [0.033_194_2, 0.966_805_8, 0.0],
+            [0.017_082_63, 0.072_397_44, 0.910_519_93],
+        ],
+    }
+}
+
+/// The sRGB transfer function (IEC 61966-2-1): the u8 surface formats are
+/// non-Srgb, so values written to them must arrive already encoded.
 fn srgb_encode(channel: f32) -> f32 {
     if channel <= 0.003_130_8 {
         12.92 * channel
@@ -188,16 +294,22 @@ fn srgb_encode(channel: f32) -> f32 {
     }
 }
 
-/// sRGB red expressed in the P3-referred encoding: bytes (234, 51, 35).
-fn srgb_red_converted_to_p3() -> egui::Color32 {
-    // Column 1 of the matrix: sRGB red (1, 0, 0) in P3-linear terms.
-    let linear = [
-        SRGB_TO_P3_LINEAR[0][0],
-        SRGB_TO_P3_LINEAR[1][0],
-        SRGB_TO_P3_LINEAR[2][0],
-    ];
-    let [r, g, b] = linear.map(|c| (srgb_encode(c) * 255.0).round() as u8);
-    egui::Color32::from_rgb(r, g, b)
+/// The six grid cell colors for `space`: the top row is the sRGB primaries
+/// converted into the granted space's encoding, the bottom row the surface's
+/// native primaries as full-range bytes.
+fn grid_cells(space: GrantedSpace) -> [egui::Color32; 6] {
+    let m = srgb_to_granted_linear(space);
+    let encode = |channel: f32| (srgb_encode(channel) * 255.0).round() as u8;
+
+    let mut cells = [egui::Color32::BLACK; 6];
+    for col in 0..3 {
+        cells[col] =
+            egui::Color32::from_rgb(encode(m[0][col]), encode(m[1][col]), encode(m[2][col]));
+    }
+    cells[3] = egui::Color32::from_rgb(255, 0, 0);
+    cells[4] = egui::Color32::from_rgb(0, 255, 0);
+    cells[5] = egui::Color32::from_rgb(0, 0, 255);
+    cells
 }
 
 struct QuadRenderResources {
@@ -206,6 +318,15 @@ struct QuadRenderResources {
     /// (the window may have moved to a different monitor).
     pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     shader: wgpu::ShaderModule,
+    /// Layout binding the cell-color uniform; shared by every pipeline this
+    /// resource builds.
+    pipeline_layout: wgpu::PipelineLayout,
+    /// The six grid cell colors, read by the fragment shader.
+    cells: wgpu::Buffer,
+    cells_bind_group: wgpu::BindGroup,
+    /// The cell colors currently uploaded to `cells`, so `prepare` only
+    /// touches the GPU buffer when the decision changes.
+    uploaded: [egui::Color32; 6],
 }
 
 impl QuadRenderResources {
@@ -222,8 +343,8 @@ impl QuadRenderResources {
         {
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("hdr_wide_gamut"),
-                // No bindings — the shader needs nothing but the vertex index.
-                layout: None,
+                // Binds the cell-color uniform uploaded in `prepare`.
+                layout: Some(&self.pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &self.shader,
                     entry_point: None,
@@ -250,19 +371,38 @@ impl QuadRenderResources {
     }
 }
 
-struct WideGamutQuad;
+struct WideGamutQuad {
+    /// This frame's six grid cell colors, derived from the granted color
+    /// space (see [`GrantedSpace`]).
+    cells: [egui::Color32; 6],
+}
 
 impl egui_wgpu::CallbackTrait for WideGamutQuad {
     fn prepare(
         &self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let resources: &mut QuadRenderResources = resources.get_mut().unwrap();
+        if resources.uploaded != self.cells {
+            // The shader reads sRGB-encoded floats (the u8 surface format is
+            // non-Srgb): one rgba32float per cell.
+            let mut bytes = [0u8; 6 * 4 * 4];
+            for (cell, out) in self.cells.iter().zip(bytes.chunks_mut(16)) {
+                for (channel, slot) in [cell.r(), cell.g(), cell.b(), 255]
+                    .into_iter()
+                    .zip(out.chunks_mut(4))
+                {
+                    slot.copy_from_slice((f32::from(channel) / 255.0).to_le_bytes().as_slice());
+                }
+            }
+            queue.write_buffer(&resources.cells, 0, &bytes);
+            resources.uploaded = self.cells;
+        }
         resources.pipeline_for(device, target_format);
         Vec::new()
     }
@@ -278,6 +418,7 @@ impl egui_wgpu::CallbackTrait for WideGamutQuad {
         match resources.pipeline.as_ref() {
             Some((format, pipeline)) if *format == target_format => {
                 render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, &resources.cells_bind_group, &[]);
                 render_pass.draw(0..6, 0..1);
             }
             _ => {
@@ -307,26 +448,12 @@ var<private> QUAD: array<vec2<f32>, 6> = array(
     vec2<f32>(1.0, 1.0),
 );
 
-// The surface's native primaries as full-range linear values: on a
-// P3-referred surface these bytes are the Display P3 primaries, on an SDR
-// fallback the same bytes are the sRGB primaries. These are NOT the P3 xy
-// chromaticities (0.680, 0.320) etc. — those are CIE chromaticity-diagram
-// coordinates that define the primaries, not colors.
-var<private> PRIMARIES: array<vec3<f32>, 3> = array(
-    vec3<f32>(1.0, 0.0, 0.0), // red
-    vec3<f32>(0.0, 1.0, 0.0), // green
-    vec3<f32>(0.0, 0.0, 1.0), // blue
-);
-
-// The sRGB transfer function (IEC 61966-2-1). The u8 surface format is
-// non-Srgb, so anything written to it must arrive pre-encoded; on the
-// primaries themselves it is the identity (0.0 and 1.0 are fixed points),
-// kept so real content dropped in later encodes correctly.
-fn srgb_encode(linear: vec3<f32>) -> vec3<f32> {
-    let low = vec3<f32>(12.92) * linear;
-    let high = vec3<f32>(1.055) * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    return select(low, high, linear > vec3<f32>(0.0031308));
-}
+// The six grid cell colors (sRGB-encoded, 0-1), uploaded from the app when
+// the granted color space changes: indices 0-2 are the top row — the sRGB
+// primaries converted into the granted space's encoding — and 3-5 the bottom
+// row, the surface's native primaries as full-range bytes.
+@group(0) @binding(0)
+var<uniform> CELLS: array<vec4<f32>, 6>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
@@ -339,7 +466,15 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let band = min(u32(in.uv.x * 3.0), 2u);
-    return vec4<f32>(srgb_encode(PRIMARIES[band]), 1.0);
+    // The 2×3 grid of full-size cells, pixel-flush: the row split at height
+    // / 2, the column splits at width / 3 — every fragment gets exactly one
+    // cell's color, so there are no seam lines. In wgpu's NDC, y=+1 is the
+    // TOP of the framebuffer, so with uv = (ndc + 1) * 0.5 from the vertex
+    // stage, uv.y >= 0.5 is the top half on screen: the converted sRGB row
+    // (cells 0-2) goes there, the native row (cells 3-5) below.
+    let col = min(u32(in.uv.x * 3.0), 2u);
+    let top = in.uv.y >= 0.5;
+    let idx = select(col + 3u, col, top);
+    return vec4<f32>(CELLS[idx].rgb, 1.0);
 }
 ";
