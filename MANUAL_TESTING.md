@@ -11,7 +11,7 @@ with the surface, and what a panel does with the colors. Each step is marked
 |---|---|
 | `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamutHdr`, asserts the surfaced decision is coherent **and that display headroom is reported from the first frame** (`None` fails), logs the pairing + headroom, exits 0 after a few frames. |
 | `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target` and a full-width 2×3 primaries grid canvas (bold "sRGB primaries" / "display primaries" labels sandwich it) — top row the sRGB primaries converted at runtime into the granted color space's encoding, bottom row the display's native primaries as full-range bytes ((255, 0, 0), (0, 255, 0), (0, 0, 255)). |
-| `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` swatches (values above 1.0) through the real upload→pipeline→surface path, plus the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr` on a linear color with exposure). Requests `WideGamutHdr`: with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
+| `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` content above 1.0 through the real upload→pipeline→surface path (a gradient sweeping linear 0..4 with the SDR-white quarter marked, plus the DisplayP3 primary strip), and the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr` on a linear color with exposure). Requests `WideGamutHdr`: with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
 
 The log line `Surface decision: Rgba16Float + ExtendedDisplayP3 (Granted),
 headroom 1.2×` (or the example's on-screen readout) is the primary reading
@@ -156,6 +156,15 @@ The `color_edit_button_hdr` + `swatch_hdr` row at the bottom of
 `hdr_float_image`. The edits are linear RGB (NOT gamma-encoded) in 0..=1 and
 an exposure in stops (−6..=+6, ¼-step); the effective color is
 `rgb × 2^stops`, 1.0 = SDR reference white.
+
+Design note (the part that looks like a bug but isn't): the picker's slider
+*ramps* (R/G/B and exposure gradients) are 8-bit `Color32` gradients, so they
+clamp at SDR reference white — on an EDR panel the exposure ramp reads flat
+white past 1.0 instead of brightening. That is per plan §6, which reserves
+float display for the flat swatches (a ramp is a gradient, not a swatch).
+The true result of an edit always shows in the left preview swatch (float
+path) and the `swatch_hdr`, both of which render above white on an extended
+surface; the right preview swatch shows the SDR clamp.
 
 1. Run `hdr_float_image` (it requests `WideGamutHdr`) on an EDR Mac.
    Expected: `Granted` with an fp16 extended pairing

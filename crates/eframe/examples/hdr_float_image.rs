@@ -4,9 +4,11 @@
 //! Shows the content↔surface pairing outcomes from a plain app's point of
 //! view (plan §4):
 //!
-//! - an **sRGB-tagged** float gradient (values in [0, 1]) — uploads natively
+//! - an **sRGB-tagged** float gradient (linear light 0..4) — uploads natively
 //!   on every granted space (on a P3-referred surface it shifts exactly like
-//!   the rest of the UI bytes);
+//!   the rest of the UI bytes). The quarter-marked tick is SDR reference
+//!   white: right of it the gradient is brightness above white on an
+//!   extended surface and clamps at white on an SDR one;
 //! - a **DisplayP3-tagged** pure-primary strip — uploads natively only when
 //!   the surface was granted a Display P3 color space, where the strip shows
 //!   primaries outside the sRGB gamut. On a fallback (sRGB) surface the
@@ -60,7 +62,6 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-#[derive(Default)]
 struct FloatImageApp {
     srgb_gradient: Option<egui::TextureHandle>,
     p3_strip: Option<egui::TextureHandle>,
@@ -70,9 +71,29 @@ struct FloatImageApp {
     logged_strip_outcome: Option<StripOutcome>,
 }
 
+impl Default for FloatImageApp {
+    fn default() -> Self {
+        Self {
+            srgb_gradient: None,
+            p3_strip: None,
+            // Not black: black × 2^stops stays black, so the §E step-1
+            // recipe (drag the exposure past 0 stops, watch the swatch
+            // glow above SDR white) would be unreproducible. This orange's
+            // red channel sits at half SDR white, so it crosses white at
+            // +1 stop (green at +2, blue at +4).
+            hdr_color: egui::HdrColor::new([0.5, 0.25, 0.0625], 0.0),
+            logged_strip_outcome: None,
+        }
+    }
+}
+
 impl FloatImageApp {
-    /// An sRGB-tagged float gradient, gamma-encoded, values in [0, 1]
-    /// (1.0 = SDR reference white).
+    /// An sRGB-tagged float gradient sweeping linear light 0..4,
+    /// gamma-encoded per the contract (the stored texels are
+    /// `enc(linear)`): the left quarter is ordinary SDR range, the rest is
+    /// brightness above SDR reference white on an extended surface and
+    /// clamps at white on an SDR one. The ¼ mark (painted by the caller)
+    /// is where linear 1.0 lands.
     fn load_srgb_gradient(&mut self, ctx: &egui::Context) {
         if self.srgb_gradient.is_some() {
             return;
@@ -81,10 +102,12 @@ impl FloatImageApp {
         let mut rgba = Vec::with_capacity(width * height * 4);
         for _ in 0..height {
             for x in 0..width {
-                // The encoded level directly: already gamma-encoded per the
-                // contract, fully opaque.
-                let v = x as f32 / (width - 1) as f32;
-                rgba.extend([v, v, v, 1.0]);
+                // Linear light 0..4, encoded per the contract, fully
+                // opaque — above 1.0 on an extended surface this is
+                // brightness, not a clipped byte.
+                let linear = 4.0 * x as f32 / (width - 1) as f32;
+                let encoded = egui::ecolor::gamma_from_linear(linear);
+                rgba.extend([encoded, encoded, encoded, 1.0]);
             }
         }
         let image = egui::FloatImage::from_rgba([width, height], egui::Primaries::Srgb, &rgba);
@@ -151,10 +174,30 @@ impl eframe::App for FloatImageApp {
             ui.heading("Tagged float content (ImageData::Float)");
             ui.add_space(8.0);
 
-            ui.label("sRGB-tagged gradient — native on every granted space:");
+            ui.label(
+                "sRGB-tagged gradient — linear light 0..4, native on every granted space \
+                 (tick = SDR reference white):",
+            );
             bordered_slot(ui, [512.0, 24.0], |ui| {
                 if let Some(texture) = self.srgb_gradient.as_ref() {
-                    ui.image(texture);
+                    let response = ui.image(texture);
+                    let rect = response.rect;
+                    // linear 1.0 sits at exactly one quarter of the ramp:
+                    // past the tick the gradient is brightness above SDR
+                    // white on an extended surface, flat white on an SDR
+                    // one.
+                    let x = rect.left() + rect.width() * 0.25;
+                    ui.painter().line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        (1.0, egui::Color32::BLACK),
+                    );
+                    ui.painter().text(
+                        egui::pos2(x + 4.0, rect.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        "1.0 = SDR white",
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::BLACK,
+                    );
                 }
             });
             ui.add_space(8.0);

@@ -194,10 +194,15 @@ fn color_button(ui: &mut Ui, srgba: [u8; 4], open: bool) -> Response {
 
 fn color_slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color32) -> Response {
     let desired_size = vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
-    let (rect, response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());
+    let (rect, mut response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());
 
     if let Some(mpos) = response.interact_pointer_pos() {
         *value = remap_clamp(mpos.x, rect.left()..=rect.right(), 0.0..=1.0);
+        // The value was written from the pointer: that IS a change. A bare
+        // interact never derives `changed` on its own (unlike `Slider`,
+        // nothing here compares old and new values), so callers gating on
+        // `.changed()` would never see it.
+        response.mark_changed();
     }
 
     if ui.is_rect_visible(rect) {
@@ -858,39 +863,58 @@ fn color_picker_hdr(ui: &mut Ui, hdr: &mut HdrColor) -> bool {
 
     let encode = |l: f32| gamma_u8_from_linear_f32(l);
 
-    color_slider_1d(ui, &mut hdr.rgb[0], |t| {
+    let red = color_slider_1d(ui, &mut hdr.rgb[0], |t| {
         Color32::from_rgb(encode(t), encode(g), encode(b))
-    })
-    .on_hover_text("Red (linear)");
-    color_slider_1d(ui, &mut hdr.rgb[1], |t| {
+    });
+    red.widget_info(|| WidgetInfo::slider(ui.is_enabled(), f64::from(hdr.rgb[0]), "Red (linear)"));
+    red.on_hover_text("Red (linear)");
+    let green = color_slider_1d(ui, &mut hdr.rgb[1], |t| {
         Color32::from_rgb(encode(r), encode(t), encode(b))
-    })
-    .on_hover_text("Green (linear)");
-    color_slider_1d(ui, &mut hdr.rgb[2], |t| {
+    });
+    green.widget_info(|| {
+        WidgetInfo::slider(ui.is_enabled(), f64::from(hdr.rgb[1]), "Green (linear)")
+    });
+    green.on_hover_text("Green (linear)");
+    let blue = color_slider_1d(ui, &mut hdr.rgb[2], |t| {
         Color32::from_rgb(encode(r), encode(g), encode(t))
-    })
-    .on_hover_text("Blue (linear)");
+    });
+    blue.widget_info(|| {
+        WidgetInfo::slider(ui.is_enabled(), f64::from(hdr.rgb[2]), "Blue (linear)")
+    });
+    blue.on_hover_text("Blue (linear)");
 
     if hdr.rgb != [r, g, b] {
         changed = true;
     }
 
     // Exposure in stops, −6..=+6 in ¼-stop steps. The gradient sweeps the
-    // exposure over the current color, encoded + clamped: on an SDR surface
-    // it visibly runs into flat white, on an extended surface it keeps
-    // brightening.
+    // exposure over the current color, encoded + clamped: the ramp is u8,
+    // so past SDR white it reads flat white even on an extended-range
+    // surface (§6 reserves float display for the flat swatches) — the true
+    // result is the preview swatch below, not the ramp.
     let min = HdrColor::MIN_EXPOSURE_STOPS;
     let max = HdrColor::MAX_EXPOSURE_STOPS;
     let mut exposure_norm = remap_clamp(hdr.exposure_stops, min..=max, 0.0..=1.0);
-    if color_slider_1d(ui, &mut exposure_norm, |t| {
+    let exposure = color_slider_1d(ui, &mut exposure_norm, |t| {
         let factor = lerp(min..=max, t).exp2();
         Color32::from_rgb(encode(r * factor), encode(g * factor), encode(b * factor))
-    })
-    .on_hover_text(format!(
-        "Exposure: {:+.2} stops",
-        clamp_stops(hdr.exposure_stops)
-    ))
-    .changed()
+    });
+    exposure.widget_info(|| {
+        // The value the screen reader announces is the edited quantity
+        // (stops), not the slider's internal 0..1 normalization.
+        WidgetInfo::slider(
+            ui.is_enabled(),
+            f64::from(lerp(min..=max, exposure_norm)),
+            "Exposure (¼-stop)",
+        )
+    });
+    if exposure
+        .on_hover_text(format!(
+            "Exposure: {:+.2} stops (the ramp itself clamps at SDR white — the preview swatch \
+             below shows the true brightness)",
+            clamp_stops(hdr.exposure_stops)
+        ))
+        .changed()
     {
         let stops = lerp(min..=max, exposure_norm);
         hdr.exposure_stops = (stops / 0.25).round() * 0.25; // ¼-stop steps

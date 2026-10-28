@@ -69,6 +69,50 @@ fn hdr_edit_button_opened_shows_picker() {
     harness.snapshot("hdr_widgets/edit_button_opened");
 }
 
+/// Dragging the exposure slider must move the ¼-stop-quantized store.
+///
+/// Regression: the slider response is a bare interact — `changed` is never
+/// derived on its own — so the picker's exposure gate never fired, the store
+/// stayed put, and every frame re-seeded the handle from the stale value
+/// (the readout stayed at ×1.00 and the handle sprang back after every
+/// drag).
+#[test]
+fn hdr_exposure_slider_drag_updates_stored_stops() {
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(360.0, 260.0))
+        .build_ui_state(
+            |ui, hdr: &mut HdrColor| {
+                ui.color_edit_button_hdr(hdr);
+            },
+            test_color(),
+        );
+    harness.run();
+    harness
+        .get_by_role_and_label(Role::ColorWell, "HDR Color")
+        .click();
+    harness.run();
+
+    // Drag the exposure ramp from 10% (≈ −4.8 stops) to 90% (≈ +4.8).
+    let rect = harness
+        .get_by_role_and_label(Role::Slider, "Exposure (¼-stop)")
+        .rect();
+    let grab = egui::pos2(rect.left() + rect.width() * 0.1, rect.center().y);
+    let target = egui::pos2(rect.left() + rect.width() * 0.9, rect.center().y);
+    harness.hover_at(grab);
+    harness.run();
+    harness.drag_at(grab);
+    harness.run();
+    harness.hover_at(target);
+    harness.run();
+    harness.drop_at(target);
+    harness.run();
+
+    // 90% of −6..=+6 is +4.8 stops → quantized to ¼-stop: +4.75. The
+    // channel sliders must be untouched by the exposure drag.
+    assert_eq!(harness.state().exposure_stops, 4.75);
+    assert_eq!(harness.state().rgb, [0.5, 0.25, 0.0625]);
+}
+
 /// `swatch_hdr` on the headless sRGB target: the first swatch is entirely
 /// within SDR range (linear [0.25, 0.125, 0.0625] — renders unchanged), the
 /// second is 2× SDR white and clamps to white. This IS the clamp, in a

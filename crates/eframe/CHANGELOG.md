@@ -11,6 +11,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 * Add `hdr_float_image` example: an sRGB-tagged `FloatImage` gradient and a DisplayP3-tagged primary strip through `ui.image()`, demonstrating the content↔surface pairing's native and loud-reject outcomes
 * `hdr_float_image` gains the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr`) and now requests `SurfacePreference::WideGamutHdr`, so the effective color shows as brightness above SDR white on an EDR display (deterministic fallback on SDR panels)
 * Fix `hdr_float_image`'s strip outcome label: the granted color space is parsed against every space the pairing table has a row for — an `ExtendedDisplayP3` grant (the EDR-display pairing) no longer shows the loud-reject message, and the scRGB-linear reject is labeled as the pending primaries conversion instead of gamut-clipping
+* `hdr_float_image`'s gradient now sweeps linear light 0..4 (encoded per the contract) with the SDR-white quarter marked, so the extended surface granted by `WideGamutHdr` actually demonstrates brightness above SDR white instead of stopping at 1.0
 
 
 ## 0.37.0 - 2026-10-15
