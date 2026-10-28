@@ -181,17 +181,32 @@ pub const WIDE_GAMUT_ORDER: &[wgpu::SurfaceColorSpace] = &[wgpu::SurfaceColorSpa
 /// Priority-ordered extended-range color spaces the [`SurfacePreference::Hdr`]
 /// leg probes.
 ///
-/// [`ExtendedSrgb`](wgpu::SurfaceColorSpace::ExtendedSrgb) first and only: HDR
-/// pins the sRGB gamut, and `ExtendedSrgbLinear` (scRGB) belongs to the later
-/// linear stage. Table data: add one row per newly supported extended space.
-pub const HDR_ORDER: &[wgpu::SurfaceColorSpace] = &[wgpu::SurfaceColorSpace::ExtendedSrgb];
+/// [`ExtendedSrgb`](wgpu::SurfaceColorSpace::ExtendedSrgb) first: HDR pins the
+/// sRGB gamut where the platform offers it. [`ExtendedSrgbLinear`] second: the
+/// scRGB pairing, the Windows/DX12 anchor (plan §7) — the platform dictates
+/// the space, so a platform that only reports extended-linear still grants
+/// HDR through it (the renderer's linear path handles the encoding; PR 4).
+/// Table data: add one row per newly supported extended space.
+pub const HDR_ORDER: &[wgpu::SurfaceColorSpace] = &[
+    wgpu::SurfaceColorSpace::ExtendedSrgb,
+    wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+];
 
 /// Priority-ordered combined wide-gamut + extended-range color spaces the
 /// [`SurfacePreference::WideGamutHdr`] leg probes.
 ///
-/// Table data: add one row per newly supported combined space.
-pub const WIDE_GAMUT_HDR_ORDER: &[wgpu::SurfaceColorSpace] =
-    &[wgpu::SurfaceColorSpace::ExtendedDisplayP3];
+/// [`ExtendedDisplayP3`](wgpu::SurfaceColorSpace::ExtendedDisplayP3) first
+/// (both axes in one space); [`ExtendedSrgbLinear`] second — scRGB is
+/// wide-gamut-*capable* rather than wide-gamut-tagged (its sRGB primaries are
+/// basis vectors, not a boundary, plan §7), so it is the honest combined
+/// pairing where the platform reports nothing else. Platform-divergent
+/// grammar is accepted: what macOS grants as `ExtendedDisplayP3`, DX12 grants
+/// as `ExtendedSrgbLinear`. Table data: add one row per newly supported
+/// combined space.
+pub const WIDE_GAMUT_HDR_ORDER: &[wgpu::SurfaceColorSpace] = &[
+    wgpu::SurfaceColorSpace::ExtendedDisplayP3,
+    wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+];
 
 /// Decide the surface target for one viewport from its actual capabilities.
 ///
@@ -482,6 +497,29 @@ mod tests {
         )
     }
 
+    /// DX12 on a Windows 11 22H2+ advanced-color machine: the 8-bit surface
+    /// reports sRGB only, the float surface reports the scRGB-linear space
+    /// (the only extended space DXGI offers; plan §7). This is the fixture
+    /// the scRGB pairing was built for.
+    fn dx12_hdr_like() -> wgpu::SurfaceCapabilities {
+        caps(
+            &[
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba16Float,
+            ],
+            &[
+                (
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    wgpu::SurfaceColorSpaces::SRGB,
+                ),
+                (
+                    wgpu::TextureFormat::Rgba16Float,
+                    wgpu::SurfaceColorSpaces::SRGB | wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
+                ),
+            ],
+        )
+    }
+
     /// Float surface that reports no extended space.
     fn float_without_extended() -> wgpu::SurfaceCapabilities {
         caps(
@@ -514,6 +552,7 @@ mod tests {
             metal_like(),
             metal_like_sdr(),
             dxgi_like(),
+            dx12_hdr_like(),
             float_without_extended(),
             srgb_grammar_p3(),
         ] {
@@ -657,6 +696,62 @@ mod tests {
         assert!(target.is_extended());
     }
 
+    /// The scRGB pairing (PR 4, plan §7): on a DX12-like fixture whose fp16
+    /// surface reports `ExtendedSrgbLinear`, both HDR legs grant
+    /// `(Rgba16Float, ExtendedSrgbLinear)` — HDR brightness and a
+    /// wide-gamut-*capable* surface, probe-gated on the reported caps.
+    #[test]
+    fn hdr_and_wide_gamut_hdr_grant_scrgb_linear_on_dx12_like() {
+        for pref in [SurfacePreference::Hdr, SurfacePreference::WideGamutHdr] {
+            let (target, status) = decide_surface_target(&dx12_hdr_like(), pref).unwrap();
+
+            assert_eq!(
+                target,
+                SurfaceTarget {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    color_space: wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+                },
+                "{pref:?}"
+            );
+            assert_eq!(status, SurfaceStatus::Granted, "{pref:?}");
+            assert!(target.is_extended(), "{pref:?}");
+        }
+
+        // The minimal DXGI fixture reports the same space, so it grants too.
+        let (target, status) = decide_surface_target(&dxgi_like(), SurfacePreference::Hdr).unwrap();
+        assert_eq!(
+            target,
+            SurfaceTarget {
+                format: wgpu::TextureFormat::Rgba16Float,
+                color_space: wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+            }
+        );
+        assert_eq!(status, SurfaceStatus::Granted);
+    }
+
+    /// The `WideGamut` leg stays 8-bit raw-view only (§7): it cannot take the
+    /// fp16 scRGB pairing, so a DX12-like machine falls back to the plain SDR
+    /// target — never a partial grant.
+    #[test]
+    fn wide_gamut_still_falls_back_on_dx12_like() {
+        let (off_target, _) =
+            decide_surface_target(&dx12_hdr_like(), SurfacePreference::Off).unwrap();
+
+        let (target, status) =
+            decide_surface_target(&dx12_hdr_like(), SurfacePreference::WideGamut).unwrap();
+
+        assert_eq!(target, off_target);
+        assert!(!target.is_extended());
+        assert_eq!(
+            status,
+            SurfaceStatus::FellBack {
+                reason: FallbackReason::NoPairedColorSpace {
+                    requested: SurfacePreference::WideGamut,
+                }
+            }
+        );
+    }
+
     #[test]
     fn hdr_wide_gamut_hdr_fall_back_to_off_target_without_pairing() {
         // No extended space anywhere (wide-gamut-only panel, or float without
@@ -712,6 +807,7 @@ mod tests {
             metal_like(),
             metal_like_sdr(),
             dxgi_like(),
+            dx12_hdr_like(),
             float_without_extended(),
             srgb_grammar_p3(),
         ] {
@@ -745,6 +841,7 @@ mod tests {
             metal_like(),
             metal_like_sdr(),
             dxgi_like(),
+            dx12_hdr_like(),
             float_without_extended(),
             srgb_grammar_p3(),
         ] {

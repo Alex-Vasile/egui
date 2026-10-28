@@ -152,14 +152,49 @@ Rules of thumb:
 
 ## Windows — manual-only
 
-PR 1 pairings are never reported on DX12; the surface must fall back
-deterministically.
+PR 1's `WideGamut` pairing (u8 + `DisplayP3`) is never reported on DX12; that
+surface must fall back deterministically.
 
 1. Run `hdr_wide_gamut`. Expected: `FellBack(NoPairedColorSpace)` with a
    plain sRGB target, on every GPU vendor. **CI cannot validate this.**
    (CI compile-checks the platform; nothing else.)
 
-## Linux — manual-only
+### scRGB-linear (PR 4): HDR brightness + a wide-gamut-capable surface
+
+Windows 11 22H2+ with **Advanced Color / HDR turned on in Windows display
+settings**. This is the pairing the platform dictates (§7): the DWM
+composites in linear scRGB, so egui renders through its linear path — the
+shader gamma-decodes and scales by `sdr_white_nits / 80` so egui's 1.0 stays
+the SDR reference white. **CI cannot validate this.**
+
+1. Run `cargo run -p eframe --example hdr_smoke`. Expected: exit 0, log
+   shows `Granted` with `Rgba16Float + ExtendedSrgbLinear` (the
+   `WideGamutHdr` request rides the platform's scRGB pairing) and
+   `hdr_headroom` reported as the nits ratio (`max_nits / sdr_white_nits`).
+   **CI cannot validate this.**
+2. Brightness of SDR chrome (the SDR-white anchor): with `hdr_smoke` (the
+   scRGB pairing) on screen, drag the Windows **SDR content brightness**
+   slider (Settings → System → Display → HDR). Expected: egui's chrome
+   brightens/dims together with surrounding SDR apps — the slider's
+   `sdr_white_nits` reaches the linear path as a per-frame uniform
+   (`scale = nits / 80`), while out-of-SDR content (values above 1.0) keeps
+   its headroom above the moving white. (`hdr_wide_gamut` deterministically
+   falls back to `(Bgra8Unorm, Srgb)` on Windows: its chrome also tracks the
+   slider, but through the DWM's SDR scaling of the plain sRGB surface — not
+   through egui's uniform.) **CI cannot validate this.**
+3. Float content end-to-end: point `hdr_float_image` at
+   `SurfacePreference::WideGamutHdr` and run it on the scRGB surface.
+   Expected: the >1.0 swatches render as brightness above SDR white; the
+   swatches' SDR values look identical to their appearance in an sRGB app.
+   **CI cannot validate this.**
+4. Fallback cross-check: turn HDR/Advanced Color off in Windows settings and
+   rerun `hdr_smoke`. Expected: deterministic
+   `FellBack(NoPairedColorSpace)` onto the plain sRGB target (the platform
+   no longer reports the extended space — nothing is assumed). Expected
+   visual: identical SDR rendering to pre-PR frames. **CI cannot validate
+   this.**
+
+## Linux (KWin) — manual-only
 
 Vulkan exposes wide color spaces only via `VK_EXT_swapchain_colorspace`, so
 the outcome is driver- and compositor-dependent.
@@ -167,6 +202,15 @@ the outcome is driver- and compositor-dependent.
 1. On KWin with the extension: `hdr_wide_gamut` may report `Granted` with a
    wide pairing. Without it: deterministic `FellBack`. Record what your
    driver reports. **CI cannot validate this.**
+2. scRGB-linear (PR 4): on KWin (Wayland, HDR enabled) with a driver that
+   reports `HDR_EXTENDED_SRGB_LINEAR` on fp16, `hdr_smoke` may now grant
+   `Rgba16Float + ExtendedSrgbLinear` and exit 0. Expected nits behavior:
+   **no** slider tracking — `DisplayLuminance` (and with it
+   `sdr_white_nits`) is Windows/DXGI-only, so the linear path keeps the
+   standard 80-nit anchor (scale 1.0); egui's SDR white sits at 80 nits
+   regardless of the compositor's SDR-white setting, which may read darker
+   or lighter than surrounding apps. That is the honest no-report default,
+   not a bug. **CI cannot validate this.**
 
 ## Web — compile-checked only
 

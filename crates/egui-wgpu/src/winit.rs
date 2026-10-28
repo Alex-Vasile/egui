@@ -766,11 +766,15 @@ impl Painter {
         // every frame on the main thread. The value drives no rendering
         // decision here — it is stored for the per-viewport accessor /
         // `ViewportInfo` mirror, and it steers the repaint schedule only.
-        {
-            let headroom = surface_state
+        // The same poll also yields the SDR white level in nits (plan §7):
+        // `DisplayLuminance` is Windows/DXGI-only, so this is `None` on
+        // macOS and every other platform — the standard 80-nit anchoring
+        // (scale 1.0) holds there.
+        let sdr_white_nits = {
+            let hdr_info = surface_state
                 .surface
-                .display_hdr_info(&render_state.adapter)
-                .tone_map_headroom();
+                .display_hdr_info(&render_state.adapter);
+            let headroom = hdr_info.tone_map_headroom();
             let moving = match (surface_state.headroom, headroom) {
                 // A known value that changed beyond the epsilon: the EDR ramp
                 // is running (or the user moved the brightness slider).
@@ -793,7 +797,8 @@ impl Painter {
                 self.context
                     .request_repaint_after(HEADROOM_REPAINT_INTERVAL);
             }
-        }
+            hdr_info.luminance.and_then(|l| l.sdr_white_nits)
+        };
 
         let mut encoder =
             render_state
@@ -814,6 +819,10 @@ impl Painter {
             // uploads below are gated on the space this viewport's surface
             // was granted (plan §4). We hold the renderer write lock.
             renderer.set_active_surface_color_space(Some(surface_state.target.color_space));
+            // SDR-white anchor for the linear path (plan §7): read from the
+            // headroom poll above, no extra OS query. `None` (macOS, …)
+            // keeps scale 1.0; gamma-encoded targets ignore the value.
+            renderer.set_sdr_white_nits(sdr_white_nits);
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

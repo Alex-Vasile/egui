@@ -159,6 +159,49 @@ struct UniformBuffer {
     ///
     /// See also <https://github.com/emilk/egui/issues/5295>.
     predictable_texture_filtering: u32,
+
+    /// The SDR-white scale applied by the linear-decode entry point only:
+    /// `sdr_white_nits / 80` so egui's 1.0 stays the SDR reference white on
+    /// scRGB surfaces, where 1.0 is pinned to 80 nits (plan §7). Gamma-encoded
+    /// entry points never read it (their surfaces interpret 1.0 natively).
+    /// Must match `Locals` in `egui.wgsl`.
+    ///
+    /// Field order matters: the pad sits before the scale so the trailing
+    /// `f32` lands at offset 28 and the struct at 32 bytes — WGSL's uniform
+    /// address space needs the 16-byte-multiple size and forbids the
+    /// array/vec3 shapes you'd otherwise reach for.
+    _padding: [u32; 3],
+    sdr_white_scale: f32,
+}
+
+/// Pins the Rust side of the Rust↔WGSL `Locals` agreement (`egui.wgsl`): the
+/// struct must stay at exactly the 32 bytes the WGSL layout produces, on
+/// every machine — including those where the adapter-gated GPU tests (the
+/// only other place the agreement is checked, by naga) skip.
+const _: () = assert!(
+    core::mem::size_of::<UniformBuffer>() == 32,
+    "UniformBuffer must stay at the 32 bytes the WGSL `Locals` layout produces (16-byte \
+     uniform alignment: pad before the trailing scale); any drift desyncs the uniform"
+);
+
+/// The scRGB / sRGB standard's SDR reference white: 80 nits (IEC 61966-2-1).
+///
+/// scRGB is scene-referred: on an `ExtendedSrgbLinear` surface a stored 1.0
+/// means 80 nits, fixed — unlike macOS EDR's display-referred 1.0 (the
+/// display's current SDR white, moving with the brightness slider). Scaling
+/// egui output by `sdr_white_nits / 80` (plan §7) keeps the §4 contract —
+/// egui's 1.0 = SDR reference white — on both platforms, so chrome matches
+/// surrounding SDR apps and `sdr_white_nits` tracking the user's slider
+/// brightens egui with it. Windows' SDR-content slider never touches
+/// advanced-color output, so without the scaling egui would render at the
+/// fixed 80-nit anchor regardless of the slider.
+pub(crate) const SDR_REFERENCE_WHITE_NITS: f32 = 80.0;
+
+/// The uniform value for the linear path: `nits / 80`, or `1.0` when the
+/// display reports nothing (macOS, web, …) so the standard 80-nit anchoring
+/// holds — egui's 1.0 = 80 nits (plan §7's default-when-unknown).
+pub(crate) fn sdr_white_scale(sdr_white_nits: Option<f32>) -> f32 {
+    sdr_white_nits.map_or(1.0, |nits| nits / SDR_REFERENCE_WHITE_NITS)
 }
 
 struct SlicedBuffer {
@@ -250,12 +293,16 @@ impl Default for RendererOptions {
 
 /// Renderer for a egui based GUI.
 pub struct Renderer {
-    /// Render pipelines keyed by the format of the render-pass target.
-    ///
-    /// Created lazily on first use of each format, in
-    /// [`Self::update_buffers`]. Only the target format bakes a pipeline:
-    /// a color-space change is a surface reconfigure, never a pipeline change.
-    pipelines: Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
+    /// Render pipelines keyed by the render-pass target's format *and* its
+    /// derived [`OutputEncoding`] (plan §3): the encoding decides the
+    /// fragment entry point, so one format can legitimately host two
+    /// pipelines — an fp16 target reaches both encodings across viewports
+    /// (`ExtendedDisplayP3` on macOS, `ExtendedSrgbLinear` on Windows/DX12).
+    /// Created lazily on first use of each key, in [`Self::update_buffers`].
+    /// Only the target's format and derived encoding bake a pipeline: a
+    /// color-space change to a space with the same encoding reconfigures the
+    /// surface and reuses the pipeline.
+    pipelines: Mutex<HashMap<(wgpu::TextureFormat, OutputEncoding), Arc<wgpu::RenderPipeline>>>,
 
     /// The egui shader module, from which all pipelines for 8-bit targets are
     /// built (dithering compiled in).
@@ -290,17 +337,30 @@ pub struct Renderer {
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
 
-    /// The color space of the surface this renderer currently presents to, as
-    /// granted by the surface decision. Set by the painter (winit / web) each
-    /// frame, under its renderer lock, before the per-frame
-    /// [`Self::update_texture`] calls; `None` (the default) means "unknown /
-    /// no surface", which pairs content with today's SDR-sRGB semantics.
+    /// The color space of the surface this renderer currently
+    /// presents to, as granted by the surface decision. Set by the painter
+    /// (winit / web) each frame, under its renderer lock, before the
+    /// per-frame [`Self::update_texture`] calls; `None` (the default) means
+    /// "unknown / no surface", which pairs content with today's SDR-sRGB
+    /// semantics.
     ///
     /// This is the other half of the content↔surface upload pairing table:
     /// the pairing function in this file is the table, this is the surface
-    /// row it looks up. Never branch on it anywhere else (plan §5 design
-    /// rule: concrete color spaces are named only in the pairing tables).
+    /// row it looks up. It also feeds the derived pipeline
+    /// selection — [`OutputEncoding::of`] turns it plus the target format
+    /// into the fragment entry point (plan §3). Never branch on it anywhere
+    /// else (plan §5 design rule: concrete color spaces are named only in the
+    /// pairing tables).
     active_surface_color_space: Option<wgpu::SurfaceColorSpace>,
+
+    /// The active surface display's SDR white level in nits, as reported by
+    /// the platform (`DisplayLuminance.sdr_white_nits` — Windows/DXGI only,
+    /// moving with the brightness slider). Set by the painter each frame next
+    /// to the color space; `None` (the default — macOS, web, headless) keeps
+    /// the standard 80-nit anchoring: the linear entry point scales output by
+    /// `sdr_white_nits / 80`, so `None` means scale 1.0 (plan §7). Gamma
+    /// encoded targets ignore it entirely.
+    sdr_white_nits: Option<f32>,
 
     /// Texture ids whose upload was already rejected-and-warned about — a
     /// pairing rejection or a content-kind/format mismatch logs once per
@@ -389,6 +449,10 @@ impl Renderer {
                 screen_size_in_points: [0.0, 0.0],
                 dithering: u32::from(options.dithering),
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
+                _padding: [0; 3],
+                // Overwritten from the first `update_buffers` on; 1.0 is the
+                // no-report default (the standard 80-nit anchor).
+                sdr_white_scale: 1.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -513,22 +577,30 @@ impl Renderer {
             next_user_texture_id: 0,
             samplers: HashMap::default(),
             active_surface_color_space: None,
+            sdr_white_nits: None,
             upload_rejections_warned: HashSet::default(),
             options,
             callback_resources: CallbackResources::default(),
         }
     }
 
-    /// Creates (if needed) the render pipeline for `target_format`.
+    /// Creates (if needed) the render pipeline for `target_format` under the
+    /// active surface's derived [`OutputEncoding`].
     ///
-    /// Exactly one pipeline is cached per target format; the cache is shared by
-    /// all viewports, so viewports rendering at different formats coexist.
+    /// Exactly one pipeline is cached per (format, encoding) key; the cache is
+    /// shared by all viewports, so viewports rendering at different formats —
+    /// or at one format with both encodings — coexist.
     ///
     /// The pipeline is compiled outside the lock: pipeline creation is expensive
     /// and must not stall a concurrent `render` reading the cache. A racing
     /// double compile is benign — the first pipeline inserted wins.
     fn ensure_pipeline(&self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
-        if self.pipelines.lock().contains_key(&target_format) {
+        let encoding = self.active_output_encoding(target_format);
+        if self
+            .pipelines
+            .lock()
+            .contains_key(&(target_format, encoding))
+        {
             return;
         }
 
@@ -543,10 +615,11 @@ impl Renderer {
             &self.pipeline_layout,
             &self.options,
             target_format,
+            encoding,
         ));
         self.pipelines
             .lock()
-            .entry(target_format)
+            .entry((target_format, encoding))
             .or_insert(pipeline);
     }
 
@@ -564,7 +637,9 @@ impl Renderer {
     /// formats can interleave their `update_buffers` calls freely).
     ///
     /// # Panic
-    /// Panics if [`Renderer::update_buffers`] has never been called with this `target_format`!
+    /// Panics if [`Renderer::update_buffers`] has never been called with this
+    /// `target_format` under the currently active surface color space (the
+    /// cache key is (format, derived encoding))!
     pub fn render(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
@@ -576,9 +651,12 @@ impl Renderer {
 
         let pipeline = {
             let pipelines = self.pipelines.lock();
-            pipelines.get(&target_format).cloned().expect(
-                "You must call .update_buffers() with the same target format before .render()",
-            )
+            pipelines
+                .get(&(target_format, self.active_output_encoding(target_format)))
+                .cloned()
+                .expect(
+                    "You must call .update_buffers() with the same target format before .render()",
+                )
         };
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
@@ -724,6 +802,35 @@ impl Renderer {
     /// painted viewport's space.
     pub fn set_active_surface_color_space(&mut self, color_space: Option<wgpu::SurfaceColorSpace>) {
         self.active_surface_color_space = color_space;
+    }
+
+    /// Tells the renderer the active surface display's SDR white level in
+    /// nits, so the linear-decode entry point can scale output by
+    /// `sdr_white_nits / 80` and egui's 1.0 stays the SDR reference white on
+    /// scRGB surfaces (plan §7).
+    ///
+    /// Called by the painter (winit / web) each frame, under its renderer
+    /// write lock, on the same paint path that already polls
+    /// `display_hdr_info` for the headroom — no extra OS query. winit reads
+    /// [`wgpu::DisplayLuminance::sdr_white_nits`] (Windows/DXGI only, tracks
+    /// the user's brightness slider); web has no reporting and passes `None`.
+    /// `None` means the standard 80-nit anchoring holds (scale 1.0), and the
+    /// value only ever reaches the float (scRGB) target class — every other
+    /// target pins the uniform to 1.0 at the write site.
+    pub fn set_sdr_white_nits(&mut self, sdr_white_nits: Option<f32>) {
+        self.sdr_white_nits = sdr_white_nits;
+    }
+
+    /// The [`OutputEncoding`] the render pass into `target_format` must use,
+    /// derived from the active surface color space (unknown → `Srgb`
+    /// semantics, the app-driven/headless default). Derived on every use,
+    /// never stored (plan §3).
+    fn active_output_encoding(&self, target_format: wgpu::TextureFormat) -> OutputEncoding {
+        OutputEncoding::of(
+            target_format,
+            self.active_surface_color_space
+                .unwrap_or(wgpu::SurfaceColorSpace::Srgb),
+        )
     }
 
     /// Should be called before [`Self::render`].
@@ -1135,8 +1242,10 @@ impl Renderer {
     /// Should be called before [`Self::render`].
     ///
     /// `target_format` is the format of the color attachment the upcoming render
-    /// pass draws into; the pipeline for it is created here if this is its first
-    /// use.
+    /// pass draws into; the pipeline for it is created here if this is its
+    /// first use **under the currently active surface color space** (the cache
+    /// key is (format, derived encoding) — one format can host both
+    /// encodings across viewports).
     ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
     pub fn update_buffers(
@@ -1158,6 +1267,19 @@ impl Renderer {
             screen_size_in_points,
             dithering: u32::from(self.options.dithering),
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
+            // The linear entry point's SDR-white scale (plan §7). Only the
+            // float (scRGB) target class can reach the linear entry point,
+            // so every other target — including the hardware-encoding
+            // `*Srgb` row — is pinned to 1.0: a stale or misreported nits
+            // value can never over-brighten a non-float surface. No
+            // allocation: a plain buffer write, skipped entirely while the
+            // content is unchanged.
+            _padding: [0; 3],
+            sdr_white_scale: if is_float_target(target_format) {
+                sdr_white_scale(self.sdr_white_nits)
+            } else {
+                1.0
+            },
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1337,9 +1459,10 @@ enum PairingRejection {
     /// The content claims primaries the active surface cannot honor: showing
     /// the values as-is would gamut-clip them, and there is no honest guess.
     GamutClipped,
-    /// The active surface pairs a linear-storage color space (scRGB); the
-    /// gamma-encoded float contract has no row there yet — that pairing
-    /// (with its linear conversion) is a later stage.
+    /// The active surface pairs a linear-storage color space (scRGB), where
+    /// only the sRGB tag rides natively (the linear pipelines decode it);
+    /// this content's primaries would need a gamut conversion egui does not
+    /// ship yet (the §5 matrices work).
     LinearStorageNotPairedYet,
     /// The surface's color space is not resolved (`Auto`), so its
     /// interpretation depends on the format: no honest row for tagged
@@ -1362,9 +1485,11 @@ impl core::fmt::Display for PairingRejection {
                  (SurfacePreference::WideGamut)"
             }
             Self::LinearStorageNotPairedYet => {
-                "this surface's color space (scRGB-linear) stores linear values, but the float \
-                 content contract is gamma-encoded; the linear pairing arrives with egui's \
-                 scRGB stage. Skipping the upload (the placeholder renders)"
+                "this surface's color space (scRGB-linear) stores linear values and only \
+                 sRGB-tagged content pairs natively there (egui's linear pipelines decode it); \
+                 this content's primaries would need a gamut conversion egui does not ship yet. \
+                 Skipping the upload (the placeholder renders). Re-encode the image app-side, or \
+                 grant the viewport a surface whose color space honors the tag"
             }
             Self::UnresolvedSurfaceSpace => {
                 "this surface's color space is unresolved (Auto), so tagged float content has no \
@@ -1387,9 +1512,10 @@ impl core::fmt::Display for PairingRejection {
 /// |-------------|------------------------------|---------------------|
 /// | `Srgb`      | sRGB space (any format)      | native              |
 /// | `Srgb`      | `DisplayP3`                  | native (shifts like the chrome) |
+/// | `Srgb`      | `ExtendedSrgbLinear` (scRGB) | native (the linear pipelines decode; §7 "app-converted content rides the sRGB basis tag") |
 /// | `DisplayP3` | `DisplayP3` (± extended)     | native              |
 /// | `DisplayP3` | sRGB / extended-sRGB         | loud reject         |
-/// | either      | scRGB-linear                 | loud reject (linear pairing is a later stage) |
+/// | `DisplayP3` | scRGB-linear                 | loud reject (the primaries conversion ships with §5's matrices) |
 ///
 /// `None` (no surface known — app-driven/headless uploads) pairs with
 /// today's SDR-sRGB semantics.
@@ -1406,10 +1532,18 @@ fn pair_float_content_with_surface(
     let space = active_surface_color_space.unwrap_or(Scs::Srgb);
     match (content_primaries, space) {
         // sRGB content follows the surface's interpretation, the same shift
-        // the chrome gets on a P3-referred surface (§4 row 2; §5).
+        // the chrome gets on a P3-referred surface (§4 row 2; §5). On the
+        // scRGB pairing the sRGB tag rides natively: the linear entry point
+        // decodes the gamma-encoded values, so no conversion is needed here
+        // (§7).
         (
             epaint::Primaries::Srgb,
-            Scs::Auto | Scs::Srgb | Scs::ExtendedSrgb | Scs::DisplayP3 | Scs::ExtendedDisplayP3,
+            Scs::Auto
+            | Scs::Srgb
+            | Scs::ExtendedSrgb
+            | Scs::ExtendedSrgbLinear
+            | Scs::DisplayP3
+            | Scs::ExtendedDisplayP3,
         ) => Ok(()),
 
         // Explicit P3 is native only on P3 spaces (± extended).
@@ -1426,9 +1560,12 @@ fn pair_float_content_with_surface(
         // honest row.
         (epaint::Primaries::DisplayP3, Scs::Auto) => Err(PairingRejection::UnresolvedSurfaceSpace),
 
-        // scRGB-linear stores linear values; the gamma-encoded contract has
-        // no row there until the linear pairing lands (§4's PR 4 row, kept).
-        (_, Scs::ExtendedSrgbLinear) => Err(PairingRejection::LinearStorageNotPairedYet),
+        // P3 content on scRGB-linear needs the primaries conversion in
+        // linear light (§7), which ships with §5's matrices work — until
+        // then the sRGB tag is the only one riding this pairing.
+        (epaint::Primaries::DisplayP3, Scs::ExtendedSrgbLinear) => {
+            Err(PairingRejection::LinearStorageNotPairedYet)
+        }
 
         // Totality: BT.2100 surfaces are not grantable in v1; tagged content
         // has no honest row on them.
@@ -1494,6 +1631,73 @@ pub(crate) fn is_float_target(format: wgpu::TextureFormat) -> bool {
     matches!(format, wgpu::TextureFormat::Rgba16Float)
 }
 
+/// How the fragment path must write color for a surface to encode exactly
+/// once (plan §3).
+///
+/// A derived quantity: computed from `(format, color_space)` wherever an
+/// entry point or cache key is selected — never stored next to its inputs
+/// (storing a derivable value re-introduces drift when either input changes
+/// under it, e.g. on a monitor re-decide).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutputEncoding {
+    /// The fragment writes gamma-encoded values (the passthrough entry
+    /// point); the surface stores them as-is. The u8 raw-view grammar and
+    /// the fp16 grammar on every pairing except the scRGB one.
+    GammaEncoded,
+
+    /// The fragment writes linear values (the decode entry point); encoding
+    /// happens downstream, in the format's hardware or the presentation
+    /// engine (scRGB composites in linear).
+    Linear,
+}
+
+impl OutputEncoding {
+    /// The encoding a render pass into `(format, color_space)` must use.
+    ///
+    /// Total per plan §3's table — every legal pairing maps to an encoding,
+    /// and the totality is unit-tested. The rows:
+    ///
+    /// | Format class                  | Color space              | Encoding       |
+    /// |-------------------------------|--------------------------|----------------|
+    /// | u8 raw views (`Bgra8Unorm` …) | any                      | `GammaEncoded` |
+    /// | fp16 (`Rgba16Float`)          | non-extended (incl. `Srgb`, `Auto`) | `GammaEncoded` |
+    /// | fp16                          | `ExtendedSrgb`           | `GammaEncoded` |
+    /// | fp16                          | `DisplayP3` / `ExtendedDisplayP3` | `GammaEncoded` |
+    /// | fp16                          | `ExtendedSrgbLinear`     | `Linear`       |
+    ///
+    /// The scRGB row is what makes the pairing grantable: the surface stores
+    /// linear values (Windows' DWM composites in linear scRGB, plan §7), so
+    /// the fragment must decode the gamma-encoded contract before writing.
+    /// Ungrantable combos (u8 with `ExtendedSrgbLinear`, wider floats) read
+    /// as `GammaEncoded` — the table's rows, not a guess.
+    ///
+    /// `*Srgb` formats are not an egui pairing (the decider grants raw views
+    /// only), but the function is total over formats: a hardware-encoding
+    /// format demands linear input (it encodes exactly once, on store) — the
+    /// same row today's `TextureFormat::is_srgb()` sniff selected, kept so
+    /// non-egui surfaces keep their entry point.
+    #[must_use]
+    pub fn of(format: wgpu::TextureFormat, color_space: wgpu::SurfaceColorSpace) -> Self {
+        use wgpu::SurfaceColorSpace as Scs;
+
+        if format.is_srgb() {
+            // Hardware encodes on store; the fragment writes linear (the
+            // row today's `is_srgb()` selection picks — kept).
+            return Self::Linear;
+        }
+        match (is_float_target(format), color_space) {
+            // The scRGB pairing (fp16 only, the grantable class): the
+            // surface stores linear values — decode in shader.
+            (true, Scs::ExtendedSrgbLinear) => Self::Linear,
+            // Every other raw-view pairing — u8 wide-gamut SDR, fp16
+            // extended sRGB / extended Display P3, fp16 with a non-extended
+            // space (`Srgb` included, legal in wgpu), unresolved BT.2100 —
+            // stores the gamma-encoded contract as-is.
+            _ => Self::GammaEncoded,
+        }
+    }
+}
+
 fn create_sampler(
     options: epaint::textures::TextureOptions,
     device: &wgpu::Device,
@@ -1525,15 +1729,19 @@ fn create_sampler(
 
 /// Creates the egui render pipeline for one render-pass target format.
 ///
-/// The per-format entry-point choice is the gamma-passthrough sniff it has
-/// always been ([`wgpu::TextureFormat::is_srgb`]); deriving the encoding from
-/// anything richer is future work (plan §3).
+/// The fragment entry point comes from the derived [`OutputEncoding`] (plan
+/// §3): `GammaEncoded` passes the gamma-encoded texel×vertex product
+/// through, `Linear` decodes it for surfaces that store linear values
+/// (scRGB) or encode in hardware (`*Srgb` formats). The two dither module
+/// variants × the two entry points stay one source of truth: both live in
+/// the same concatenated module, selected here, never copied.
 fn create_pipeline(
     device: &wgpu::Device,
     module: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
     options: &RendererOptions,
     target_format: wgpu::TextureFormat,
+    encoding: OutputEncoding,
 ) -> wgpu::RenderPipeline {
     profiling::scope!("create_render_pipeline");
 
@@ -1581,11 +1789,19 @@ fn create_pipeline(
 
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some(if target_format.is_srgb() {
-                log::warn!("Detected a linear (sRGBA aware) framebuffer {target_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm");
-                "fs_main_linear_framebuffer"
-            } else {
-                "fs_main_gamma_framebuffer" // this is what we prefer
+            entry_point: Some(match encoding {
+                // The kept advice for hardware-encoding formats (not an egui
+                // pairing — the decider grants raw views only): egui prefers
+                // the raw 8-bit formats.
+                OutputEncoding::Linear => {
+                    if target_format.is_srgb() {
+                        log::warn!("Detected a linear (sRGBA aware) framebuffer {target_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm");
+                    }
+                    "fs_main_linear_framebuffer"
+                }
+                OutputEncoding::GammaEncoded => {
+                    "fs_main_gamma_framebuffer" // this is what we prefer
+                }
             }),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
@@ -1759,15 +1975,16 @@ mod tests {
             .expect("GPU poll failed while waiting for the pipeline cache test frame");
     }
 
-    /// The pipeline cache is keyed by target format: repeated renders at one
-    /// format reuse one pipeline, a second format gets its own entry, and no
-    /// device error surfaces along the way (plan §8, row 1).
+    /// The pipeline cache is keyed by (target format, derived encoding):
+    /// repeated renders under one key reuse one pipeline, a second format (or
+    /// encoding) gets its own entry, and no device error surfaces along the
+    /// way (plan §8, row 1; plan §3's encoding-keyed cache).
     ///
     /// Adapter-requiring: this is egui-wgpu's first runtime test. Machines
     /// without any wgpu adapter skip with a message; CI and normal dev
     /// machines (hardware GPU or software rasterizer) always run it.
     #[test]
-    fn pipeline_cache_is_keyed_by_target_format() {
+    fn pipeline_cache_is_keyed_by_target_format_and_encoding() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(
             &wgpu::RequestAdapterOptions {
@@ -1784,7 +2001,7 @@ mod tests {
                 #[expect(clippy::print_stderr)]
                 {
                     eprintln!(
-                        "skipping pipeline_cache_is_keyed_by_target_format: no wgpu adapter: {err}"
+                        "skipping pipeline_cache_is_keyed_by_target_format_and_encoding: no wgpu adapter: {err}"
                     );
                 }
                 return;
@@ -1807,6 +2024,8 @@ mod tests {
             renderer.pipelines.lock().is_empty(),
             "pipelines must be created lazily, not in Renderer::new"
         );
+        // No active surface: Srgb semantics → the GammaEncoded entry point.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
 
         render_offscreen(
             &device,
@@ -1817,7 +2036,10 @@ mod tests {
         let first_bgra = renderer
             .pipelines
             .lock()
-            .get(&wgpu::TextureFormat::Bgra8Unorm)
+            .get(&(
+                wgpu::TextureFormat::Bgra8Unorm,
+                OutputEncoding::GammaEncoded,
+            ))
             .cloned()
             .expect("the Bgra8Unorm pipeline must be cached after the first render");
 
@@ -1839,7 +2061,10 @@ mod tests {
                 Arc::ptr_eq(
                     &first_bgra,
                     pipelines
-                        .get(&wgpu::TextureFormat::Bgra8Unorm)
+                        .get(&(
+                            wgpu::TextureFormat::Bgra8Unorm,
+                            OutputEncoding::GammaEncoded
+                        ))
                         .expect("the Bgra8Unorm cache entry must survive")
                 ),
                 "repeated renders at the same format must reuse the cached pipeline"
@@ -1863,11 +2088,108 @@ mod tests {
             !Arc::ptr_eq(
                 &first_bgra,
                 pipelines
-                    .get(&wgpu::TextureFormat::Rgba8Unorm)
+                    .get(&(
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        OutputEncoding::GammaEncoded
+                    ))
                     .expect("the Rgba8Unorm pipeline must be cached"),
             ),
             "distinct target formats must hold distinct pipelines"
         );
+    }
+
+    /// One format, both encodings (plan §3): an fp16 target reaching
+    /// `ExtendedSrgbLinear` (the scRGB pairing) alongside every other space
+    /// legitimately hosts two pipelines — the encoding is part of the cache
+    /// key, so neither evicts the other and repeats reuse their own entry.
+    /// Adapter-requiring (2a conventions).
+    #[test]
+    fn pipeline_cache_keys_both_encodings_per_format() {
+        let Some((device, queue)) = test_device("pipeline_cache_keys_both_encodings_per_format")
+        else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+
+        // First encoding: the sRGB row (every non-scRGB pairing) on fp16.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgb));
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+
+        // Second encoding: the scRGB pairing on the same target format.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+
+        let (gamma, linear) = {
+            let pipelines = renderer.pipelines.lock();
+            assert_eq!(
+                pipelines.len(),
+                2,
+                "one format may host one pipeline per encoding, no more"
+            );
+            let gamma = Arc::clone(
+                pipelines
+                    .get(&(
+                        wgpu::TextureFormat::Rgba16Float,
+                        OutputEncoding::GammaEncoded,
+                    ))
+                    .expect("the GammaEncoded fp16 pipeline must be cached"),
+            );
+            let linear = Arc::clone(
+                pipelines
+                    .get(&(wgpu::TextureFormat::Rgba16Float, OutputEncoding::Linear))
+                    .expect("the Linear fp16 pipeline must be cached"),
+            );
+            (gamma, linear)
+        };
+        assert!(
+            !Arc::ptr_eq(&gamma, &linear),
+            "the two encodings must be distinct pipelines"
+        );
+
+        // Repeats under each encoding reuse their own entry (no third
+        // pipeline, no recompilation churn).
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgb));
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
+        render_offscreen(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let pipelines = renderer.pipelines.lock();
+        assert_eq!(pipelines.len(), 2);
+        assert!(Arc::ptr_eq(
+            &gamma,
+            pipelines
+                .get(&(
+                    wgpu::TextureFormat::Rgba16Float,
+                    OutputEncoding::GammaEncoded
+                ))
+                .expect("the GammaEncoded entry must survive")
+        ));
+        assert!(Arc::ptr_eq(
+            &linear,
+            pipelines
+                .get(&(wgpu::TextureFormat::Rgba16Float, OutputEncoding::Linear))
+                .expect("the Linear entry must survive")
+        ));
     }
 
     /// Guards the module split against drift at the name level.
@@ -2351,29 +2673,25 @@ fn fs_test(in: TestVOut) -> TestFOut {
             for space in spaces {
                 let result = pair_float_content_with_surface(primaries, Some(space));
                 match (primaries, space) {
-                    // Srgb content: native on sRGB spaces and on DisplayP3
-                    // (shifts like the chrome); rejected on the linear
-                    // scRGB pairing and on non-grantable BT.2100 spaces.
+                    // Srgb content: native on sRGB spaces, on DisplayP3
+                    // (shifts like the chrome), and on the scRGB pairing
+                    // (the linear pipelines decode — PR 4's flip); rejected
+                    // only on non-grantable BT.2100 spaces.
                     (
                         epaint::Primaries::Srgb,
                         Scs::Auto
                         | Scs::Srgb
                         | Scs::ExtendedSrgb
+                        | Scs::ExtendedSrgbLinear
                         | Scs::DisplayP3
                         | Scs::ExtendedDisplayP3,
                     ) => {
                         assert_eq!(result, Ok(()), "{primaries:?} on {space:?}");
                     }
-                    (epaint::Primaries::Srgb, Scs::ExtendedSrgbLinear) => {
-                        assert_eq!(
-                            result,
-                            Err(PairingRejection::LinearStorageNotPairedYet),
-                            "{primaries:?} on {space:?}"
-                        );
-                    }
                     // DisplayP3 content: native on P3 (± extended), loud
                     // reject everywhere else (sRGB spaces gamut-clip; scRGB
-                    // is the later linear pairing; BT.2100 not grantable).
+                    // needs the §5 matrices conversion; BT.2100 not
+                    // grantable).
                     (epaint::Primaries::DisplayP3, Scs::DisplayP3 | Scs::ExtendedDisplayP3) => {
                         assert_eq!(result, Ok(()), "{primaries:?} on {space:?}");
                     }
@@ -2412,6 +2730,70 @@ fn fs_test(in: TestVOut) -> TestFOut {
                 pair_float_content_with_surface(primaries, None),
                 pair_float_content_with_surface(primaries, Some(Scs::Srgb)),
                 "None must pair like Srgb"
+            );
+        }
+    }
+
+    /// `OutputEncoding::of` is total over every reported color space × a
+    /// representative format set, and matches plan §3's table (the normative
+    /// rows): u8 raw views are `GammaEncoded` everywhere; `*Srgb` formats are
+    /// `Linear` (hardware encodes — the row today's `is_srgb()` sniff
+    /// selected, kept); the fp16 class is `Linear` exactly on the scRGB
+    /// pairing and `GammaEncoded` everywhere else (`Srgb` included — legal
+    /// in wgpu, so the table must cover it). Pure function — runs everywhere.
+    #[test]
+    fn output_encoding_of_is_total_and_matches_plan_table() {
+        use wgpu::SurfaceColorSpace as Scs;
+        use wgpu::TextureFormat as Tf;
+
+        let spaces = [
+            Scs::Auto,
+            Scs::Srgb,
+            Scs::ExtendedSrgb,
+            Scs::ExtendedSrgbLinear,
+            Scs::DisplayP3,
+            Scs::ExtendedDisplayP3,
+            Scs::Bt2100Pq,
+            Scs::Bt2100Hlg,
+        ];
+
+        for space in spaces {
+            // u8 raw views: gamma-encoded on every space (§3 rows 1–2).
+            for format in [Tf::Bgra8Unorm, Tf::Rgba8Unorm] {
+                assert_eq!(
+                    OutputEncoding::of(format, space),
+                    OutputEncoding::GammaEncoded,
+                    "{format:?} + {space:?}"
+                );
+            }
+            // `*Srgb` formats: hardware encodes, so the fragment writes
+            // linear on every space (the kept `is_srgb()` row).
+            assert_eq!(
+                OutputEncoding::of(Tf::Bgra8UnormSrgb, space),
+                OutputEncoding::Linear,
+                "Bgra8UnormSrgb + {space:?}"
+            );
+            // The fp16 class: linear only on the scRGB pairing.
+            let expected = if space == Scs::ExtendedSrgbLinear {
+                OutputEncoding::Linear
+            } else {
+                OutputEncoding::GammaEncoded
+            };
+            assert_eq!(
+                OutputEncoding::of(Tf::Rgba16Float, space),
+                expected,
+                "Rgba16Float + {space:?}"
+            );
+            // Ungrantable combos read as `GammaEncoded` (the table's rows,
+            // not a guess): a u8 surface is never paired with the linear
+            // space, and no non-fp16 float target is grantable.
+            assert_eq!(
+                OutputEncoding::of(Tf::Bgra8Unorm, Scs::ExtendedSrgbLinear),
+                OutputEncoding::GammaEncoded
+            );
+            assert_eq!(
+                OutputEncoding::of(Tf::Rgba32Float, Scs::ExtendedSrgbLinear),
+                OutputEncoding::GammaEncoded
             );
         }
     }
@@ -2688,17 +3070,32 @@ fn fs_test(in: TestVOut) -> TestFOut {
             "the gate must not poison later, pairable uploads for the same id"
         );
 
-        // The scRGB-linear row is kept rejected for BOTH tags (PR 4 pairing).
+        // The scRGB pairing since PR 4: sRGB-tagged content is native there
+        // (the linear pipelines decode it) and uploads f16-bit-exact…
         renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
-        let p3_id_scrgb = epaint::TextureId::Managed(202);
-        renderer.update_texture(&device, &queue, p3_id_scrgb, &p3_delta);
-        assert!(renderer.texture(&p3_id_scrgb).is_none());
-        let srgb_id_scrgb = epaint::TextureId::Managed(203);
+        let srgb_id_scrgb = epaint::TextureId::Managed(202);
         renderer.update_texture(&device, &queue, srgb_id_scrgb, &srgb_delta);
-        assert!(renderer.texture(&srgb_id_scrgb).is_none());
+        let scrgb_texture = renderer
+            .texture(&srgb_id_scrgb)
+            .and_then(|t| t.texture.as_ref())
+            .expect("Srgb float content on the scRGB pairing must upload natively");
+        assert_eq!(scrgb_texture.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, scrgb_texture, 3, 2),
+            roundtrip_expected_bits(),
+            "the native scRGB upload must also be f16-bit-exact"
+        );
+        // …while DisplayP3 content still loudly rejects there (the primaries
+        // conversion ships with §5's matrices).
+        let p3_id_scrgb = epaint::TextureId::Managed(203);
+        renderer.update_texture(&device, &queue, p3_id_scrgb, &p3_delta);
         assert!(
-            renderer.upload_rejections_warned.contains(&srgb_id_scrgb),
-            "gamma-encoded content on the linear pairing must reject loudly"
+            renderer.texture(&p3_id_scrgb).is_none(),
+            "DisplayP3 content on the linear pairing must stay rejected"
+        );
+        assert!(
+            renderer.upload_rejections_warned.contains(&p3_id_scrgb),
+            "the rejected scRGB pairing must warn (once) for its texture id"
         );
     }
 
@@ -3467,6 +3864,182 @@ fn fs_test(in: TestVOut) -> TestFOut {
             for (lane, v) in pixel.iter().take(3).enumerate() {
                 assert_eq!(*v, want, "texel {i} lane {lane}: resolved {want} damaged");
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PR 4 — the derived linear path (plan §3 + §7).
+    // -----------------------------------------------------------------------
+
+    /// The scale-math unit test (plan §7's anchor): the uniform value for the
+    /// linear entry point is `sdr_white_nits / 80`, and the no-report default
+    /// is exactly 1.0. Pure function — runs everywhere, no adapter needed.
+    #[test]
+    fn sdr_white_scale_math() {
+        assert_eq!(sdr_white_scale(None), 1.0, "no report → the 80-nit anchor");
+        // Also the anchor check: scale(nits) is 1.0 exactly when the constant
+        // divides nits, so `Some(80.0) → 1.0` pins `SDR_REFERENCE_WHITE_NITS`
+        // at the IEC 61966-2-1 reference white.
+        assert_eq!(
+            sdr_white_scale(Some(80.0)),
+            1.0,
+            "80 nits is the anchor: no rescaling"
+        );
+        assert_eq!(
+            sdr_white_scale(Some(200.0)),
+            2.5,
+            "200 nits over the 80-nit anchor"
+        );
+    }
+
+    /// The gamma-encoded scene for the linear-decode test: 16 columns, both
+    /// rows identical, §4-contract values (unclamped, odd-symmetric, both
+    /// zeros, subnormal decodes). It omits magnitudes whose *decoded* value
+    /// leaves f16 range (`65504²·⁴` overflows; the passthrough matrix in
+    /// [`Self::fp16_extended_surface_preserves_contract_values`] covers those
+    /// on the gamma path, which never decodes).
+    fn linear_scene_encoded_texels() -> Vec<[f32; 4]> {
+        let encoded: [f32; HDR_SCENE_W as usize] = [
+            epaint::ecolor::gamma_from_linear(0.25),
+            epaint::ecolor::gamma_from_linear(0.5),
+            epaint::ecolor::gamma_from_linear(0.75),
+            epaint::ecolor::gamma_from_linear(0.04), // the decode toe
+            epaint::ecolor::gamma_from_linear(0.003_130_8), // the encode knee
+            epaint::ecolor::gamma_from_linear(1e-6), // subnormal decode
+            1.0,                                     // SDR reference white
+            2.0,                                     // classic headroom value
+            10.0, // deep headroom, still f16-representable decoded
+            -1.0,
+            -0.5,
+            -4.0, // odd-symmetric decode
+            0.0,
+            -0.0, // both zeros: decode must not NaN
+            1e-5, // positive f16-subnormal decode
+            1e-6,
+        ];
+        encoded
+            .iter()
+            .chain(encoded.iter()) // both scene rows identical, row-major
+            .map(|&v| [v, v, v, 1.0])
+            .collect()
+    }
+
+    /// Renders the linear scene once through the production `Renderer` onto
+    /// the offscreen fp16 target and returns the decoded readback texels.
+    fn render_linear_scene(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        texture_id: epaint::TextureId,
+    ) -> Vec<[f32; 4]> {
+        let readback = render_scene(
+            device,
+            queue,
+            renderer,
+            wgpu::TextureFormat::Rgba16Float,
+            1,
+            textured_quad(texture_id),
+        );
+        crate::readback::texture_to_float_image(
+            device,
+            &readback,
+            [HDR_SCENE_W, HDR_SCENE_H],
+            wgpu::util::align_to(HDR_SCENE_W * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+        )
+    }
+
+    /// The linear path end-to-end, headless (scRGB is never *reported* on
+    /// macOS, but the encoding is a derived quantity, so the fp16 target is
+    /// forced through `OutputEncoding::Linear` by the same plumbing a
+    /// Windows surface drives: active space `ExtendedSrgbLinear` →
+    /// [`OutputEncoding::of`] → the decode entry point). Asserts, against the
+    /// shared 2a CPU references (`ecolor::linear_from_gamma`, negative inputs
+    /// included):
+    /// - scale 1.0 (default, 80 nits, no report): gamma-encoded in → linear
+    ///   out, within the §8 f16 tolerance, alpha untouched, zeros intact;
+    /// - 200 nits → ×2.5 (the §7 anchor math), back to ×1.0 at 80 nits/None;
+    /// - the `GammaEncoded` entry point ignores the uniform entirely (exact
+    ///   passthrough with nits set).
+    ///
+    /// Not covered here, honestly: a real scRGB *surface* round-trip — that
+    /// needs Windows/DXGI (`MANUAL_TESTING.md`). Adapter-requiring (2a
+    /// conventions).
+    #[test]
+    fn linear_encoding_decodes_and_scales_on_fp16_target() {
+        let Some((device, queue)) =
+            test_device("linear_encoding_decodes_and_scales_on_fp16_target")
+        else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        // The scRGB pairing: (Srgb content, ExtendedSrgbLinear surface) has
+        // been native since the PR 4 pairing flip.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
+        let inputs = linear_scene_encoded_texels();
+        let flat: Vec<f32> = inputs.iter().flat_map(|t| *t).collect();
+        let image = epaint::FloatImage::from_rgba(
+            [HDR_SCENE_W as usize, HDR_SCENE_H as usize],
+            epaint::Primaries::Srgb,
+            &flat,
+        );
+        let id = epaint::TextureId::Managed(405);
+        renderer.update_texture(
+            &device,
+            &queue,
+            id,
+            &epaint::ImageDelta::full(image, epaint::textures::TextureOptions::NEAREST),
+        );
+        assert!(
+            renderer.texture(&id).is_some(),
+            "Srgb content on the scRGB pairing must upload"
+        );
+
+        let assert_decoded = |pixels: &[[f32; 4]], scale: f32, context: &str| {
+            assert_eq!(pixels.len(), (HDR_SCENE_W * HDR_SCENE_H) as usize);
+            for (i, pixel) in pixels.iter().enumerate() {
+                let encoded = inputs[i % HDR_SCENE_W as usize];
+                for (lane, &v) in encoded[..3].iter().enumerate() {
+                    let want = epaint::ecolor::linear_from_gamma(v) * scale;
+                    assert_f16_close(
+                        pixel[lane],
+                        want,
+                        &format!("{context}: texel {i} lane {lane} (encoded {v})"),
+                    );
+                }
+                assert_eq!(pixel[3], 1.0, "{context}: texel {i}: alpha stays 1.0");
+            }
+        };
+
+        // Scale 1.0 — the default — is the pure decode.
+        let pixels = render_linear_scene(&device, &queue, &mut renderer, id);
+        assert_decoded(&pixels, 1.0, "default scale");
+
+        // The §7 anchor math: 200 nits → ×2.5; 80 nits and no report → ×1.0.
+        renderer.set_sdr_white_nits(Some(200.0));
+        let pixels = render_linear_scene(&device, &queue, &mut renderer, id);
+        assert_decoded(&pixels, 2.5, "200-nit scale");
+
+        renderer.set_sdr_white_nits(Some(80.0));
+        let pixels = render_linear_scene(&device, &queue, &mut renderer, id);
+        assert_decoded(&pixels, 1.0, "80-nit scale");
+
+        renderer.set_sdr_white_nits(None);
+        let pixels = render_linear_scene(&device, &queue, &mut renderer, id);
+        assert_decoded(&pixels, 1.0, "no-report scale");
+
+        // The GammaEncoded entry point never reads the uniform: same scene,
+        // same (2.5×) nits, sRGB active space — exact f16 passthrough.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        renderer.set_sdr_white_nits(Some(200.0));
+        let pixels = render_linear_scene(&device, &queue, &mut renderer, id);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let encoded = inputs[i % HDR_SCENE_W as usize];
+            let want = encoded.map(half::f16::from_f32).map(half::f16::to_f32);
+            assert_eq!(
+                *pixel, want,
+                "texel {i}: the gamma path must ignore the SDR-white uniform"
+            );
         }
     }
 }

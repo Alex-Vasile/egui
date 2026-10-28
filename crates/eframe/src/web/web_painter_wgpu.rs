@@ -221,6 +221,10 @@ impl WebPainter for WebPainterWgpu {
             // uploads below are gated on the space the canvas was granted
             // (plan §4). We hold the renderer write lock.
             renderer.set_active_surface_color_space(Some(self.surface_target.color_space));
+            // Web reports no SDR white level (`DisplayLuminance` is
+            // Windows/DXGI-only), so the linear path keeps the standard
+            // 80-nit anchor: scale 1.0 (plan §7).
+            renderer.set_sdr_white_nits(None);
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

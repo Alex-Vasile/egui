@@ -15,6 +15,18 @@ struct Locals {
     /// 1 to do manual filtering for more predictable kittest snapshot images.
     /// See also https://github.com/emilk/egui/issues/5295
     predictable_texture_filtering: u32,
+
+    /// The SDR-white scale applied by `fs_main_linear_framebuffer` only:
+    /// `sdr_white_nits / 80` so egui's 1.0 stays the SDR reference white on
+    /// scRGB surfaces, where a stored 1.0 is pinned to 80 nits (plan §7).
+    /// Gamma-encoded entry points never read it. Must match `UniformBuffer`
+    /// in `renderer.rs`; the trailing scalar pad brings the struct to the
+    /// 16-byte-multiple size the uniform address space requires (an array
+    /// pad would violate the stride rule, a `vec3` pad its alignment).
+    _padding_0: u32,
+    _padding_1: u32,
+    _padding_2: u32,
+    sdr_white_scale: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 
@@ -172,7 +184,14 @@ fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
         out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);
     }
     let out_color_linear = linear_from_gamma_rgb(out_color_gamma.rgb);
-    return vec4<f32>(out_color_linear, out_color_gamma.a);
+    // SDR-white anchor (plan §7): on a linear-storage surface (scRGB) a
+    // stored 1.0 is pinned to the sRGB standard's 80-nit reference white
+    // (IEC 61966-2-1), so scale by the display's current SDR white over that
+    // anchor — egui's 1.0 = SDR reference white, and the value follows the
+    // user's brightness slider. 1.0 (the default) is the standard anchoring;
+    // alpha is untouched, and the gamma entry point never reads the uniform.
+    let scaled_linear = out_color_linear * r_locals.sdr_white_scale;
+    return vec4<f32>(scaled_linear, out_color_gamma.a);
 }
 
 @fragment
