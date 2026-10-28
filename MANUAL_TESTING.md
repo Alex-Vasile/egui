@@ -1,4 +1,4 @@
-# Manual testing — wide-gamut + HDR surface (PR 1 + PR 3)
+# Manual testing — wide-gamut + HDR surface (PR 1 + PR 3; PR 4/PR 5 sections below)
 
 **"Tested" means "this checklist passes."** Everything below exercises the
 parts of the surface work that a machine cannot judge: what a compositor does
@@ -9,24 +9,35 @@ with the surface, and what a panel does with the colors. Each step is marked
 
 | Command | What it shows |
 |---|---|
+| `cargo run -p eframe --example hdr_test_app` | **The primary instrument** (the protocol's instrument per plan §8): one window that stays open — a live readout panel (`SurfaceStatus`, `surface_target`, `hdr_headroom`, and a one-line interpretation of the granted pairing) above a radio menu of the deterministic patterns below (Primaries 2×3, SDR sweep, Float gradient, Swatches, White 1.0 / White 4.0). Requests `SurfacePreference::WideGamutHdr`. |
 | `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamutHdr`, asserts the surfaced decision is coherent **and that display headroom is reported from the first frame** (`None` fails), logs the pairing + headroom, exits 0 after a few frames. |
 | `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target` and a full-width 2×3 primaries grid canvas (bold "sRGB primaries" / "display primaries" labels sandwich it) — top row the sRGB primaries converted at runtime into the granted color space's encoding, bottom row the display's native primaries as full-range bytes ((255, 0, 0), (0, 255, 0), (0, 0, 255)). |
 | `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` content above 1.0 through the real upload→pipeline→surface path (a gradient sweeping linear 0..4 with the SDR-white quarter marked, plus the DisplayP3 primary strip), and the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr` on a linear color with exposure). Requests `WideGamutHdr`: with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
 
 The log line `Surface decision: Rgba16Float + ExtendedDisplayP3 (Granted),
-headroom 1.2×` (or the example's on-screen readout) is the primary reading
-throughout.
+headroom 1.2×` (or, primarily, the readout panel in `hdr_test_app`) is the
+primary reading throughout.
 
-Expected readings on this PR, by instrument and panel (the preference differs
-per instrument: the smoke asks for `WideGamutHdr`, the other two examples for
-`WideGamut`):
+Expected readings on this branch, by instrument and panel (the preference
+differs per instrument: the smoke, `hdr_float_image`, and `hdr_test_app` ask
+for `WideGamutHdr`; `hdr_wide_gamut` for `WideGamut`):
 
 | Instrument / panel | Expected `surface_status` | Expected `surface_target` | Expected `hdr_headroom` |
 |---|---|---|---|
+| `hdr_test_app` on an EDR panel (EDR iMac, Pro Display XDR, recent MacBook panels) | `Granted` | `Rgba16Float + ExtendedDisplayP3` | the live EDR multiplier (`> 1.0`; ramps over ~1–2 s after a brightness change, then rests) — watch it move in the readout panel |
+| `hdr_test_app` on an SDR panel reporting SRGB | `FellBack(NoPairedColorSpace)` | `Bgra8Unorm + Srgb` | `Some(1.0)` (the definitively-SDR guard pins it) |
 | `hdr_smoke` on an EDR panel (EDR iMac, Pro Display XDR, recent MacBook panels) | `Granted` | `Rgba16Float + ExtendedDisplayP3` | the live EDR multiplier (`> 1.0`; ramps over ~1–2 s after a brightness change, then rests) |
 | `hdr_smoke` on an SDR panel reporting SRGB | `FellBack(NoPairedColorSpace)` | `Bgra8Unorm + Srgb` | `Some(1.0)` (the definitively-SDR guard pins it) |
-| `hdr_wide_gamut` / `hdr_float_image` (WideGamut) on any P3-reporting panel | `Granted` | `Bgra8Unorm + DisplayP3` | same headroom column as above (it is a display property, not a preference property) |
+| `hdr_wide_gamut` (WideGamut) on any P3-reporting panel | `Granted` | `Bgra8Unorm + DisplayP3` | same headroom column as above (it is a display property, not a preference property) |
 | Headless / no surface (offscreen harness) | `None` (fields unset) | `None` | `None` (unknown — never fabricated) |
+
+The per-pattern expected readings map onto the test app's pattern names: the
+wide-gamut grid reading (§B) is the **Primaries 2×3** pattern; the >1.0
+clamps-on-SDR / brightness-on-EDR readings (§E, the scRGB steps) are the
+**Float gradient**, **Swatches**, and **White 1.0 / White 4.0** patterns —
+on an extended surface the gradient's right three quarters and the 4.0
+patch render as brightness above SDR white, on an SDR surface everything
+above 1.0 clips identically.
 
 Caveat: macOS reports what the *screen mode* offers, not what the panel can
 show — some SDR displays still get `DisplayP3`. That grant is correct; the
@@ -89,9 +100,12 @@ Rules of thumb:
 
 ### B. P3-capable panel (granted path)
 
-1. Run `hdr_wide_gamut` on an EDR iMac or Pro Display XDR.
+1. Run `hdr_wide_gamut` (or select **Primaries 2×3** in `hdr_test_app`) on
+   an EDR iMac or Pro Display XDR.
    Expected: `Surface status: Granted`, `Surface target:
-   Bgra8Unorm + DisplayP3`. The grid's top row reads as the familiar sRGB
+   Bgra8Unorm + DisplayP3` (`hdr_test_app` requests `WideGamutHdr`, so on an
+   EDR panel it instead reads `Rgba16Float + ExtendedDisplayP3`). The grid's
+   top row reads as the familiar sRGB
    primaries while the bottom row is visibly deeper and more saturated —
    outside the sRGB gamut. **CI cannot validate this.**
 2. Instrumented check (screenshot piped through a color-managed viewer or a
@@ -143,11 +157,12 @@ Rules of thumb:
   window on a compositor that honors extended-range alpha, premultiplied
   >1.0 content must composite without halos or clamping artifacts.
   **CI cannot validate this.**
-- **Headroom reactivity**: on an EDR Mac, run `hdr_wide_gamut` and drag the
-  display-brightness slider (or toggle an HDR video next to it). Expected:
-  the `HDR headroom` readout follows the ~1–2 s EDR ramp (the painter
-  schedules ~100 ms repaints while it moves) and then rests — the process
-  idles in `ControlFlow::Wait` at 0% CPU once the value is steady.
+- **Headroom reactivity**: on an EDR Mac, run `hdr_test_app` (its readout
+  panel shows `hdr_headroom` live) and drag the display-brightness slider
+  (or toggle an HDR video next to it). Expected: the `HDR headroom` readout
+  follows the ~1–2 s EDR ramp (the painter schedules ~100 ms repaints while
+  it moves) and then rests — the process idles in `ControlFlow::Wait` at 0%
+  CPU once the value is steady.
   **CI cannot validate this.**
 
 ### E. HDR color editing widgets (PR 5)

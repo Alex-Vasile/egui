@@ -612,10 +612,13 @@ and is not involved), and example dev-dependencies keep the crates' dep trees cl
 It runs `run_native` with `WideGamut`, asserts on first frame that `SurfaceStatus` is
 coherent — `Granted` or `FellBack`, never a panic — draws one label, exits after a few
 frames; CI fails on nonzero exit. PR 3 extends the same example with the headroom-field
-assertion. As implemented (PR 1, fork): the smoke exits via `process::exit(0)` after its
-assertions (short-lived windowed eframe apps hit the AppKit teardown abort, §9) and
-carries a 2-minute watchdog so a wedged loop fails CI in minutes, not at the job
-timeout; the step lives in the macOS GPU CI job (`rust.yml`). The *payoff* —
+assertion. As implemented (PR 1, fork): the smoke requests `WideGamutHdr` (the
+preference text above predates PR 3's completed enum), exits via `process::exit(0)`
+after its assertions (short-lived windowed eframe apps hit the AppKit teardown abort,
+§9) and carries a 2-minute watchdog so a wedged loop fails CI in minutes, not at the
+job timeout; the step lives in the macOS GPU CI job (`rust.yml`). The protocol's
+instrument itself is `crates/eframe/examples/hdr_test_app.rs` — the deterministic
+pattern menu + live readout described above, as shipped. The *payoff* —
 compositor tone mapping, panel gamut — is manual-only.
 
 **Test matrix** (mapped to existing conventions: ecolor 14 inline tests, epaint 96,

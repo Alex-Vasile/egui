@@ -314,3 +314,7 @@ required-features = ["wgpu"]
 [[example]]
 name = "hdr_float_image"
 required-features = ["wgpu"]
+
+[[example]]
+name = "hdr_test_app"
+required-features = ["wgpu"]

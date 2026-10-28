@@ -8,6 +8,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 
 ## Unreleased
+* Add `hdr_test_app` example: the manual protocol's instrument (`MANUAL_TESTING.md`, plan §8) — a live surface readout (`SurfaceStatus`, `surface_target`, `hdr_headroom`, and a granted-space interpretation line) above a radio menu of deterministic, snapshot-free patterns (Primaries 2×3 grid, SDR sweep, float gradient, the PR 5 HDR swatches, and the White 1.0 / White 4.0 EDR discriminator); requests `SurfacePreference::WideGamutHdr`
 * Add `hdr_float_image` example: an sRGB-tagged `FloatImage` gradient and a DisplayP3-tagged primary strip through `ui.image()`, demonstrating the content↔surface pairing's native and loud-reject outcomes
 * `hdr_float_image` gains the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr`) and now requests `SurfacePreference::WideGamutHdr`, so the effective color shows as brightness above SDR white on an EDR display (deterministic fallback on SDR panels)
 * Fix `hdr_float_image`'s strip outcome label: the granted color space is parsed against every space the pairing table has a row for — an `ExtendedDisplayP3` grant (the EDR-display pairing) no longer shows the loud-reject message, and the scRGB-linear reject is labeled as the pending primaries conversion instead of gamut-clipping
