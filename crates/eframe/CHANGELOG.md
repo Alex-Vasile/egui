@@ -9,6 +9,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 ## Unreleased
 * Add `hdr_float_image` example: an sRGB-tagged `FloatImage` gradient and a DisplayP3-tagged primary strip through `ui.image()`, demonstrating the content↔surface pairing's native and loud-reject outcomes
+* Fix `hdr_float_image`'s strip outcome label: the granted color space is parsed against every space the pairing table has a row for — an `ExtendedDisplayP3` grant (the EDR-display pairing) no longer shows the loud-reject message, and the scRGB-linear reject is labeled as the pending primaries conversion instead of gamut-clipping
 
 
 ## 0.37.0 - 2026-10-15

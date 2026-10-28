@@ -57,6 +57,9 @@ fn main() -> Result<(), eframe::Error> {
 struct FloatImageApp {
     srgb_gradient: Option<egui::TextureHandle>,
     p3_strip: Option<egui::TextureHandle>,
+    /// The last strip outcome logged, so the info line logs once per
+    /// decision, not once per frame.
+    logged_strip_outcome: Option<StripOutcome>,
 }
 
 impl FloatImageApp {
@@ -127,10 +130,14 @@ impl eframe::App for FloatImageApp {
                 info.and_then(|v| v.surface_target.clone()),
             )
         });
-        let p3_granted = target
-            .as_deref()
-            .and_then(|t| t.rsplit_once(" + ").map(|(_, space)| space))
-            == Some("DisplayP3");
+        let strip_outcome = StripOutcome::from_target(target.as_deref());
+        if self.logged_strip_outcome != Some(strip_outcome) {
+            log::info!(
+                "hdr_float_image strip upload outcome: {strip_outcome:?} (surface target: {})",
+                target.as_deref().unwrap_or("(unknown)")
+            );
+            self.logged_strip_outcome = Some(strip_outcome);
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Tagged float content (ImageData::Float)");
@@ -150,17 +157,35 @@ impl eframe::App for FloatImageApp {
                     ui.image(texture);
                 }
             });
-            if p3_granted {
-                ui.colored_label(
-                    egui::Color32::LIGHT_GREEN,
-                    "P3 surface granted: the strip shows primaries outside the sRGB gamut.",
-                );
-            } else {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    "sRGB surface: the strip's upload was loudly rejected — the slot above is the \
-                     placeholder. A warning logged once in the console.",
-                );
+            match strip_outcome {
+                StripOutcome::NativeP3 => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        "P3 surface granted: the strip shows primaries outside the sRGB gamut.",
+                    );
+                }
+                StripOutcome::GamutClipped => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        "sRGB surface: the strip's upload was loudly rejected — the slot above \
+                         is the placeholder. A warning logged once in the console.",
+                    );
+                }
+                StripOutcome::LinearStorageNotPairedYet => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_YELLOW,
+                        "Extended-sRGB-linear surface: the P3 strip needs the primaries \
+                         conversion that isn't shipped yet (plan §7) — the upload was loudly \
+                         rejected; the slot above is the placeholder.",
+                    );
+                }
+                StripOutcome::Unrecognized => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_YELLOW,
+                        "Granted color space not recognized — no honest claim about the \
+                         strip's upload.",
+                    );
+                }
             }
             ui.add_space(8.0);
 
@@ -175,6 +200,40 @@ impl eframe::App for FloatImageApp {
                  HDR brightness above SDR white is a later stage.",
             );
         });
+    }
+}
+
+/// What the pairing gate does with the DisplayP3-tagged strip's upload on
+/// the granted surface, derived from the color-space suffix of the
+/// diagnostics string ([`egui::ViewportInfo::surface_target`], e.g.
+/// "`Rgba16Float + ExtendedDisplayP3`") — the same `format + color_space`
+/// pairing-table string `hdr_wide_gamut` parses. The suffix matches
+/// [`wgpu::SurfaceColorSpace`]'s `Debug` name 1:1, so this is a table
+/// lookup, not guesswork — with an arm per pairing-table row (plan §4), so
+/// the label never claims a reason the gate didn't produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StripOutcome {
+    /// P3-referred surface (± extended): the strip uploads natively and
+    /// shows primaries outside the sRGB gamut.
+    NativeP3,
+    /// sRGB-gamut surface (± extended): gamut-clipped, loudly rejected —
+    /// the placeholder renders and a warning logs once.
+    GamutClipped,
+    /// scRGB-linear surface: loudly rejected for a different honest reason
+    /// — the P3→linear-light primaries conversion is future work (plan §7).
+    LinearStorageNotPairedYet,
+    /// Anything else (or no string): no honest claim about the upload.
+    Unrecognized,
+}
+
+impl StripOutcome {
+    fn from_target(target: Option<&str>) -> Self {
+        match target.and_then(|t| t.rsplit_once(" + ").map(|(_, space)| space)) {
+            Some("DisplayP3" | "ExtendedDisplayP3") => Self::NativeP3,
+            Some("Srgb" | "ExtendedSrgb") => Self::GamutClipped,
+            Some("ExtendedSrgbLinear") => Self::LinearStorageNotPairedYet,
+            _ => Self::Unrecognized,
+        }
     }
 }
 

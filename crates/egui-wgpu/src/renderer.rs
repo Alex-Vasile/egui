@@ -2584,6 +2584,28 @@ fn fs_test(in: TestVOut) -> TestFOut {
             "the native DisplayP3 upload must also be f16-bit-exact"
         );
 
+        // DisplayP3-tagged content on the EXTENDED P3 space — the pairing
+        // `WideGamutHdr` grants on EDR displays — must upload native and
+        // bit-exact too: the plain space above does not exercise the
+        // extended arm of the pairing row.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedDisplayP3));
+        let p3ext_id = epaint::TextureId::Managed(104);
+        let p3ext_image = roundtrip_float_image(epaint::Primaries::DisplayP3);
+        let p3ext_delta =
+            epaint::ImageDelta::full(p3ext_image, epaint::textures::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, p3ext_id, &p3ext_delta);
+
+        let p3ext_texture = renderer
+            .texture(&p3ext_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("DisplayP3 content on an ExtendedDisplayP3 surface must allocate a texture");
+        assert_eq!(p3ext_texture.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, p3ext_texture, 3, 2),
+            roundtrip_expected_bits(),
+            "the native ExtendedDisplayP3 upload must also be f16-bit-exact"
+        );
+
         // Partial (sub-region) float updates ride the same padded path: a
         // 3×2 patch written into a 3×4 texture (width 3 keeps forcing the
         // 256-byte pitch), then verified region-exact.
@@ -2733,7 +2755,7 @@ fn fs_test(in: TestVOut) -> TestFOut {
             float_id,
             &epaint::ImageDelta::partial(
                 [0, 0],
-                epaint::ColorImage::filled([1, 2], egui::Color32::RED),
+                epaint::ColorImage::filled([1, 2], epaint::Color32::RED),
                 epaint::textures::TextureOptions::LINEAR,
             ),
         );
@@ -2760,7 +2782,7 @@ fn fs_test(in: TestVOut) -> TestFOut {
             &queue,
             color_id,
             &epaint::ImageDelta::full(
-                epaint::ColorImage::filled([3, 2], egui::Color32::RED),
+                epaint::ColorImage::filled([3, 2], epaint::Color32::RED),
                 epaint::textures::TextureOptions::LINEAR,
             ),
         );
@@ -2795,7 +2817,7 @@ fn fs_test(in: TestVOut) -> TestFOut {
             &queue,
             color_id,
             &epaint::ImageDelta::full(
-                epaint::ColorImage::filled([3, 2], egui::Color32::BLUE),
+                epaint::ColorImage::filled([3, 2], epaint::Color32::BLUE),
                 epaint::textures::TextureOptions::LINEAR,
             ),
         );
