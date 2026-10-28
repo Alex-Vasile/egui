@@ -1,12 +1,14 @@
-//! Windowed CI smoke test for the wide-gamut surface policy.
+//! Windowed CI smoke test for the HDR surface policy.
 //!
-//! Opens a real window with [`SurfacePreference::WideGamut`], checks on the
-//! first frame that the surface decision is surfaced and coherent, logs the
-//! pairing, draws one label, and exits after a few frames.
+//! Opens a real window with [`SurfacePreference::WideGamutHdr`], checks on
+//! the first frame that the surface decision is surfaced and coherent and
+//! that display headroom is reported (`Some(1.0)` on an SDR display, the EDR
+//! multiplier on an EDR one — `None` means the poll failed and fails the
+//! smoke), logs the pairing, draws one label, and exits after a few frames.
 //! Exit code 0 = pass.
 //!
-//! What this *cannot* validate — panel gamut, compositor tone mapping — is
-//! the manual protocol in `MANUAL_TESTING.md`.
+//! What this *cannot* validate — panel gamut, compositor tone mapping, the
+//! actual headroom *value* — is the manual protocol in `MANUAL_TESTING.md`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 #![expect(rustdoc::missing_crate_level_docs)] // it's an example
@@ -48,8 +50,11 @@ fn main() -> Result<(), eframe::Error> {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 200.0]),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            // The fork opts in unconditionally (plan §2).
-            surface_preference: SurfacePreference::WideGamut,
+            // The fork opts in unconditionally; PR 3 completes the enum, and
+            // the smoke asserts the combined path (plan §2). On hardware that
+            // reports no extended pairing this deterministically falls back
+            // to plain SDR — still a pass (the status is what's asserted).
+            surface_preference: SurfacePreference::WideGamutHdr,
             ..Default::default()
         },
         ..Default::default()
@@ -103,18 +108,22 @@ impl eframe::App for HdrSmoke {
 /// The hard assertions of the smoke test, run once on the first frame.
 ///
 /// A windowed wgpu viewport must surface its decision from the first frame,
-/// and the surfaced fields must agree. A [`egui::SurfaceStatus::Granted`]
-/// status *should* mean a wide pairing, but that is never hard-required:
-/// CI hardware varies, and an SDR display correctly reports
-/// [`egui::SurfaceStatus::FellBack`].
+/// and the surfaced fields must agree, and headroom must be reported. A
+/// [`egui::SurfaceStatus::Granted`] status *should* mean the combined
+/// extended pairing, but that is never hard-required: CI hardware varies,
+/// and an SDR display correctly reports [`egui::SurfaceStatus::FellBack`].
 fn check_surface_decision(ctx: &egui::Context) {
-    let (status, target) = ctx.input(|input| {
+    let (status, target, headroom) = ctx.input(|input| {
         let info = input
             .raw
             .viewports
             .get(&egui::ViewportId::ROOT)
             .expect("the root viewport must be in the viewports map");
-        (info.surface_status, info.surface_target.clone())
+        (
+            info.surface_status,
+            info.surface_target.clone(),
+            info.hdr_headroom,
+        )
     });
 
     let status = status.expect(
@@ -123,11 +132,34 @@ fn check_surface_decision(ctx: &egui::Context) {
     );
     let target = target.expect("`surface_status` is surfaced, so `surface_target` must be too");
 
-    log::info!("Surface decision: {target} ({status:?})");
+    // PR 3: headroom must be reported from the first frame — `Some(1.0)` on a
+    // definitively-SDR display, the EDR multiplier on an EDR one. macOS is
+    // the runtime-verified platform and wgpu 30 always populates the value
+    // there, so `None` (or a nonsense value) fails the smoke. Elsewhere the
+    // poll may legitimately report nothing — warn and continue.
+    let headroom = match headroom {
+        Some(h) if h.is_finite() && h > 0.0 => h,
+        other => {
+            #[cfg(target_os = "macos")]
+            panic!(
+                "a windowed wgpu viewport on macOS must surface `hdr_headroom` from the \
+                 first frame (Some(1.0) on SDR, the EDR multiplier on EDR — never None); \
+                 got {other:?}"
+            );
+            #[cfg(not(target_os = "macos"))]
+            {
+                log::warn!("hdr_headroom not reported ({other:?}); continuing (non-macOS)");
+                return;
+            }
+        }
+    };
 
-    if status == egui::SurfaceStatus::Granted && !target.contains("DisplayP3") {
+    log::info!("Surface decision: {target} ({status:?}), headroom {headroom}×");
+
+    if status == egui::SurfaceStatus::Granted && !target.contains("ExtendedDisplayP3") {
         // Soft check only: what is granted depends on the capabilities the
-        // CI machine's display actually reports.
-        log::warn!("Granted without a wide pairing: {target} (an SDR display grants exactly this)");
+        // CI machine's display actually reports (an SDR display grants a
+        // plain pairing; the status, not the pairing, is what's hard-required).
+        log::warn!("Granted without the combined pairing: {target}");
     }
 }

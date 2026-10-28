@@ -392,7 +392,13 @@ impl WebPainter for WebPainterWgpu {
             if let Some(capture_buffer) = capture_buffer
                 && let Some(capture_state) = &self.screen_capture_state
             {
-                capture_state.read_screen_rgba(capture_buffer, capture_data);
+                // A non-u8 surface (e.g. an extended-range `Rgba16Float` one)
+                // has no 8-bit decoder: the error is loud here instead of the
+                // old silent log-and-drop, and the screenshot callbacks are
+                // simply never completed (same as before).
+                if let Err(err) = capture_state.read_screen_rgba(capture_buffer, capture_data) {
+                    log::error!("Failed to read back the screen capture: {err}");
+                }
             }
 
             render_state.queue.present(frame);

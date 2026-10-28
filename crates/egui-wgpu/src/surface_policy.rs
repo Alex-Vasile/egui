@@ -29,6 +29,22 @@ pub enum SurfacePreference {
     /// [`FallbackReason::NoPairedColorSpace`]) when no wide color space is
     /// reported on a supported format.
     WideGamut,
+
+    /// HDR brightness with the sRGB gamut pinned: extended-range sRGB, no
+    /// saturation claim.
+    ///
+    /// Falls back to the [`SurfacePreference::Off`] pairing (with
+    /// [`FallbackReason::NoPairedColorSpace`]) when no extended-range color
+    /// space is reported on a supported float format.
+    Hdr,
+
+    /// Wide gamut *and* HDR brightness, all-or-nothing: the combined pairing
+    /// or plain SDR, never one axis alone.
+    ///
+    /// Falls back to the [`SurfacePreference::Off`] pairing (with
+    /// [`FallbackReason::NoPairedColorSpace`]) when no extended-range wide
+    /// color space is reported on a supported float format.
+    WideGamutHdr,
 }
 
 /// The concrete surface pairing a viewport decided on.
@@ -68,9 +84,11 @@ impl SurfaceTarget {
     ///
     /// `Auto` maps to the sRGB points it resolves to on every surface this
     /// crate configures. cICP cannot express *extended* range (values beyond
-    /// `[0, 1]`): extended-range surfaces aren't 8-bit-capturable anyway
-    /// (the capture path's `read_screen_rgba` only accepts `Rgba8Unorm` /
-    /// `Bgra8Unorm`), so their points are the base spaces.
+    /// `[0, 1]`): extended-range surfaces aren't 8-bit-capturable anyway (the
+    /// u8 capture path's `read_screen_rgba` only accepts `Rgba8Unorm` /
+    /// `Bgra8Unorm`; lossless inspection goes through
+    /// `CaptureState::read_screen_floats`), so their points are the base
+    /// spaces.
     ///
     /// BT.2020 PQ/HLG points are included for completeness; no BT.2020
     /// surface pairing is granted yet.
@@ -160,6 +178,21 @@ impl From<SurfaceStatus> for egui::SurfaceStatus {
 /// Table data: add one row per newly supported primaries.
 pub const WIDE_GAMUT_ORDER: &[wgpu::SurfaceColorSpace] = &[wgpu::SurfaceColorSpace::DisplayP3];
 
+/// Priority-ordered extended-range color spaces the [`SurfacePreference::Hdr`]
+/// leg probes.
+///
+/// [`ExtendedSrgb`](wgpu::SurfaceColorSpace::ExtendedSrgb) first and only: HDR
+/// pins the sRGB gamut, and `ExtendedSrgbLinear` (scRGB) belongs to the later
+/// linear stage. Table data: add one row per newly supported extended space.
+pub const HDR_ORDER: &[wgpu::SurfaceColorSpace] = &[wgpu::SurfaceColorSpace::ExtendedSrgb];
+
+/// Priority-ordered combined wide-gamut + extended-range color spaces the
+/// [`SurfacePreference::WideGamutHdr`] leg probes.
+///
+/// Table data: add one row per newly supported combined space.
+pub const WIDE_GAMUT_HDR_ORDER: &[wgpu::SurfaceColorSpace] =
+    &[wgpu::SurfaceColorSpace::ExtendedDisplayP3];
+
 /// Decide the surface target for one viewport from its actual capabilities.
 ///
 /// The [`SurfacePreference::Off`] leg delegates to
@@ -168,10 +201,15 @@ pub const WIDE_GAMUT_ORDER: &[wgpu::SurfaceColorSpace] = &[wgpu::SurfaceColorSpa
 /// `Rgba16Float` when reported, `Srgb` otherwise), so the default path stays
 /// byte-identical to today's while never leaving `Auto` in a configuration.
 ///
-/// The [`SurfacePreference::WideGamut`] leg walks [`WIDE_GAMUT_ORDER`] and
-/// grants the first raw-view 8-bit format paired with a wide color space;
-/// if none is reported it returns the `Off` target with a
-/// [`SurfaceStatus::FellBack`] status instead.
+/// The [`SurfacePreference::WideGamut`], [`SurfacePreference::Hdr`] and
+/// [`SurfacePreference::WideGamutHdr`] legs each walk their priority-ordered
+/// table ([`WIDE_GAMUT_ORDER`], [`HDR_ORDER`],
+/// [`WIDE_GAMUT_HDR_ORDER`]) and grant the first pairing their format class
+/// reports (raw-view 8-bit / float / float respectively); if none is reported
+/// they return the `Off` target with a [`SurfaceStatus::FellBack`] status
+/// instead. The walks read reported capabilities only, so probe-gating is
+/// inherent — a platform that doesn't report the extended pair is never
+/// assumed to have it.
 ///
 /// # Errors
 /// Returns [`WgpuError::NoSurfaceFormatsAvailable`] if the surface has no
@@ -185,26 +223,38 @@ pub fn decide_surface_target(
         SurfacePreference::Off => {
             resolve_off_target(caps).map(|target| (target, SurfaceStatus::Granted))
         }
-        SurfacePreference::WideGamut => {
-            if let Some((format, color_space)) = wide_gamut_pairing(caps) {
-                return Ok((
-                    SurfaceTarget {
-                        format,
-                        color_space,
-                    },
-                    SurfaceStatus::Granted,
-                ));
-            }
-
-            let target = resolve_off_target(caps)?;
-            Ok((
-                target,
-                SurfaceStatus::FellBack {
-                    reason: FallbackReason::NoPairedColorSpace { requested: pref },
-                },
-            ))
+        SurfacePreference::WideGamut => grant_or_fall_back(caps, pref, wide_gamut_pairing(caps)),
+        SurfacePreference::Hdr => grant_or_fall_back(caps, pref, hdr_pairing(caps)),
+        SurfacePreference::WideGamutHdr => {
+            grant_or_fall_back(caps, pref, wide_gamut_hdr_pairing(caps))
         }
     }
+}
+
+/// The granted pairing, or the `Off` target with a [`SurfaceStatus::FellBack`]
+/// status when the preference has no pairing on this surface.
+fn grant_or_fall_back(
+    caps: &wgpu::SurfaceCapabilities,
+    pref: SurfacePreference,
+    pairing: Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)>,
+) -> Result<(SurfaceTarget, SurfaceStatus), WgpuError> {
+    if let Some((format, color_space)) = pairing {
+        return Ok((
+            SurfaceTarget {
+                format,
+                color_space,
+            },
+            SurfaceStatus::Granted,
+        ));
+    }
+
+    let target = resolve_off_target(caps)?;
+    Ok((
+        target,
+        SurfaceStatus::FellBack {
+            reason: FallbackReason::NoPairedColorSpace { requested: pref },
+        },
+    ))
 }
 
 /// The `Off` pairing: [`crate::preferred_framebuffer_format`]'s format with
@@ -236,12 +286,40 @@ fn resolve_off_target(caps: &wgpu::SurfaceCapabilities) -> Result<SurfaceTarget,
 fn wide_gamut_pairing(
     caps: &wgpu::SurfaceCapabilities,
 ) -> Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)> {
-    for &color_space in WIDE_GAMUT_ORDER {
+    pairing(caps, WIDE_GAMUT_ORDER, is_u8)
+}
+
+/// The `Hdr` pairing probe: first extended-range color space reported on a
+/// supported float format.
+fn hdr_pairing(
+    caps: &wgpu::SurfaceCapabilities,
+) -> Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)> {
+    pairing(caps, HDR_ORDER, is_f16)
+}
+
+/// The `WideGamutHdr` pairing probe: first combined wide-gamut extended-range
+/// color space reported on a supported float format.
+fn wide_gamut_hdr_pairing(
+    caps: &wgpu::SurfaceCapabilities,
+) -> Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)> {
+    pairing(caps, WIDE_GAMUT_HDR_ORDER, is_f16)
+}
+
+/// The pairing walk shared by all three preference legs: the first color
+/// space in `order` reported on the first `format_filter` format.
+///
+/// Raw views only (`!format.is_srgb()`): a `*Srgb` format would decode and
+/// then re-interpret the color space (double encoding), whatever the space.
+fn pairing(
+    caps: &wgpu::SurfaceCapabilities,
+    order: &[wgpu::SurfaceColorSpace],
+    format_filter: impl Fn(wgpu::TextureFormat) -> bool,
+) -> Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)> {
+    for &color_space in order {
         for cap in &caps.format_capabilities {
             let format = cap.format;
-            // Raw-view 8-bit only: `*Srgb` formats would decode and then
-            // re-interpret a wide color space (double encoding).
-            if is_u8(format) && !format.is_srgb() && reported(cap.color_spaces, color_space) {
+            if format_filter(format) && !format.is_srgb() && reported(cap.color_spaces, color_space)
+            {
                 return Some((format, color_space));
             }
         }
@@ -257,6 +335,16 @@ fn is_u8(format: wgpu::TextureFormat) -> bool {
         format,
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
     )
+}
+
+/// The float formats egui renders to natively: the HDR pairing class.
+///
+/// Table data: extend when egui renders to more float formats. Must stay in
+/// sync with `renderer.rs`'s `is_float_target` (the dither-off target class)
+/// — enforced by
+/// [`float_target_tables_agree`](super::tests::float_target_tables_agree).
+pub(crate) fn is_f16(format: wgpu::TextureFormat) -> bool {
+    matches!(format, wgpu::TextureFormat::Rgba16Float)
 }
 
 /// Does a reported color-space set include `color_space`?
@@ -349,8 +437,31 @@ mod tests {
         }
     }
 
-    /// Metal: 8-bit surface reporting the wide-gamut P3 space.
+    /// Metal: 8-bit surface reporting the wide-gamut P3 space, plus the fp16
+    /// surface reporting the extended pair — an EDR-capable panel.
     fn metal_like() -> wgpu::SurfaceCapabilities {
+        caps(
+            &[
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba16Float,
+            ],
+            &[
+                (
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    wgpu::SurfaceColorSpaces::SRGB | wgpu::SurfaceColorSpaces::DISPLAY_P3,
+                ),
+                (
+                    wgpu::TextureFormat::Rgba16Float,
+                    wgpu::SurfaceColorSpaces::SRGB
+                        | wgpu::SurfaceColorSpaces::EXTENDED_SRGB
+                        | wgpu::SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
+                ),
+            ],
+        )
+    }
+
+    /// Metal on an SDR panel: wide gamut on 8-bit, no extended spaces at all.
+    fn metal_like_sdr() -> wgpu::SurfaceCapabilities {
         caps(
             &[wgpu::TextureFormat::Bgra8Unorm],
             &[(
@@ -401,6 +512,7 @@ mod tests {
     fn off_leg_matches_preferred_framebuffer_format() {
         for fixture in [
             metal_like(),
+            metal_like_sdr(),
             dxgi_like(),
             float_without_extended(),
             srgb_grammar_p3(),
@@ -448,7 +560,12 @@ mod tests {
 
     #[test]
     fn empty_caps_error_for_every_preference() {
-        for pref in [SurfacePreference::Off, SurfacePreference::WideGamut] {
+        for pref in [
+            SurfacePreference::Off,
+            SurfacePreference::WideGamut,
+            SurfacePreference::Hdr,
+            SurfacePreference::WideGamutHdr,
+        ] {
             let err = decide_surface_target(&empty(), pref).unwrap_err();
             assert!(matches!(err, WgpuError::NoSurfaceFormatsAvailable));
         }
@@ -509,14 +626,101 @@ mod tests {
     }
 
     #[test]
+    fn hdr_grants_extended_srgb_on_fp16() {
+        let (target, status) =
+            decide_surface_target(&metal_like(), SurfacePreference::Hdr).unwrap();
+
+        assert_eq!(
+            target,
+            SurfaceTarget {
+                format: wgpu::TextureFormat::Rgba16Float,
+                color_space: wgpu::SurfaceColorSpace::ExtendedSrgb,
+            }
+        );
+        assert_eq!(status, SurfaceStatus::Granted);
+        assert!(target.is_extended());
+    }
+
+    #[test]
+    fn wide_gamut_hdr_grants_extended_display_p3_on_fp16() {
+        let (target, status) =
+            decide_surface_target(&metal_like(), SurfacePreference::WideGamutHdr).unwrap();
+
+        assert_eq!(
+            target,
+            SurfaceTarget {
+                format: wgpu::TextureFormat::Rgba16Float,
+                color_space: wgpu::SurfaceColorSpace::ExtendedDisplayP3,
+            }
+        );
+        assert_eq!(status, SurfaceStatus::Granted);
+        assert!(target.is_extended());
+    }
+
+    #[test]
+    fn hdr_wide_gamut_hdr_fall_back_to_off_target_without_pairing() {
+        // No extended space anywhere (wide-gamut-only panel, or float without
+        // extended spaces): both HDR legs must land on the Off-identical SDR
+        // target, never a partial grant.
+        for fixture in [metal_like_sdr(), float_without_extended()] {
+            let (off_target, _) = decide_surface_target(&fixture, SurfacePreference::Off).unwrap();
+
+            for pref in [SurfacePreference::Hdr, SurfacePreference::WideGamutHdr] {
+                let (target, status) = decide_surface_target(&fixture, pref).unwrap();
+
+                assert_eq!(target, off_target, "{pref:?}");
+                assert!(!target.is_extended(), "{pref:?}");
+                assert_eq!(
+                    status,
+                    SurfaceStatus::FellBack {
+                        reason: FallbackReason::NoPairedColorSpace { requested: pref },
+                    },
+                    "{pref:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_does_not_take_the_wide_gamut_pairing_and_vice_versa() {
+        // Axis separation: Hdr must not grant the wide-gamut *SDR* pairing
+        // (u8 + DisplayP3), and WideGamut must not grant the extended *HDR*
+        // pairing (fp16 + ExtendedDisplayP3) — each leg only walks its own
+        // table over its own format class.
+        let (_, status) = decide_surface_target(&metal_like_sdr(), SurfacePreference::Hdr).unwrap();
+        assert!(matches!(status, SurfaceStatus::FellBack { .. }));
+
+        let (target, status) =
+            decide_surface_target(&metal_like(), SurfacePreference::WideGamut).unwrap();
+        assert_eq!(
+            target,
+            SurfaceTarget {
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                color_space: wgpu::SurfaceColorSpace::DisplayP3,
+            }
+        );
+        assert_eq!(status, SurfaceStatus::Granted);
+        assert!(
+            !target.is_extended(),
+            "WideGamut is SDR-range by definition"
+        );
+    }
+
+    #[test]
     fn decider_never_returns_an_incoherent_target() {
         for fixture in [
             metal_like(),
+            metal_like_sdr(),
             dxgi_like(),
             float_without_extended(),
             srgb_grammar_p3(),
         ] {
-            for pref in [SurfacePreference::Off, SurfacePreference::WideGamut] {
+            for pref in [
+                SurfacePreference::Off,
+                SurfacePreference::WideGamut,
+                SurfacePreference::Hdr,
+                SurfacePreference::WideGamutHdr,
+            ] {
                 let (target, _) = decide_surface_target(&fixture, pref).unwrap();
 
                 // Never `Auto` (so `dxgi_like` never yields `(Rgba16Float, Auto)`),
@@ -539,11 +743,17 @@ mod tests {
 
         for fixture in [
             metal_like(),
+            metal_like_sdr(),
             dxgi_like(),
             float_without_extended(),
             srgb_grammar_p3(),
         ] {
-            for pref in [SurfacePreference::Off, SurfacePreference::WideGamut] {
+            for pref in [
+                SurfacePreference::Off,
+                SurfacePreference::WideGamut,
+                SurfacePreference::Hdr,
+                SurfacePreference::WideGamutHdr,
+            ] {
                 let (target, _) = decide_surface_target(&fixture, pref).unwrap();
 
                 let config = build_configuration(
@@ -672,6 +882,31 @@ mod tests {
             ),
         ] {
             assert_eq!(target.to_string(), expected);
+        }
+    }
+
+    /// The two float-target tables (the HDR pairing class in this module and
+    /// the dither-off class in `renderer.rs`) must name the same formats: a
+    /// pairing granted by one must be exactly the set whose pipelines dither
+    /// not. Extend both together — this test fails if only one grows.
+    #[test]
+    fn float_target_tables_agree() {
+        for format in [
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureFormat::Rg16Float,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Uint,
+            wgpu::TextureFormat::Depth32Float,
+        ] {
+            assert_eq!(
+                is_f16(format),
+                crate::renderer::is_float_target(format),
+                "{format:?}: the HDR pairing class and the dither-off class diverged"
+            );
         }
     }
 

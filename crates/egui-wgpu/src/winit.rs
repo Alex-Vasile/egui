@@ -13,6 +13,23 @@ use core::num::NonZeroU32;
 use egui::{Context, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
 
+/// How far apart two headroom polls must move before the value counts as
+/// *moving* and the painter keeps scheduling repaints (plan §7).
+///
+/// 0.01 (1% of SDR white) sits far above the float jitter of the OS readings
+/// — so a settled ramp is reliably recognized as steady and egui gets to rest
+/// in `ControlFlow::Wait` — and far below the ~0.1-sized steps of a real
+/// brightness change, so no meaningful ramp is ever missed. A much smaller
+/// epsilon risks polling at ~10 fps forever on noisy readings; a much larger
+/// one stops mid-ramp.
+const HEADROOM_MOVEMENT_EPSILON: f32 = 0.01;
+
+/// The repaint interval while headroom is moving or unsettled (plan §7).
+///
+/// ~10 fps: the EDR ramp lasts ~1–2 s, so this tracks it closely enough at a
+/// total cost of ~20 frames per user brightness change.
+const HEADROOM_REPAINT_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
+
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
 
@@ -24,6 +41,21 @@ struct SurfaceState {
 
     /// Whether the surface preference was granted, or fell back, for this viewport.
     status: SurfaceStatus,
+
+    /// The display headroom (tone-map multiplier above SDR white) of the
+    /// display this viewport's surface is on, as of the last poll.
+    ///
+    /// Polled on the main thread — the winit event loop — at surface
+    /// installation and once per paint ([`DisplayHdrInfo::tone_map_headroom`]
+    /// reads `NSScreen` on Metal; off-thread wgpu logs a warning once
+    /// and returns `None`). [`None`] means unknown: the poll failed, the
+    /// platform reports nothing, or nothing has been polled yet.
+    ///
+    /// Not part of the surface *decision*: it moves with the display's live
+    /// state (brightness slider, EDR ramp), not with the configured pairing.
+    ///
+    /// [`DisplayHdrInfo::tone_map_headroom`]: wgpu::DisplayHdrInfo::tone_map_headroom
+    headroom: Option<f32>,
 
     /// The last monitor this viewport was seen on, used to detect the monitor
     /// changes that trigger a re-decide (plan §7).
@@ -131,6 +163,16 @@ impl Painter {
         self.surfaces
             .get(&viewport_id)
             .map(|state| (state.target, state.status))
+    }
+
+    /// The display headroom (tone-map multiplier above SDR white) of the
+    /// display this viewport's surface is on, as of the last poll.
+    ///
+    /// [`None`] means *unknown* — never fabricated: no surface, no poll yet,
+    /// a failed poll, or a platform that reports nothing.
+    /// `Some(1.0)` is a valid no-headroom steady state.
+    pub fn surface_headroom(&self, viewport_id: ViewportId) -> Option<f32> {
+        self.surfaces.get(&viewport_id)?.headroom
     }
 
     /// Change the surface configuration (present mode, frame latency) at runtime.
@@ -382,12 +424,20 @@ impl Painter {
             );
         }
 
+        // The install-time headroom poll: so the first injected frame already
+        // carries a value. A failed or unsupported poll is `None` (unknown),
+        // never fabricated.
+        let headroom = surface
+            .display_hdr_info(&render_state.adapter)
+            .tone_map_headroom();
+
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
                 surface,
                 target,
                 status,
+                headroom,
                 monitor,
                 width,
                 height,
@@ -712,6 +762,39 @@ impl Painter {
             }
         }
 
+        // Headroom poll (plan §7): live, per-surface display state, re-queried
+        // every frame on the main thread. The value drives no rendering
+        // decision here — it is stored for the per-viewport accessor /
+        // `ViewportInfo` mirror, and it steers the repaint schedule only.
+        {
+            let headroom = surface_state
+                .surface
+                .display_hdr_info(&render_state.adapter)
+                .tone_map_headroom();
+            let moving = match (surface_state.headroom, headroom) {
+                // A known value that changed beyond the epsilon: the EDR ramp
+                // is running (or the user moved the brightness slider).
+                (Some(previous), Some(current)) => {
+                    (current - previous).abs() > HEADROOM_MOVEMENT_EPSILON
+                }
+                // First data after unknown: unsettled — keep polling until it
+                // holds steady.
+                (None, Some(_)) => true,
+                // Unknown stays unknown (poll failure, unsupported platform):
+                // no repaint pressure — an unreportable value must never spin
+                // the event loop.
+                (Some(_) | None, None) => false,
+            };
+            surface_state.headroom = headroom;
+            if moving {
+                // Adaptive repaint (plan §7): ~10 fps for the 1–2 s an EDR
+                // ramp lasts, then egui rests in `ControlFlow::Wait` at zero
+                // cost. Apps wanting faster can repaint themselves.
+                self.context
+                    .request_repaint_after(HEADROOM_REPAINT_INTERVAL);
+            }
+        }
+
         let mut encoder =
             render_state
                 .device
@@ -954,7 +1037,14 @@ impl Painter {
         if let Some(capture_buffer) = capture_buffer
             && let Some(screen_capture_state) = &mut self.screen_capture_state
         {
-            screen_capture_state.read_screen_rgba(capture_buffer, capture_data);
+            // A non-u8 surface (e.g. an extended-range `Rgba16Float` one) has
+            // no 8-bit decoder: the error is loud here instead of the old
+            // silent log-and-drop, and the screenshot callbacks are simply
+            // never completed (same as before — the caller can't be handed
+            // floats through the u8 `ScreenshotCallback` API).
+            if let Err(err) = screen_capture_state.read_screen_rgba(capture_buffer, capture_data) {
+                log::error!("Failed to read back the screen capture: {err}");
+            }
         }
 
         if let Some(output_frame) = output_frame {

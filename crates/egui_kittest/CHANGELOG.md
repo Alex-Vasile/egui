@@ -6,6 +6,11 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+
+### ⭐ Added
+* `WgpuTestRenderer::with_options_and_target(options, target_format, msaa_samples)`: render offscreen harness frames into an explicit target format (e.g. `Rgba16Float` for extended-range numeric tests) with an explicit MSAA sample count — with samples > 1 the pass renders into a same-format multi-sampled intermediate that resolves into the read-back target. Defaults are unchanged (`Rgba8Unorm`, MSAA off)
+
 ## 0.37.0 - 2026-10-15
 ### ⭐ Added
 * Add `diagnostic_max_steps` for a better`ExceededMaxStepsError` [#8421](https://github.com/emilk/egui/pull/8421) by [@lucasmerlin](https://github.com/lucasmerlin)

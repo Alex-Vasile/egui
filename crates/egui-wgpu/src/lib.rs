@@ -31,13 +31,17 @@ pub use setup::{
     WgpuSetupExisting,
 };
 pub use surface_policy::{
-    FallbackReason, SurfacePreference, SurfaceStatus, SurfaceTarget, WIDE_GAMUT_ORDER,
-    build_configuration, decide_surface_target,
+    FallbackReason, HDR_ORDER, SurfacePreference, SurfaceStatus, SurfaceTarget,
+    WIDE_GAMUT_HDR_ORDER, WIDE_GAMUT_ORDER, build_configuration, decide_surface_target,
 };
 
 /// Helpers for capturing screenshots of the UI.
 #[cfg(feature = "capture")]
 pub mod capture;
+
+/// Numeric float readback of rendered `Rgba16Float` frames (tests and
+/// offline verification of extended-range output).
+pub mod readback;
 
 /// Module for painting [`egui`](https://github.com/emilk/egui) with [`wgpu`] on [`winit`].
 #[cfg(feature = "winit")]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use wgpu::{BindGroupLayout, MultisampleState, StoreOp};
 
 use crate::SurfaceTarget;
+use crate::readback::texture_to_float_image;
 
 /// A texture and a buffer for reading the rendered frame back to the cpu.
 ///
@@ -30,7 +31,6 @@ impl CaptureState {
     /// `size` and `format` are those of the surface we would otherwise render to.
     pub fn new(device: &wgpu::Device, size: wgpu::Extent3d, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("texture_copy.wgsl"));
-
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("texture_copy"),
             layout: None,
@@ -88,7 +88,14 @@ impl CaptureState {
             view_formats: &[],
         });
 
-        let padding = BufferPadding::new(size.width);
+        // Per-format texel size: 8 for `Rgba16Float`, 4 for the 8-bit
+        // formats (all capture formats are uncompressed 1×1 blocks). A
+        // 4-bytes-per-pixel pitch on an fp16 capture under-allocates the
+        // readback buffer and fails wgpu validation for any width above 32.
+        let bytes_per_pixel = format
+            .block_copy_size(None)
+            .expect("capture formats always have a block size");
+        let padding = BufferPadding::new(size.width, bytes_per_pixel);
 
         let view = texture.create_view(&Default::default());
 
@@ -194,7 +201,19 @@ impl CaptureState {
     /// This function is non-blocking and will send the data to the given sender when it's ready.
     /// Pass in the buffer returned from [`CaptureState::copy_textures`].
     /// Make sure to call this after the encoder has been submitted.
-    pub fn read_screen_rgba(&self, buffer: wgpu::Buffer, callbacks: Vec<ScreenshotCallback>) {
+    ///
+    /// # Errors
+    /// Returns [`CaptureReadbackError::UnsupportedColorFormat`] for capture
+    /// textures this 8-bit path cannot decode — today [`Rgba16Float`]
+    /// (`wgpu::TextureFormat::Rgba16Float`), the extended-range surface
+    /// format. Use [`Self::read_screen_floats`] to read those back
+    /// losslessly; an 8-bit [`ColorImage`] cannot carry values above 1.0, so
+    /// a silent (or lossy) u8 completion would be wrong.
+    pub fn read_screen_rgba(
+        &self,
+        buffer: wgpu::Buffer,
+        callbacks: Vec<ScreenshotCallback>,
+    ) -> Result<(), CaptureReadbackError> {
         #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
         let buffer = Arc::new(buffer);
         let buffer_clone = Arc::clone(&buffer);
@@ -205,11 +224,8 @@ impl CaptureState {
         let to_rgba = match format {
             wgpu::TextureFormat::Rgba8Unorm => [0, 1, 2, 3],
             wgpu::TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
-            _ => {
-                log::error!(
-                    "Screen can't be captured unless the surface format is Rgba8Unorm or Bgra8Unorm. Current surface format is {format:?}"
-                );
-                return;
+            other => {
+                return Err(CaptureReadbackError::UnsupportedColorFormat(other));
             }
         };
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -249,18 +265,68 @@ impl CaptureState {
                 callback.complete(Arc::clone(&image));
             }
         });
+        Ok(())
+    }
+
+    /// Reads back a capture of an extended-range (`Rgba16Float`) surface as
+    /// float texels, row by row, top to bottom.
+    ///
+    /// Unlike the u8 [`Self::read_screen_rgba`] path this preserves the
+    /// stored values exactly as the GPU wrote them — above 1.0, negative,
+    /// subnormal — so it is how HDR captures are inspected. There is no
+    /// egui callback type for float images, so the result is returned
+    /// directly.
+    ///
+    /// Pass the buffer returned from [`CaptureState::copy_textures`], after
+    /// the encoder has been submitted. Blocks until the data is mapped.
+    ///
+    /// # Errors
+    /// Returns [`CaptureReadbackError::UnsupportedColorFormat`] unless the
+    /// capture texture is `Rgba16Float` (the u8 formats belong to
+    /// [`Self::read_screen_rgba`]).
+    pub fn read_screen_floats(
+        &self,
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+    ) -> Result<Vec<[f32; 4]>, CaptureReadbackError> {
+        let format = self.texture.format();
+        if format != wgpu::TextureFormat::Rgba16Float {
+            return Err(CaptureReadbackError::UnsupportedColorFormat(format));
+        }
+        let size = self.texture.size();
+        Ok(texture_to_float_image(
+            device,
+            buffer,
+            [size.width, size.height],
+            self.padding.padded_bytes_per_row,
+        ))
     }
 }
 
-#[derive(Copy, Clone)]
-struct BufferPadding {
+/// Why a screen capture could not be read back.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureReadbackError {
+    /// The capture texture's format has no decoder on the attempted path.
+    ///
+    /// `Rgba16Float` (extended-range) captures go through
+    /// [`CaptureState::read_screen_floats`]; the u8
+    /// [`CaptureState::read_screen_rgba`] path decodes only
+    /// `Rgba8Unorm` / `Bgra8Unorm`.
+    #[error("no decoder for capture surface format {0:?} on this readback path")]
+    UnsupportedColorFormat(wgpu::TextureFormat),
+}
+
+/// The row pitch of a texture-to-buffer copy: the unpadded row length for
+/// `width` texels of `bytes_per_pixel`, and that length padded to wgpu's
+/// 256-byte `COPY_BYTES_PER_ROW_ALIGNMENT`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferPadding {
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
 }
 
 impl BufferPadding {
-    fn new(width: u32) -> Self {
-        let bytes_per_pixel = core::mem::size_of::<u32>() as u32;
+    fn new(width: u32, bytes_per_pixel: u32) -> Self {
         let unpadded_bytes_per_row = width * bytes_per_pixel;
         let padded_bytes_per_row =
             wgpu::util::align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -511,7 +577,9 @@ mod tests {
                 .expect("failed to write the tagged capture PNG");
             tx.send(()).expect("test channel closed early");
         });
-        capture_state.read_screen_rgba(buffer, vec![callback]);
+        capture_state
+            .read_screen_rgba(buffer, vec![callback])
+            .expect("Rgba8Unorm captures decode on the u8 path");
 
         // `read_screen_rgba` maps the buffer asynchronously; pump the device
         // until the callback runs.
@@ -561,5 +629,154 @@ mod tests {
         assert!(cicp.is_video_full_range_image);
         assert_eq!(output.width, 4);
         assert_eq!(output.height, 4);
+    }
+
+    /// An fp16 capture round-trips values above 1.0 through the float
+    /// readback, and the u8 path reports the loud error instead of silently
+    /// producing nothing (plan §8 PR 3 deliverable 3). Adapter-requiring like
+    /// the other runtime tests: machines without any wgpu adapter skip with
+    /// a message, never silently.
+    #[test]
+    fn fp16_capture_returns_floats_and_u8_path_errors_loudly() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            },
+        )) {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!(
+                        "skipping fp16_capture_returns_floats_and_u8_path_errors_loudly: no wgpu adapter: {err}"
+                    );
+                }
+                return;
+            }
+        };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("egui-wgpu fp16 capture test"),
+            ..Default::default()
+        }))
+        .expect("failed to request a wgpu device for the fp16 capture test");
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the fp16 capture test: {err}");
+        }));
+
+        // Width 40 forces the fp16 row pitch past wgpu's 256-byte alignment
+        // (40 × 8 B = 320 → 512), and past the 4-bytes-per-pixel pitch that a
+        // u8-only readback would compute (40 × 4 = 160 → 256 < 320): a
+        // regression to the u8 pitch fails validation loudly here.
+        let size = wgpu::Extent3d {
+            width: 40,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        let mut capture_state = CaptureState::new(&device, size, wgpu::TextureFormat::Rgba16Float);
+
+        // Paint an HDR value into the capture texture: red at 2.0× SDR white.
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fp16 capture test hdr fill"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r"
+                @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                    var pos = array<vec2<f32>, 3>(
+                        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+                    return vec4<f32>(pos[i], 0.0, 1.0);
+                }
+                @fragment fn fs_main() -> @location(0) vec4<f32> {
+                    return vec4<f32>(2.0, 0.0, 0.0, 1.0);
+                }
+                ",
+            )),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fp16 capture test hdr fill"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::TextureFormat::Rgba16Float.into())],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let view = capture_state.texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fp16 capture test"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fp16 capture test fill"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+
+        let buffer = capture_state.copy_textures(&device, None, &mut encoder);
+        queue.submit([encoder.finish()]);
+
+        // The u8 path must refuse loudly, not silently produce nothing.
+        assert_eq!(
+            capture_state.read_screen_rgba(buffer.clone(), vec![]),
+            Err(CaptureReadbackError::UnsupportedColorFormat(
+                wgpu::TextureFormat::Rgba16Float
+            ))
+        );
+
+        // The float path returns the stored values: 2.0 survives the round
+        // trip on every pixel (f16 store of 2.0 is exact).
+        let floats = capture_state
+            .read_screen_floats(&device, &buffer)
+            .expect("Rgba16Float captures decode on the float path");
+        assert_eq!(floats.len(), 80);
+        for texel in &floats {
+            assert_eq!(texel, &[2.0, 0.0, 0.0, 1.0]);
+        }
+
+        // And a u8 capture is the float path's error, symmetrically.
+        let mut u8_capture = CaptureState::new(&device, size, wgpu::TextureFormat::Rgba8Unorm);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fp16 capture test u8 copy"),
+        });
+        let u8_buffer = u8_capture.copy_textures(&device, None, &mut encoder);
+        queue.submit([encoder.finish()]);
+        assert_eq!(
+            u8_capture.read_screen_floats(&device, &u8_buffer),
+            Err(CaptureReadbackError::UnsupportedColorFormat(
+                wgpu::TextureFormat::Rgba8Unorm
+            ))
+        );
     }
 }

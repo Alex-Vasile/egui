@@ -696,7 +696,7 @@ impl WgpuWinitRunning<'_> {
 
             // Surface the (possibly just-stored) surface decision before the
             // info is cloned into the input below:
-            inject_surface_decision(painter, viewport_id, info);
+            inject_surface_state(painter, viewport_id, info);
 
             let Some(egui_winit) = egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -1204,15 +1204,18 @@ fn is_viewport_or_descendant_visible(viewports: &Viewports, viewport_id: Viewpor
     })
 }
 
-/// Mirror the painter's current surface decision for a viewport into its
-/// [`ViewportInfo`], so the app sees it as input the same frame.
+/// Mirror the painter's current per-viewport surface state — decision
+/// (target + status) and display headroom — into its [`ViewportInfo`], so the
+/// app sees it as input the same frame.
 ///
-/// A viewport without a surface decision right now (no surface yet, or the
-/// surface was torn down) gets `None`: an unknown decision is never
-/// fabricated, and a stale one is never left behind. The glow and web
-/// backends use their own painters and never call this, so their fields
-/// stay `None`.
-fn inject_surface_decision(
+/// A viewport without a surface right now (no surface yet, or the surface was
+/// torn down) gets `None` for every field: an unknown decision is never
+/// fabricated, and a stale one is never left behind. Headroom follows the
+/// same clearing rule, and can additionally be `None` while a surface exists
+/// (a failed poll or a platform that reports nothing — unknown is never
+/// fabricated). The glow and web backends use their own painters and never
+/// call this, so their fields stay `None`.
+fn inject_surface_state(
     painter: &egui_wgpu::winit::Painter,
     viewport_id: ViewportId,
     info: &mut ViewportInfo,
@@ -1224,6 +1227,7 @@ fn inject_surface_decision(
         info.surface_status = None;
         info.surface_target = None;
     }
+    info.hdr_headroom = painter.surface_headroom(viewport_id);
 }
 
 fn render_immediate_viewport(
@@ -1276,7 +1280,7 @@ fn render_immediate_viewport(
 
         // Surface the decision from the previous paint (this viewport's
         // `set_window` happens further down, before painting):
-        inject_surface_decision(painter, ids.this, &mut viewport.info);
+        inject_surface_state(painter, ids.this, &mut viewport.info);
 
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports

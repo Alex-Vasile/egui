@@ -84,9 +84,21 @@ pub fn create_render_state(
     .expect("Failed to create render state")
 }
 
-/// Utility to render snapshots from a [`crate::Harness`] using [`egui_wgpu`].
+/// Utility to render snapshots from a [`Harness`](crate::Harness) using [`egui_wgpu`].
 pub struct WgpuTestRenderer {
     render_state: RenderState,
+
+    /// The offscreen target format. [`wgpu::TextureFormat::Rgba8Unorm`] unless
+    /// overridden — e.g. to `Rgba16Float` for extended-range numeric tests
+    /// (plan §8 PR 3 deliverable 2: an explicit override, not the decider —
+    /// a surfaceless viewport stays `FellBack { NoSurface }`).
+    target_format: wgpu::TextureFormat,
+
+    /// MSAA sample count for the offscreen pass; 1 = off (default). The
+    /// pipeline is built for this count, and with more than one the pass
+    /// renders into a same-format multi-sampled intermediate that resolves
+    /// into the target (plan §9).
+    msaa_samples: u32,
 }
 
 impl Default for WgpuTestRenderer {
@@ -98,22 +110,28 @@ impl Default for WgpuTestRenderer {
 impl WgpuTestRenderer {
     /// Create a new [`WgpuTestRenderer`] with the default setup.
     pub fn new() -> Self {
-        Self {
-            render_state: create_render_state(
-                default_wgpu_setup(),
-                egui_wgpu::RendererOptions::PREDICTABLE,
-            ),
-        }
+        Self::with_options_and_target(
+            egui_wgpu::RendererOptions::PREDICTABLE,
+            OFFSCREEN_TARGET_FORMAT,
+            1,
+        )
     }
 
     /// Create a new [`WgpuTestRenderer`] with the given setup.
     pub fn from_setup(setup: WgpuSetup) -> Self {
         Self {
             render_state: create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE),
+            target_format: OFFSCREEN_TARGET_FORMAT,
+            msaa_samples: 1,
         }
     }
 
     /// Create a new [`WgpuTestRenderer`] from an existing [`RenderState`].
+    ///
+    /// The offscreen target stays [`wgpu::TextureFormat::Rgba8Unorm`] and MSAA
+    /// stays off; for other targets / sample counts use
+    /// [`Self::with_options_and_target`] with the same render options the
+    /// [`RenderState`] was built with.
     ///
     /// # Panics
     /// Panics if the [`RenderState`] has been used before.
@@ -126,13 +144,46 @@ impl WgpuTestRenderer {
                 .is_none(),
             "The RenderState passed in has been used before, pass in a fresh RenderState instead."
         );
-        Self { render_state }
+        Self {
+            render_state,
+            target_format: OFFSCREEN_TARGET_FORMAT,
+            msaa_samples: 1,
+        }
     }
 
     /// Create a new [`WgpuTestRenderer`] with custom render options.
+    ///
+    /// A `msaa_samples` above 1 in `options` gets the same intermediate +
+    /// resolve treatment as [`Self::with_options_and_target`].
     pub fn with_render_options(options: egui_wgpu::RendererOptions) -> Self {
+        Self::with_options_and_target(
+            options,
+            OFFSCREEN_TARGET_FORMAT,
+            options.msaa_samples.max(1),
+        )
+    }
+
+    /// Create a new [`WgpuTestRenderer`] rendering into `target_format` with
+    /// `msaa_samples` (1 = off), e.g. `Rgba16Float` + 4 for an MSAA-on-fp16
+    /// test.
+    ///
+    /// `options.msaa_samples` must agree with `msaa_samples` — the multisample
+    /// count is baked into the render pipeline.
+    pub fn with_options_and_target(
+        options: egui_wgpu::RendererOptions,
+        target_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> Self {
+        let msaa_samples = msaa_samples.max(1);
+        assert_eq!(
+            options.msaa_samples.max(1),
+            msaa_samples,
+            "RendererOptions::msaa_samples must match the requested msaa_samples"
+        );
         Self {
             render_state: create_render_state(default_wgpu_setup(), options),
+            target_format,
+            msaa_samples,
         }
     }
 }
@@ -193,7 +244,7 @@ impl crate::TestRenderer for WgpuTestRenderer {
             &mut encoder,
             &tessellated,
             &screen,
-            OFFSCREEN_TARGET_FORMAT,
+            self.target_format,
         );
 
         let texture = self
@@ -209,20 +260,49 @@ impl crate::TestRenderer for WgpuTestRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: OFFSCREEN_TARGET_FORMAT,
+                format: self.target_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // MSAA (plan §9): with samples > 1 the pass renders into a
+        // multi-sampled intermediate — same format as the target — that
+        // resolves into `texture`, which is what gets read back.
+        let (view, resolve_target) = if self.msaa_samples > 1 {
+            let intermediate = self
+                .render_state
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Egui Texture (MSAA intermediate)"),
+                    size: wgpu::Extent3d {
+                        width: screen.size_in_pixels[0],
+                        height: screen.size_in_pixels[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: self.msaa_samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.target_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+            (
+                intermediate.create_view(&wgpu::TextureViewDescriptor::default()),
+                Some(&texture_view),
+            )
+        } else {
+            (texture_view.clone(), None)
+        };
+
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Egui Render Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &texture_view,
-                        resolve_target: None,
+                        view: &view,
+                        resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
@@ -233,7 +313,7 @@ impl crate::TestRenderer for WgpuTestRenderer {
                 })
                 .forget_lifetime();
 
-            renderer.render(&mut pass, &tessellated, &screen, OFFSCREEN_TARGET_FORMAT);
+            renderer.render(&mut pass, &tessellated, &screen, self.target_format);
         }
 
         self.render_state

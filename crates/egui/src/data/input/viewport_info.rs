@@ -131,6 +131,22 @@ pub struct ViewportInfo {
     /// [`Self::surface_status`]. [`None`] means unknown — same conditions as
     /// [`Self::surface_status`].
     pub surface_target: Option<String>,
+
+    /// The display headroom this viewport's surface is currently presenting
+    /// with: the linear multiplier above SDR reference white the display can
+    /// drive before clipping (e.g. `Some(2.5)` = values up to 2.5× SDR white
+    /// are shown, not clipped).
+    ///
+    /// [`None`] means *unknown* — never treat it as a no-headroom steady
+    /// state: the backend does not poll (glow, web), the viewport has no
+    /// surface (headless), or the platform reports nothing (e.g. iOS, where
+    /// the wgpu TODO names `UIScreen.currentEDRHeadroom` as the missing
+    /// path). [`Some(1.0)`](Some) *is* a valid no-headroom steady state, as
+    /// reported for definitively-SDR displays.
+    ///
+    /// Polled per frame by wgpu-based backends (the winit painter; the value
+    /// ramps over ~1–2 s when the display brightness changes).
+    pub hdr_headroom: Option<f32>,
 }
 
 impl ViewportInfo {
@@ -179,6 +195,7 @@ impl ViewportInfo {
             occluded: self.occluded,
             surface_status: self.surface_status,
             surface_target: self.surface_target.clone(),
+            hdr_headroom: self.hdr_headroom,
         }
     }
 
@@ -198,6 +215,7 @@ impl ViewportInfo {
             occluded,
             surface_status,
             surface_target,
+            hdr_headroom,
         } = self;
 
         crate::Grid::new("viewport_info").show(ui, |ui| {
@@ -257,6 +275,10 @@ impl ViewportInfo {
             ui.label(surface_target.as_deref().unwrap_or(""));
             ui.end_row();
 
+            ui.label("HDR headroom:");
+            ui.label(opt_as_str(hdr_headroom));
+            ui.end_row();
+
             let visible = self.visible();
 
             ui.label("Visible:");
@@ -287,6 +309,7 @@ mod tests {
         let info = ViewportInfo::default();
         assert_eq!(info.surface_status, None);
         assert_eq!(info.surface_target, None);
+        assert_eq!(info.hdr_headroom, None);
     }
 
     #[cfg(all(feature = "serde", feature = "ron"))]
@@ -295,6 +318,7 @@ mod tests {
         let mut info = ViewportInfo {
             surface_status: Some(SurfaceStatus::FellBack(FallbackReason::NoPairedColorSpace)),
             surface_target: Some("Bgra8Unorm + DisplayP3".to_owned()),
+            hdr_headroom: Some(1.5),
             ..Default::default()
         };
 
@@ -302,6 +326,7 @@ mod tests {
         assert_eq!(ron::from_str::<ViewportInfo>(&serialized).unwrap(), info);
 
         info.surface_status = Some(SurfaceStatus::Granted);
+        info.hdr_headroom = None;
         let serialized = ron::to_string(&info).unwrap();
         assert_eq!(ron::from_str::<ViewportInfo>(&serialized).unwrap(), info);
 

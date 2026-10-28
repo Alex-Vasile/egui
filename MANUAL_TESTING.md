@@ -1,33 +1,37 @@
-# Manual testing — wide-gamut surface (PR 1)
+# Manual testing — wide-gamut + HDR surface (PR 1 + PR 3)
 
 **"Tested" means "this checklist passes."** Everything below exercises the
-parts of the wide-gamut surface work that a machine cannot judge: what a
-compositor does with the surface, and what a panel does with the colors.
-Each step is marked **CI cannot validate this.**
+parts of the surface work that a machine cannot judge: what a compositor does
+with the surface, and what a panel does with the colors. Each step is marked
+**CI cannot validate this.**
 
 ## Instruments
 
 | Command | What it shows |
 |---|---|
-| `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamut`, asserts the surfaced decision is coherent, logs the pairing, exits 0 after a few frames. |
+| `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamutHdr`, asserts the surfaced decision is coherent **and that display headroom is reported from the first frame** (`None` fails), logs the pairing + headroom, exits 0 after a few frames. |
 | `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target` and a full-width 2×3 primaries grid canvas (bold "sRGB primaries" / "display primaries" labels sandwich it) — top row the sRGB primaries converted at runtime into the granted color space's encoding, bottom row the display's native primaries as full-range bytes ((255, 0, 0), (0, 255, 0), (0, 0, 255)). |
+| `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` swatches (values above 1.0) through the real upload→pipeline→surface path; with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
 
-The log line `Surface decision: Bgra8Unorm + DisplayP3 (Granted)` (or the
-example's on-screen readout) is the primary reading throughout.
+The log line `Surface decision: Rgba16Float + ExtendedDisplayP3 (Granted),
+headroom 1.2×` (or the example's on-screen readout) is the primary reading
+throughout.
 
-Expected pairings on this PR, by panel:
+Expected readings on this PR, by instrument and panel (the preference differs
+per instrument: the smoke asks for `WideGamutHdr`, the other two examples for
+`WideGamut`):
 
-| Panel | Expected `surface_status` | Expected `surface_target` |
-|---|---|---|
-| P3-capable (EDR iMac, Pro Display XDR, recent MacBook panels) | `Granted` | `Bgra8Unorm + DisplayP3` |
-| SDR panel reporting SRGB | `FellBack(NoPairedColorSpace)` | `Bgra8Unorm + Srgb` |
-| Headless / no surface (offscreen harness) | `None` (fields unset) | `None` |
+| Instrument / panel | Expected `surface_status` | Expected `surface_target` | Expected `hdr_headroom` |
+|---|---|---|---|
+| `hdr_smoke` on an EDR panel (EDR iMac, Pro Display XDR, recent MacBook panels) | `Granted` | `Rgba16Float + ExtendedDisplayP3` | the live EDR multiplier (`> 1.0`; ramps over ~1–2 s after a brightness change, then rests) |
+| `hdr_smoke` on an SDR panel reporting SRGB | `FellBack(NoPairedColorSpace)` | `Bgra8Unorm + Srgb` | `Some(1.0)` (the definitively-SDR guard pins it) |
+| `hdr_wide_gamut` / `hdr_float_image` (WideGamut) on any P3-reporting panel | `Granted` | `Bgra8Unorm + DisplayP3` | same headroom column as above (it is a display property, not a preference property) |
+| Headless / no surface (offscreen harness) | `None` (fields unset) | `None` | `None` (unknown — never fabricated) |
 
 Caveat: macOS reports what the *screen mode* offers, not what the panel can
 show — some SDR displays still get `DisplayP3`. That grant is correct; the
 *out-of-sRGB saturation* then needs an actually-P3-capable panel to be
-visible. Headroom readout (`hdr_headroom`) arrives with PR 3 and is
-deliberately absent from this checklist.
+visible.
 
 ## How to interpret PNG dumps
 
@@ -62,7 +66,11 @@ Rules of thumb:
   presentation engine interpreted.
 - cICP cannot express *extended* range (values beyond `[0, 1]`). 8-bit
   captures are clamped anyway; extended-range (`Rgba16Float`) surfaces are
-  not capturable by the 8-bit capture path today.
+  **not capturable through the 8-bit `ScreenshotCallback` path** — it now
+  fails loudly (`CaptureReadbackError::UnsupportedColorFormat`) instead of
+  silently producing nothing. Lossless inspection of such a capture goes
+  through `CaptureState::read_screen_floats` (float texels, values above 1.0
+  preserved).
 
 ## macOS — the only runtime-verified platform
 
@@ -119,20 +127,28 @@ Rules of thumb:
 
 ### D. Interaction checkboxes (plan §9)
 
-- **`present_with_transaction` jitter-fix × wide gamut × drag-resize**:
-  run `cargo run -p eframe --example hdr_wide_gamut --features
+- **`present_with_transaction` jitter-fix × HDR × drag-resize**: run
+  `cargo run -p eframe --example hdr_wide_gamut --features
   egui-wgpu/macos-window-resize-jitter-fix` on a P3 display and drag-resize
-  the window continuously for ~10 s. Expected: no jitter, no
-  wgpu validation errors in the log (reconfigures rebuild from the viewport's
-  stored decision). The HDR leg of this checkbox is *not testable in PR 1* —
-  it activates with PR 3 (fp16 surface); wide gamut is the PR 1 stand-in.
+  the window continuously for ~10 s. Expected: no jitter, no wgpu validation
+  errors in the log (reconfigures rebuild from the viewport's stored
+  decision). **CI cannot validate this.**
+- **HDR surface × drag-resize** (the fp16 leg activates with PR 3): run
+  `hdr_smoke`-style `WideGamutHdr` (e.g. temporarily point `hdr_wide_gamut`
+  at `SurfacePreference::WideGamutHdr`) on an EDR display and drag-resize for
+  ~10 s. Expected: no jitter, no validation errors; the fp16 surface
+  reconfigures from the stored decision. **CI cannot validate this.**
+- **Transparency: compositor behavior of premultiplied >1.0 content** (the
+  fp16 surface and >1.0 content exist since PR 2b/PR 3): with a transparent
+  window on a compositor that honors extended-range alpha, premultiplied
+  >1.0 content must composite without halos or clamping artifacts.
   **CI cannot validate this.**
-- **Transparency: compositor behavior of premultiplied >1.0 content**: *not
-  testable in PR 1* — content above 1.0 arrives with PR 3 (float content).
-  The checkbox is recorded here for PR 3: with a transparent window on a
-  compositor that honors extended-range alpha, premultiplied >1.0 content
-  must composite without halos or clamping artifacts. **CI cannot validate
-  this.**
+- **Headroom reactivity**: on an EDR Mac, run `hdr_wide_gamut` and drag the
+  display-brightness slider (or toggle an HDR video next to it). Expected:
+  the `HDR headroom` readout follows the ~1–2 s EDR ramp (the painter
+  schedules ~100 ms repaints while it moves) and then rests — the process
+  idles in `ControlFlow::Wait` at 0% CPU once the value is steady.
+  **CI cannot validate this.**
 
 ## Windows — manual-only
 

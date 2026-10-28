@@ -162,7 +162,12 @@ fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     // This step is optional for egui backends.
     // Note that dithering is performed on the gamma encoded values,
     // because this function is used together with a srgb converting target.
-    if r_locals.dithering == 1 {
+    //
+    // `DITHER_CAPABLE` is a compile-time constant declared by `renderer.rs`'s
+    // `shader_source` when it concatenates this module: `false` for float
+    // targets, which have no 8-bit quantizer for the noise to hide in, so the
+    // dither application is compiled out for their pipelines (plan §3).
+    if DITHER_CAPABLE && r_locals.dithering == 1 {
         let out_color_gamma_rgb = dither_interleaved(out_color_gamma.rgb, 256.0, in.position);
         out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);
     }
@@ -177,7 +182,9 @@ fn fs_main_gamma_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     var out_color_gamma = in.color * tex_gamma;
     // Dither the float color down to eight bits to reduce banding.
     // This step is optional for egui backends.
-    if r_locals.dithering == 1 {
+    // `DITHER_CAPABLE`: see `fs_main_linear_framebuffer` above — compile-time
+    // constant, `false` for float targets (plan §3).
+    if DITHER_CAPABLE && r_locals.dithering == 1 {
         let out_color_gamma_rgb = dither_interleaved(out_color_gamma.rgb, 256.0, in.position);
         out_color_gamma = vec4<f32>(out_color_gamma_rgb, out_color_gamma.a);
     }

@@ -201,9 +201,15 @@ pub struct RendererOptions {
 
     /// Controls whether to apply dithering to minimize banding artifacts.
     ///
-    /// Dithering assumes an sRGB output and thus will apply noise to any input value that lies between
-    /// two 8bit values after applying the sRGB OETF function, i.e. if it's not a whole 8bit value in "gamma space".
-    /// This means that only inputs from texture interpolation and vertex colors should be affected in practice.
+    /// Dithering assumes an 8-bit sRGB target; float targets never dither —
+    /// their pipelines are built from a shader module with the dither
+    /// application compiled out, regardless of this knob (a float target has
+    /// no 8-bit quantizer for the noise to hide in; plan §3).
+    ///
+    /// On an 8-bit target the noise applies to any input value that lies
+    /// between two 8bit values in "gamma space". This means that only inputs
+    /// from texture interpolation and vertex colors should be affected in
+    /// practice.
     ///
     /// Defaults to true.
     pub dithering: bool,
@@ -251,8 +257,15 @@ pub struct Renderer {
     /// a color-space change is a surface reconfigure, never a pipeline change.
     pipelines: Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
 
-    /// The egui shader module, from which all pipelines in the cache are built.
+    /// The egui shader module, from which all pipelines for 8-bit targets are
+    /// built (dithering compiled in).
     shader_module: wgpu::ShaderModule,
+
+    /// The egui shader module for float targets (`Rgba16Float`), with the
+    /// dither application compiled out regardless of
+    /// [`RendererOptions::dithering`] — a float target has no 8-bit quantizer
+    /// for the noise to hide in (plan §3). See [`Self::shader_source`].
+    shader_module_float_target: wgpu::ShaderModule,
 
     /// The pipeline layout, shared by all pipelines in the cache.
     pipeline_layout: wgpu::PipelineLayout,
@@ -305,6 +318,25 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// The WGSL source for one shader module: the shared transfer functions
+    /// and entry points, prefixed by the compile-time dither gate.
+    ///
+    /// Two modules are built in [`Self::new`]: `DITHER_CAPABLE = true` for
+    /// 8-bit targets and `false` for float targets. The gate is declared here
+    /// — not in `egui.wgsl` — because the two variants must differ in exactly
+    /// this one constant and WGSL has no way to inject it into the file.
+    /// Keeping every other line identical (the same `include_str!` calls
+    /// concatenated in the same order) is what keeps one source of truth for
+    /// the shader math; the float module is the 8-bit module with dithering
+    /// compiled out (plan §3).
+    fn shader_source(dither_capable: bool) -> String {
+        format!(
+            "const DITHER_CAPABLE: bool = {dither_capable};\n{}\n{}",
+            include_str!("egui_transfer.wgsl"),
+            include_str!("egui.wgsl")
+        )
+    }
+
     /// Creates a renderer for a egui UI.
     ///
     /// Render pipelines are created lazily, keyed by the format of the
@@ -314,32 +346,41 @@ impl Renderer {
     pub fn new(device: &wgpu::Device, options: RendererOptions) -> Self {
         profiling::function_scope!();
 
-        let shader = wgpu::ShaderModuleDescriptor {
-            label: Some("egui"),
-            // The module is the shared transfer functions (`egui_transfer.wgsl`)
-            // concatenated with the entry points (`egui.wgsl`); the CPU↔GPU
-            // round-trip test concatenates the same helpers with its own entry
-            // points, so both exercise the same WGSL source. The allocation is
-            // once per `Renderer::new`, never per frame.
-            //
-            // Two maintainer traps:
-            // - WGSL error messages report line numbers against the
-            //   CONCATENATED source. To find a reported line in `egui.wgsl`,
-            //   subtract `egui_transfer.wgsl`'s line count plus the join
-            //   newline.
-            // - Nothing validates this concatenation at build time: `cargo
-            //   check`, clippy and the wasm32 CI job never parse WGSL. The
-            //   first validation of any edit to either file is this call, on
-            //   a machine with a real wgpu adapter.
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
-                "{}\n{}",
-                include_str!("egui_transfer.wgsl"),
-                include_str!("egui.wgsl")
-            ))),
+        let shader_for = |dither_capable| {
+            wgpu::ShaderModuleDescriptor {
+                label: Some(if dither_capable {
+                    "egui"
+                } else {
+                    "egui (float target, dither off)"
+                }),
+                // The module is the shared transfer functions (`egui_transfer.wgsl`)
+                // concatenated with the entry points (`egui.wgsl`), behind the
+                // one-line `DITHER_CAPABLE` prologue; the CPU↔GPU round-trip test
+                // concatenates the same helpers with its own entry points, so both
+                // exercise the same WGSL source. The allocation is twice per
+                // `Renderer::new` (the two variants), never per frame. Both
+                // variants have identical line numbering — a WGSL error reports
+                // the same line whichever module it came from.
+                //
+                // Two maintainer traps:
+                // - WGSL error messages report line numbers against the
+                //   CONCATENATED source: subtract `egui_transfer.wgsl`'s line
+                //   count, the join newline, and the one-line dither-gate
+                //   prologue to land on `egui.wgsl`.
+                // - Nothing validates this concatenation at build time: `cargo
+                //   check`, clippy and the wasm32 CI job never parse WGSL. The
+                //   first validation of any edit to either file is this call, on
+                //   a machine with a real wgpu adapter.
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(Self::shader_source(dither_capable))),
+            }
         };
         let module = {
             profiling::scope!("create_shader_module");
-            device.create_shader_module(shader)
+            device.create_shader_module(shader_for(true))
+        };
+        let module_float_target = {
+            profiling::scope!("create_shader_module_float_target");
+            device.create_shader_module(shader_for(false))
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -450,6 +491,7 @@ impl Renderer {
         Self {
             pipelines: Mutex::new(HashMap::default()),
             shader_module: module,
+            shader_module_float_target: module_float_target,
             pipeline_layout,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
@@ -490,9 +532,14 @@ impl Renderer {
             return;
         }
 
+        let module = if is_float_target(target_format) {
+            &self.shader_module_float_target
+        } else {
+            &self.shader_module
+        };
         let pipeline = Arc::new(create_pipeline(
             device,
-            &self.shader_module,
+            module,
             &self.pipeline_layout,
             &self.options,
             target_format,
@@ -1432,6 +1479,21 @@ fn texture_flags(nearest: bool, wrap_mode: u32) -> usize {
     (nearest | (wrap_mode << 1)) as usize
 }
 
+/// The float render-target formats whose pipelines never dither.
+///
+/// A float target has no 8-bit quantizer for the dither noise to hide in; on
+/// such targets the noise is harmful, not meaningless (plan §3), so their
+/// pipelines are built from the dither-free shader module regardless of
+/// [`RendererOptions::dithering`]. 8-bit targets keep today's behavior
+/// bit-for-bit.
+///
+/// Table data: extend when egui renders to more float target formats (keep in
+/// sync with `is_f16` in `surface_policy.rs`, the HDR pairing class —
+/// enforced by `surface_policy`'s `float_target_tables_agree` test).
+pub(crate) fn is_float_target(format: wgpu::TextureFormat) -> bool {
+    matches!(format, wgpu::TextureFormat::Rgba16Float)
+}
+
 fn create_sampler(
     options: epaint::textures::TextureOptions,
     device: &wgpu::Device,
@@ -1945,46 +2007,6 @@ fn fs_test(in: TestVOut) -> TestFOut {
         inputs
     }
 
-    /// Decode IEEE 754 binary16 bits to `f32`.
-    ///
-    /// Hand-rolled to keep the test dependency-free; sanity-checked by
-    /// [`f16_bits_to_f32_known_values`] below.
-    fn f16_bits_to_f32(h: u16) -> f32 {
-        let sign = u32::from(h & 0x8000) << 16;
-        let exp = u32::from((h >> 10) & 0x1f);
-        let frac = u32::from(h & 0x03ff);
-        let magnitude = match exp {
-            0 if frac == 0 => 0, // ±0
-            0 => {
-                // Subnormal: normalize. `ilog2` is the index of the highest
-                // set bit within the 10-bit fraction field.
-                let msb = frac.ilog2();
-                ((103 + msb) << 23) | ((frac << (23 - msb)) & 0x007f_ffff)
-            }
-            31 => 0x7f80_0000 | (frac << 13), // inf / NaN
-            exp => ((exp + 112) << 23) | (frac << 13),
-        };
-        f32::from_bits(sign | magnitude)
-    }
-
-    #[test]
-    fn f16_bits_to_f32_known_values() {
-        assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
-        assert_eq!(f16_bits_to_f32(0xBC00), -1.0);
-        assert_eq!(f16_bits_to_f32(0x0000), 0.0);
-        assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0f32.to_bits());
-        assert_eq!(f16_bits_to_f32(0x8000), 0.0);
-        assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(f16_bits_to_f32(0x8400), -2.0f32.powi(-14)); // sign + min normal
-        assert_eq!(f16_bits_to_f32(0xC400), -4.0);
-        assert_eq!(f16_bits_to_f32(0x0400), 2.0f32.powi(-14)); // smallest normal
-        assert_eq!(f16_bits_to_f32(0x0001), 2.0f32.powi(-24)); // smallest subnormal
-        assert_eq!(f16_bits_to_f32(0x03FF), 1023.0 * 2.0f32.powi(-24));
-        assert_eq!(f16_bits_to_f32(0x3555), 0.333_251_95);
-        assert_eq!(f16_bits_to_f32(0x7C00), f32::INFINITY);
-        assert!(f16_bits_to_f32(0x7E00).is_nan());
-    }
-
     /// Smallest positive normal `f16` (= 2⁻¹⁴); below it half-precision steps
     /// are subnormal-sized, so a relative tolerance would explode.
     const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
@@ -2018,41 +2040,7 @@ fn fs_test(in: TestVOut) -> TestFOut {
         size: u32,
         bytes_per_row: u32,
     ) -> Vec<[f32; 4]> {
-        let slice = buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).expect("readback receiver hung up");
-        });
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(Duration::from_secs(10)),
-            })
-            .expect("GPU poll failed while waiting for the readback map");
-        receiver
-            .recv()
-            .expect("readback sender hung up")
-            .expect("failed to map the readback buffer");
-
-        let data = slice
-            .get_mapped_range()
-            .expect("failed to map the readback buffer");
-        let mut pixels = Vec::with_capacity((size * size) as usize);
-        for row in 0..size {
-            for col in 0..size {
-                let offset = (row * bytes_per_row + col * 8) as usize; // 4 × f16
-                let texel: [u16; 4] = bytemuck::cast_slice(&data[offset..offset + 8])
-                    .try_into()
-                    .expect("each f16 texel is exactly eight bytes");
-                pixels.push([
-                    f16_bits_to_f32(texel[0]),
-                    f16_bits_to_f32(texel[1]),
-                    f16_bits_to_f32(texel[2]),
-                    f16_bits_to_f32(texel[3]),
-                ]);
-            }
-        }
-        pixels
+        crate::readback::texture_to_float_image(device, buffer, [size, size], bytes_per_row)
     }
 
     /// Round-trips the REAL production WGSL transfer functions against the
@@ -2862,5 +2850,623 @@ fn fs_test(in: TestVOut) -> TestFOut {
         }));
 
         Some((device, queue))
+    }
+
+    // -----------------------------------------------------------------------
+    // PR 3 — fp16 extended-range pipelines (plan §8 PR 3 test matrix).
+    //
+    // All render through the PRODUCTION `Renderer` (pipeline cache, uniform
+    // path, dither module choice) onto offscreen `Rgba16Float` targets, and
+    // read back through the shared `crate::readback` decoder. The content is
+    // gamma-encoded contract-layout `FloatImage` (plan §4), so the CPU-side
+    // expectations are exact up to the one f16 quantization the content type
+    // performs.
+    // -----------------------------------------------------------------------
+
+    /// Screen size of the one-quad scenes below: 16×2 px, so the 16-texel
+    /// content row maps 1:1 and the row pitch (16 × 8 B = 128) forces the
+    /// 256-byte padding.
+    const HDR_SCENE_W: u32 = 16;
+    const HDR_SCENE_H: u32 = 2;
+
+    /// The gamma-encoded content of the numeric scene: one texel per column,
+    /// both rows identical. Layout per plan §4: premultiplied in the encoded
+    /// components (alpha 1 ⇒ identity), unclamped above 1.0, odd-symmetric
+    /// for negatives.
+    fn numeric_scene_texels() -> Vec<[f32; 4]> {
+        let values: [f32; HDR_SCENE_W as usize] = [
+            epaint::ecolor::gamma_from_linear(0.25),
+            epaint::ecolor::gamma_from_linear(0.5),
+            epaint::ecolor::gamma_from_linear(0.75),
+            epaint::ecolor::gamma_from_linear(0.04), // the toe region
+            epaint::ecolor::gamma_from_linear(0.003_130_8), // the encode knee
+            epaint::ecolor::gamma_from_linear(1e-6), // encodes into f16 subnormals
+            1.0,                                     // SDR reference white
+            2.0,                                     // the classic HDR headroom value
+            10.0,                                    // deep headroom
+            65504.0, // f16 max: the value must not round-trip to inf
+            -1.0,
+            -0.5,
+            -4.0,
+            0.0,
+            -0.0,
+            1e-5, // a positive f16-subnormal
+        ];
+        values
+            .iter()
+            .chain(values.iter()) // both scene rows identical, row-major
+            .map(|&v| [v, v, v, 1.0])
+            .collect()
+    }
+
+    /// One full-viewport quad textured with `texture_id`, in the layout
+    /// `update_buffers` consumes (the UV grid maps the quad onto a
+    /// `HDR_SCENE_W × 1` content image).
+    fn textured_quad(texture_id: epaint::TextureId) -> epaint::Mesh {
+        let [sw, sh] = [f32::from(HDR_SCENE_W as u16), f32::from(HDR_SCENE_H as u16)];
+        let uv = |x: f32, y: f32| epaint::Pos2::new(x / HDR_SCENE_W as f32, y);
+        let vertices = [
+            (epaint::Pos2::ZERO, uv(0.0, 0.0)),
+            (epaint::Pos2::new(sw, 0.0), uv(HDR_SCENE_W as f32, 0.0)),
+            (epaint::Pos2::new(sw, sh), uv(HDR_SCENE_W as f32, 1.0)),
+            (epaint::Pos2::new(0.0, sh), uv(0.0, 1.0)),
+        ]
+        .map(|(pos, uv)| epaint::Vertex {
+            pos,
+            uv,
+            color: epaint::Color32::WHITE,
+        });
+        epaint::Mesh {
+            indices: vec![0, 1, 2, 0, 2, 3],
+            vertices: vertices.to_vec(),
+            texture_id,
+        }
+    }
+
+    /// Renders one mesh through the production `Renderer` onto an offscreen
+    /// target (`msaa_samples` > 1 goes through an intermediate multi-sampled
+    /// attachment resolved into the target — the plumbing deliverable) and
+    /// returns the copied readback buffer, ready for
+    /// [`crate::readback::texture_to_float_image`] (float formats) or the u8
+    /// decode (8-bit formats).
+    fn render_scene(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        target_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+        mesh: epaint::Mesh,
+    ) -> wgpu::Buffer {
+        let screen = ScreenDescriptor {
+            size_in_pixels: [HDR_SCENE_W, HDR_SCENE_H],
+            pixels_per_point: 1.0,
+        };
+        let clip = epaint::ClippedPrimitive {
+            clip_rect: epaint::Rect::from_min_size(
+                epaint::Pos2::ZERO,
+                epaint::vec2(HDR_SCENE_W as f32, HDR_SCENE_H as f32),
+            ),
+            primitive: epaint::Primitive::Mesh(mesh),
+        };
+        let primitives = [clip];
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let user_cmd_bufs = renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            &primitives,
+            &screen,
+            target_format,
+        );
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pr3 scene target"),
+            size: wgpu::Extent3d {
+                width: HDR_SCENE_W,
+                height: HDR_SCENE_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let (view, resolve_target) = if msaa_samples > 1 {
+            let intermediate = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("pr3 scene msaa intermediate"),
+                size: wgpu::Extent3d {
+                    width: HDR_SCENE_W,
+                    height: HDR_SCENE_H,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: msaa_samples,
+                dimension: wgpu::TextureDimension::D2,
+                format: target_format, // §9: the intermediate uses the target format
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            (
+                intermediate.create_view(&wgpu::TextureViewDescriptor::default()),
+                Some(&target_view),
+            )
+        } else {
+            (target_view.clone(), None)
+        };
+
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pr3 scene pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            renderer.render(&mut pass, &primitives, &screen, target_format);
+        }
+
+        queue.submit(core::iter::chain(user_cmd_bufs, [encoder.finish()]));
+
+        // Copy the target into a pitch-padded buffer (256-byte alignment).
+        // The scenes only use the two uncompressed RGBA targets.
+        let bytes_per_pixel = match target_format {
+            wgpu::TextureFormat::Rgba16Float => 8,
+            wgpu::TextureFormat::Rgba8Unorm => 4,
+            other => {
+                unreachable!("the scenes only render to Rgba8Unorm/Rgba16Float, got {other:?}")
+            }
+        };
+        let bytes_per_row = wgpu::util::align_to(
+            HDR_SCENE_W * bytes_per_pixel,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        );
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pr3 scene readback"),
+            size: u64::from(bytes_per_row * HDR_SCENE_H),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: HDR_SCENE_W,
+                height: HDR_SCENE_H,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        readback
+    }
+
+    /// Reads back a pitch-padded `Rgba8Unorm` copy as float texels in
+    /// `[0, 1]` (premultiplied), matching [`crate::readback`]'s shape.
+    fn read_u8_pixels(
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+        size: [u32; 2],
+        bytes_per_row: u32,
+    ) -> Vec<[f32; 4]> {
+        assert_eq!(
+            u64::from(bytes_per_row * size[1]),
+            buffer.size(),
+            "readback buffer size must match size × bytes_per_row"
+        );
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).expect("readback receiver hung up");
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed while waiting for the u8 readback map");
+        receiver
+            .recv()
+            .expect("readback sender hung up")
+            .expect("failed to map the u8 readback buffer");
+        let data = slice
+            .get_mapped_range()
+            .expect("failed to map the u8 readback buffer");
+        let mut texels = Vec::with_capacity((size[0] * size[1]) as usize);
+        for row in 0..size[1] {
+            let row_start = (row * bytes_per_row) as usize;
+            for col in 0..size[0] {
+                let offset = row_start + (col * 4) as usize;
+                let texel: [u8; 4] = data[offset..offset + 4]
+                    .try_into()
+                    .expect("each RGBA8 texel is exactly four bytes");
+                texels.push(texel.map(f32::from).map(|v| v / 255.0));
+            }
+        }
+        texels
+    }
+
+    /// The expected readback of `numeric_scene_texels` content: the CPU f16
+    /// quantization the content type performs (round-to-nearest). The path is
+    /// value-exact beyond that — zero-copy upload, exact 1.0× multiply in the
+    /// shader, exact `a=1` premultiplied blend, f16-exact store — so these
+    /// are compared for equality, not within a tolerance.
+    fn expected_numeric_texels() -> Vec<[f32; 4]> {
+        numeric_scene_texels()
+            .iter()
+            .map(|texel| texel.map(half::f16::from_f32).map(half::f16::to_f32))
+            .collect()
+    }
+
+    /// The §8 PR 3 numeric matrix: known-linear rows surface as
+    /// `gamma_from_linear` within f16 quantization (±2⁻¹¹ relative in the
+    /// normal range, subnormal carve-out); 2.0, 10.0 and near-f16-max survive
+    /// upload→shader→blend; negatives stay odd-symmetric. Adapter-requiring
+    /// (2a conventions).
+    #[test]
+    fn fp16_extended_surface_preserves_contract_values() {
+        let Some((device, queue)) = test_device("fp16_extended_surface_preserves_contract_values")
+        else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let texels = numeric_scene_texels();
+        let flat: Vec<f32> = texels.iter().flat_map(|t| *t).collect();
+        let image = epaint::FloatImage::from_rgba(
+            [HDR_SCENE_W as usize, HDR_SCENE_H as usize],
+            epaint::Primaries::Srgb,
+            &flat,
+        );
+        let id = epaint::TextureId::Managed(401);
+        renderer.update_texture(
+            &device,
+            &queue,
+            id,
+            &epaint::ImageDelta::full(image, epaint::textures::TextureOptions::NEAREST),
+        );
+        assert!(
+            renderer.texture(&id).is_some(),
+            "Srgb-tagged content on an sRGB surface must upload"
+        );
+
+        let readback = render_scene(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+            1,
+            textured_quad(id),
+        );
+        let pixels = crate::readback::texture_to_float_image(
+            &device,
+            &readback,
+            [HDR_SCENE_W, HDR_SCENE_H],
+            wgpu::util::align_to(HDR_SCENE_W * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+        );
+
+        let expected = expected_numeric_texels();
+        let inputs = numeric_scene_texels();
+        for (i, pixel) in pixels.iter().enumerate() {
+            let want = expected[i];
+            let raw = inputs[i % HDR_SCENE_W as usize];
+            // Exactness of the pass-through (the contract's stored value).
+            assert_eq!(*pixel, want, "texel {i}: exact f16 pass-through");
+            // The §8 numeric bound for the gamma-encoded rows, stated against
+            // the unquantized value: ±2⁻¹¹ relative (half an f16 step) in the
+            // normal range, an absolute carve-out in the subnormal range.
+            for lane in 0..3 {
+                let (gpu, cpu) = (pixel[lane], raw[lane]);
+                if cpu.abs() < 6.103_515_6e-5 {
+                    assert!(
+                        (gpu - cpu).abs() <= 1.192_092_9e-7,
+                        "texel {i} lane {lane}: subnormal {cpu} -> {gpu}"
+                    );
+                } else if cpu != 0.0 {
+                    assert!(
+                        !gpu.is_nan() && (gpu - cpu).abs() <= cpu.abs() * 4.882_812_5e-4,
+                        "texel {i} lane {lane}: {cpu} -> {gpu} (±2⁻¹¹ relative)"
+                    );
+                }
+            }
+            assert_eq!(pixel[3], 1.0, "texel {i}: alpha stays 1.0");
+        }
+    }
+
+    /// Dithering is structural per target class (plan §3): with the knob ON,
+    /// the u8 target dithers (frame differs from the knob-OFF frame — today's
+    /// behavior, regression guard for the gate), and the fp16 target does NOT
+    /// (knob-ON frame bit-identical to the knob-OFF frame, and two repeats
+    /// bit-identical). The probe is a bilinear gradient — vertex colors sit
+    /// exactly on 8-bit codes, which is precisely why the knob only ever
+    /// mattered for interpolated values. Adapter-requiring.
+    #[test]
+    fn dither_applies_on_u8_and_never_on_fp16() {
+        let Some((device, queue)) = test_device("dither_applies_on_u8_and_never_on_fp16") else {
+            return;
+        };
+
+        // Two renderers of the same scene, differing only in the knob.
+        let mut dither_on = Renderer::new(&device, RendererOptions::default());
+        let mut dither_off = Renderer::new(&device, RendererOptions::PREDICTABLE);
+        dither_on.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        dither_off.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+
+        // A 2-texel gradient, LINEAR-filtered, stretched over the viewport:
+        // every pixel interpolates to a value between 8-bit codes.
+        let gradient = || {
+            epaint::FloatImage::from_rgba(
+                [2, 1],
+                epaint::Primaries::Srgb,
+                &[0.25, 0.25, 0.25, 1.0, 0.75, 0.75, 0.75, 1.0],
+            )
+        };
+        let scene = |renderer: &mut Renderer, id: epaint::TextureId| {
+            renderer.update_texture(
+                &device,
+                &queue,
+                id,
+                &epaint::ImageDelta::full(gradient(), epaint::textures::TextureOptions::LINEAR),
+            );
+        };
+        let (on_id, off_id) = (
+            epaint::TextureId::Managed(402),
+            epaint::TextureId::Managed(403),
+        );
+        scene(&mut dither_on, on_id);
+        scene(&mut dither_off, off_id);
+
+        let fp16_pitch = wgpu::util::align_to(HDR_SCENE_W * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let u8_pitch = wgpu::util::align_to(HDR_SCENE_W * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let fp16 = |renderer: &mut Renderer, id| {
+            let readback = render_scene(
+                &device,
+                &queue,
+                renderer,
+                wgpu::TextureFormat::Rgba16Float,
+                1,
+                textured_quad(id),
+            );
+            crate::readback::texture_to_float_image(
+                &device,
+                &readback,
+                [HDR_SCENE_W, HDR_SCENE_H],
+                fp16_pitch,
+            )
+        };
+        let u8 = |renderer: &mut Renderer, id| {
+            let readback = render_scene(
+                &device,
+                &queue,
+                renderer,
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+                textured_quad(id),
+            );
+            read_u8_pixels(&device, &readback, [HDR_SCENE_W, HDR_SCENE_H], u8_pitch)
+        };
+
+        let fp16_on = fp16(&mut dither_on, on_id);
+        let fp16_on_repeat = fp16(&mut dither_on, on_id);
+        let fp16_off = fp16(&mut dither_off, off_id);
+        let u8_on = u8(&mut dither_on, on_id);
+        let u8_off = u8(&mut dither_off, off_id);
+
+        // Two frames of the same fp16 scene: bit-identical.
+        assert_eq!(fp16_on, fp16_on_repeat, "two frames of the same fp16 scene");
+
+        // The knob cannot reach fp16: forcing it off changes nothing.
+        assert_eq!(
+            fp16_on, fp16_off,
+            "fp16 frames must be identical with dithering on and off"
+        );
+
+        // The knob still works on u8: at least one pixel dithers to a
+        // different code.
+        assert_ne!(
+            u8_on, u8_off,
+            "the u8 path must still dither with the knob on"
+        );
+    }
+
+    /// A [0,1] SDR scene through the fp16 path matches the u8-path output
+    /// within tolerance (§2: ≤ ½-code drift where the u8 path quantized at
+    /// store; the bound absorbs blend-precision drift between targets).
+    /// Adapter-requiring.
+    #[test]
+    fn sdr_scene_matches_u8_path_on_fp16() {
+        let Some((device, queue)) = test_device("sdr_scene_matches_u8_path_on_fp16") else {
+            return;
+        };
+
+        let mut renderer = Renderer::new(&device, RendererOptions::PREDICTABLE);
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let sdr_values: Vec<[f32; 4]> = (0..HDR_SCENE_W)
+            .map(|x| {
+                let v = epaint::ecolor::gamma_from_linear(x as f32 / (HDR_SCENE_W - 1) as f32);
+                [v, v, v, 1.0]
+            })
+            .collect();
+        let sdr_flat: Vec<f32> = sdr_values.iter().flat_map(|t| *t).collect();
+        let image = epaint::FloatImage::from_rgba(
+            [HDR_SCENE_W as usize, 1],
+            epaint::Primaries::Srgb,
+            &sdr_flat,
+        );
+        let id = epaint::TextureId::Managed(403);
+        renderer.update_texture(
+            &device,
+            &queue,
+            id,
+            &epaint::ImageDelta::full(image, epaint::textures::TextureOptions::NEAREST),
+        );
+        let quad = textured_quad(id);
+
+        let fp16_readback = render_scene(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+            1,
+            quad.clone(),
+        );
+        let fp16 = crate::readback::texture_to_float_image(
+            &device,
+            &fp16_readback,
+            [HDR_SCENE_W, HDR_SCENE_H],
+            wgpu::util::align_to(HDR_SCENE_W * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+        );
+        let u8_readback = render_scene(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            quad,
+        );
+        let u8 = read_u8_pixels(
+            &device,
+            &u8_readback,
+            [HDR_SCENE_W, HDR_SCENE_H],
+            wgpu::util::align_to(HDR_SCENE_W * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+        );
+
+        assert_eq!(fp16.len(), u8.len());
+        for (i, (f, u)) in fp16.iter().zip(u8.iter()).enumerate() {
+            for lane in 0..4 {
+                assert!(
+                    (f[lane] - u[lane]).abs() <= 2.0 / 255.0,
+                    "texel {i} lane {lane}: fp16 {f:?} vs u8 {u:?} drifted beyond a code"
+                );
+            }
+        }
+    }
+
+    /// MSAA on fp16 resolves (§9): the multi-sampled intermediate (same
+    /// format as the target) resolves into the single-sampled target and the
+    /// content survives. Skips with a message — never silent-pass — when the
+    /// adapter cannot resolve `Rgba16Float` (§9's apple1x caveat).
+    /// Adapter-requiring.
+    #[test]
+    fn msaa_fp16_resolves_content() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })) {
+                Ok(adapter) => adapter,
+                Err(err) => {
+                    #[expect(clippy::print_stderr)]
+                    {
+                        eprintln!("skipping msaa_fp16_resolves_content: no wgpu adapter: {err}");
+                    }
+                    return;
+                }
+            };
+        let format_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float);
+        if !format_features
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE)
+        {
+            #[expect(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "skipping msaa_fp16_resolves_content: adapter ({:?}) cannot resolve Rgba16Float (§9 apple1x caveat)",
+                    adapter.get_info().name
+                );
+            }
+            return;
+        }
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("msaa fp16 resolve test"),
+            ..Default::default()
+        }))
+        .expect("failed to request a wgpu device for the msaa fp16 resolve test");
+        device.on_uncaptured_error(Arc::new(|err| {
+            panic!("wgpu device error during the msaa fp16 resolve test: {err}");
+        }));
+
+        // The pipeline must be built for 4× MSAA (multisample.count).
+        let mut renderer = Renderer::new(
+            &device,
+            RendererOptions {
+                msaa_samples: 4,
+                ..RendererOptions::PREDICTABLE
+            },
+        );
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let msaa_values: Vec<[f32; 4]> = (0..HDR_SCENE_W)
+            .map(|x| {
+                let v = 1.0 + x as f32; // HDR: 1..17, all above SDR white
+                [v, v, v, 1.0]
+            })
+            .collect();
+        let msaa_flat: Vec<f32> = msaa_values.iter().flat_map(|t| *t).collect();
+        let image = epaint::FloatImage::from_rgba(
+            [HDR_SCENE_W as usize, 1],
+            epaint::Primaries::Srgb,
+            &msaa_flat,
+        );
+        let id = epaint::TextureId::Managed(404);
+        renderer.update_texture(
+            &device,
+            &queue,
+            id,
+            &epaint::ImageDelta::full(image, epaint::textures::TextureOptions::NEAREST),
+        );
+
+        let readback = render_scene(
+            &device,
+            &queue,
+            &mut renderer,
+            wgpu::TextureFormat::Rgba16Float,
+            4,
+            textured_quad(id),
+        );
+        let pixels = crate::readback::texture_to_float_image(
+            &device,
+            &readback,
+            [HDR_SCENE_W, HDR_SCENE_H],
+            wgpu::util::align_to(HDR_SCENE_W * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+        );
+
+        assert_eq!(pixels.len(), (HDR_SCENE_W * HDR_SCENE_H) as usize);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let x = (i % HDR_SCENE_W as usize) as f32;
+            let want = half::f16::from_f32(1.0 + x).to_f32();
+            assert_eq!(
+                pixel[0], pixel[1],
+                "texel {i}: resolved content must be uniform per texel"
+            );
+            for (lane, v) in pixel.iter().take(3).enumerate() {
+                assert_eq!(*v, want, "texel {i} lane {lane}: resolved {want} damaged");
+            }
+        }
     }
 }
