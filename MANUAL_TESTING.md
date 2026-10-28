@@ -157,14 +157,28 @@ The `color_edit_button_hdr` + `swatch_hdr` row at the bottom of
 an exposure in stops (−6..=+6, ¼-step); the effective color is
 `rgb × 2^stops`, 1.0 = SDR reference white.
 
-Design note (the part that looks like a bug but isn't): the picker's slider
-*ramps* (R/G/B and exposure gradients) are 8-bit `Color32` gradients, so they
-clamp at SDR reference white — on an EDR panel the exposure ramp reads flat
-white past 1.0 instead of brightening. That is per plan §6, which reserves
-float display for the flat swatches (a ramp is a gradient, not a swatch).
-The true result of an edit always shows in the left preview swatch (float
-path) and the `swatch_hdr`, both of which render above white on an extended
-surface; the right preview swatch shows the SDR clamp.
+Design note: the picker's R/G/B slider ramps are 8-bit `Color32` gradients —
+their domains are 0..=1, there is nothing above white to show, so they clamp
+at SDR reference white by construction. The **exposure slider is the
+exception**: its ramp is a float texture (`FloatImage::exposure_ramp`, plan
+§6's axis-aligned texture carve-out — this supersedes the earlier "all slider
+gradients are u8" decision for the exposure axis), so on an extended-range
+surface it *brightens past SDR white* where the display's headroom allows.
+The dashed vertical line over the ramp marks where that headroom ends
+(`ViewportInfo::hdr_headroom`, re-read every frame). The line is realtime
+*because the picker keeps itself awake*: while the popup is open the slider
+schedules ~10 fps repaints — a display-brightness change arrives as no
+window event, and PR 3's painter-side adaptive repaint only runs on paints,
+so without them the line would freeze once the headroom value is steady.
+Cost tradeoff: ~10 fps of a small popup window, only while editing — the
+moment the picker closes the requests stop and the app returns to §7's
+zero-cost rest. Line rules: headroom `None` (unknown) hides the line; a
+boundary below the shown −6..=+6 range clamps to the left edge; a boundary
+at or above the range hides the line (nothing on the ramp clips). The true
+result of an edit always also shows in the left preview swatch (float path)
+and the `swatch_hdr`, both of which render above white on an extended
+surface; the right preview swatch shows the SDR clamp (they show the
+*current value*, the ramp shows the *axis*).
 
 1. Run `hdr_float_image` (it requests `WideGamutHdr`) on an EDR Mac.
    Expected: `Granted` with an fp16 extended pairing
@@ -172,20 +186,31 @@ surface; the right preview swatch shows the SDR clamp.
    the effective color as **brightness above SDR white** — drag the
    exposure slider past 0 stops and the swatch visibly glows above the
    surrounding UI, peaking at 1.0 × 2⁶ = 64× SDR white. In the opened
-   picker, the two preview swatches differ above SDR white: the left one
-   (float-texture path) is brighter, the right one (clamped `Color32`)
-   sits at SDR white. **CI cannot validate this.**
+   picker, the exposure ramp itself glows past the SDR-white point, and the
+   dashed line sits at the live headroom boundary: everything right of it
+   clips at the display's white, everything left of it is shown in full.
+   Change the display brightness (System Settings → Displays) **without
+   touching the mouse**: the line tracks it within ~100 ms — that tracking
+   is exactly what the picker's own ~10 fps polling buys. The two preview
+   swatches differ above SDR white: the left one (float-texture path) is
+   brighter, the right one (clamped `Color32`) sits at SDR white. **CI
+   cannot validate this.**
 2. Same command on an SDR panel (deterministic `FellBack` onto the sRGB
    target). Expected: the swatch clamps at white once the effective value
    exceeds 1.0 — pushing the exposure slider runs it into flat white and
    stopping there — and in the picker the two preview swatches coincide at
-   the clamp. That is the correct §7 behavior, made visible by the
-   pair. **CI cannot validate this.**
+   the clamp. The ramp clamps white from the 0-stops mark onward, and the
+   dashed line sits at the exact center: `hdr_headroom` is `Some(1.0)` (SDR
+   white = 0 stops), so everything right of it clips. That is the correct
+   §7 behavior, made visible by the pair. **CI cannot validate this.**
 3. Cache sanity (any panel): scrub a channel slider back and forth — the
    swatch updates without texture churn or flicker (swatch textures are
    cached per 8-bit encoded color bucket, 256 entries, cleared wholesale
    at the cap; a cap overflow is invisible beyond a one-frame re-upload).
-   **CI cannot validate this.**
+   Drag the exposure slider: the ramp must not churn at all mid-drag —
+   ramp textures are keyed by the color bucket + stops range, not by the
+   current value, so one texture serves the whole drag. **CI cannot
+   validate this.**
 
 ## Windows — manual-only
 

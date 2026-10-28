@@ -5,6 +5,7 @@ use crate::{
     Context, DragValue, Id, Painter, Popup, PopupCloseBehavior, Response, Role, Sense,
     TextureHandle, TextureId, Ui, Widget as _, WidgetInfo, epaint, lerp, remap_clamp,
 };
+use core::time::Duration;
 use epaint::{
     ColorImage, CornerRadius, FloatImage, Rect, RectShape, RoundedRect, Shape, Stroke, StrokeKind,
     Vec2,
@@ -244,6 +245,194 @@ fn color_slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color
     }
 
     response
+}
+
+/// The exposure slider of the HDR color picker: an HDR ramp swept over the
+/// current color's exposure axis, with the dashed headroom-boundary line on top.
+///
+/// The slider body is the float texture from [`FloatImage::exposure_ramp`] (the
+/// plan §6 carve-out covers this axis-aligned rect), painted across the slider
+/// rect: on an extended-range surface the ramp is *brighter than SDR white*
+/// where the display's headroom allows — the whole point of exposing the
+/// exposure axis. The R/G/B channel sliders above it stay 8-bit `color_slider_1d`
+/// gradients (their domains are 0..=1, nothing to show above white).
+///
+/// The texture is painted with the same mechanism as [`paint_gradient`] (a
+/// textured [`RectShape`]) rather than the `Image` widget, so the ramp, the
+/// interaction, and the accessibility node all share one rect: in a justified
+/// layout the `Image` widget paints its aligned size but *reports* the full
+/// justified rect, which would desync the pointer→stops mapping from the
+/// visible ramp. It also keeps the ramp as wide as the R/G/B sliders beside it.
+///
+/// Interaction matches [`color_slider_1d`]: the pointer's x position maps to
+/// stops across `MIN_EXPOSURE_STOPS..=MAX_EXPOSURE_STOPS`, the write marks the
+/// response changed (a bare interact never derives `changed` on its own), and
+/// the stored value is quantized to ¼ stops.
+///
+/// The headroom line is *realtime while the picker is open*: the value is
+/// re-read from the current viewport's `ViewportInfo` every frame this widget
+/// is drawn, and the widget schedules a ~10 fps repaint itself. That polling
+/// is needed because PR 3's painter-side adaptive repaint only runs *on
+/// paints*: once the headroom is steady the painter schedules nothing and egui
+/// rests in `ControlFlow::Wait` — and a display-brightness change produces no
+/// winit event, so without the widget's own requests the line would freeze
+/// until an unrelated repaint. This widget only runs while the popup is open
+/// ([`Popup::show`] runs its content only then), so the requests stop the
+/// moment the picker closes and the app returns to its zero-cost rest; the
+/// cost while editing is ~10 fps of a small popup window.
+fn hdr_exposure_slider(ui: &mut Ui, hdr: &mut HdrColor) -> Response {
+    let min = HdrColor::MIN_EXPOSURE_STOPS;
+    let max = HdrColor::MAX_EXPOSURE_STOPS;
+    let desired_size = vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
+    let (rect, mut response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());
+
+    let mut exposure_norm = remap_clamp(hdr.exposure_stops, min..=max, 0.0..=1.0);
+    if let Some(mpos) = response.interact_pointer_pos() {
+        exposure_norm = remap_clamp(mpos.x, rect.left()..=rect.right(), 0.0..=1.0);
+        let stops = lerp(min..=max, exposure_norm);
+        hdr.exposure_stops = (stops / 0.25).round() * 0.25; // ¼-stop steps
+        // The value was written from the pointer: that IS a change. A bare
+        // interact never derives `changed` on its own (the 2a-era fix).
+        response.mark_changed();
+    }
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+
+        // The ramp: the cached float texture, linearly sampled across the
+        // rect. It sweeps the current color over the exposure axis — it
+        // depends on rgb but NOT on the current stops value, so the cached
+        // texture is stable for the whole drag (no churn while dragging).
+        // Same half-texel uv inset as `paint_gradient`, so the edges sample
+        // the exact endpoint columns.
+        let texture_id = exposure_ramp_texture_id(ui.ctx(), hdr.rgb, min, max);
+        let inset_x = 0.5 / HDR_EXPOSURE_RAMP_WIDTH as f32;
+        let uv = Rect::from_min_max(pos2(inset_x, 0.5), pos2(1.0 - inset_x, 0.5));
+        ui.painter().add(
+            RectShape::filled(rect, visuals.corner_radius, Color32::WHITE)
+                .with_texture(texture_id, uv),
+        );
+
+        // The outline the other sliders have. A plain u8 stroke *over* a float
+        // texture is fine — §6 forbids HDR-colored strokes, not strokes on top.
+        // (A textured `RectShape` cannot carry its own stroke: the stroke
+        // vertices would sample the same texture.)
+        ui.painter().rect_stroke(
+            rect,
+            visuals.corner_radius,
+            visuals.bg_stroke,
+            StrokeKind::Inside,
+        );
+
+        // Show where the slider is at (same marker as `color_slider_1d`, the
+        // encoded color at the current stops — a vertex color caps at 1.0,
+        // which is all a marker needs).
+        let x = lerp(rect.left()..=rect.right(), exposure_norm);
+        let factor = lerp(min..=max, exposure_norm).exp2();
+        let picked_color = Color32::from_rgb(
+            gamma_u8_from_linear_f32(hdr.rgb[0] * factor),
+            gamma_u8_from_linear_f32(hdr.rgb[1] * factor),
+            gamma_u8_from_linear_f32(hdr.rgb[2] * factor),
+        );
+        let r = rect.height() / 4.0;
+        ui.painter().add(Shape::convex_polygon(
+            vec![
+                pos2(x, rect.center().y),   // tip
+                pos2(x + r, rect.bottom()), // right bottom
+                pos2(x - r, rect.bottom()), // left bottom
+            ],
+            picked_color,
+            Stroke::new(visuals.fg_stroke.width, contrast_color(picked_color)),
+        ));
+
+        // The headroom boundary, live. `None` headroom (unknown) draws nothing.
+        //
+        // Keep frames flowing while the picker is open: the painter-side
+        // adaptive repaint (PR 3) only polls *on paints*, so once the headroom
+        // is steady nothing is scheduled and egui rests in `ControlFlow::Wait`
+        // — and a brightness change arrives as no winit event at all. Without
+        // this request the line would freeze until an unrelated repaint. This
+        // code only runs while the popup is open, so the ~10 fps polling (and
+        // its small cost) ends the moment the picker closes.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        let headroom = ui.input(|input| input.viewport().hdr_headroom);
+        if let Some(fraction) = headroom_line_fraction(headroom, min, max) {
+            paint_headroom_line(ui, rect, fraction);
+        }
+    }
+
+    response.widget_info(|| {
+        // The value the screen reader announces is the edited quantity
+        // (stops), not the slider's internal 0..1 normalization.
+        WidgetInfo::slider(
+            ui.is_enabled(),
+            f64::from(lerp(min..=max, exposure_norm)),
+            "Exposure (¼-stop)",
+        )
+    });
+
+    response
+}
+
+/// The headroom boundary as a fraction across the exposure ramp
+/// (`0.0` = left edge, `1.0` = right edge), or `None` for "no line".
+///
+/// `hdr_headroom` is the viewport's display headroom multiplier (1.0 = SDR
+/// reference white). The ramp clips where its linear value exceeds the
+/// headroom, i.e. at `stops = log2(headroom)`; this normalizes that stop over
+/// the shown `stops_min..=stops_max` range.
+///
+/// Rules:
+/// * `None` headroom means *unknown* (non-wgpu backend, no surface yet, or a
+///   platform that reports nothing): no line — an unknown boundary is never
+///   fabricated.
+/// * A non-positive or NaN headroom is a broken report (never a valid
+///   multiplier): clamped to the left edge — total over f32, never NaN.
+/// * A boundary below the shown range (headroom ≤ `2^stops_min`) clamps to the
+///   left edge: everything right of it clips, which is real information.
+/// * A boundary at or above the shown range (headroom ≥ `2^stops_max`) hides the
+///   line: nothing on the ramp clips, and a line hugging the right edge would
+///   read as decoration rather than information. (Below the max the line is
+///   clamped to 1.0, so it slides off the right edge as the headroom rises.)
+pub(crate) fn headroom_line_fraction(
+    hdr_headroom: Option<f32>,
+    stops_min: f32,
+    stops_max: f32,
+) -> Option<f32> {
+    let headroom = hdr_headroom?;
+    if headroom.is_nan() || headroom <= 0.0 {
+        // A non-positive (or NaN) headroom is a broken report, not an unknown:
+        // `log2` of either is −inf/NaN, so clamp it to the left edge instead of
+        // propagating NaN into draw coordinates.
+        return Some(0.0);
+    }
+    if headroom >= stops_max.exp2() {
+        return None;
+    }
+    Some(((headroom.log2() - stops_min) / (stops_max - stops_min)).clamp(0.0, 1.0))
+}
+
+/// The dashed headroom line over the ramp: a vertical line at `fraction` across
+/// `rect`, drawn in two passes — a dark halo under a light core — so it reads
+/// on both themes and over both the dim and the (potentially very bright) parts
+/// of the ramp. Clipped to the ramp rect: the dashes never bleed outside.
+fn paint_headroom_line(ui: &Ui, rect: Rect, fraction: f32) {
+    let x = lerp(rect.left()..=rect.right(), fraction);
+    let path = [pos2(x, rect.top()), pos2(x, rect.bottom())];
+    let painter = ui.painter().with_clip_rect(rect);
+
+    painter.extend(Shape::dashed_line(
+        &path,
+        Stroke::new(3.0, Color32::from_black_alpha(196)),
+        4.0,
+        4.0,
+    ));
+    painter.extend(Shape::dashed_line(
+        &path,
+        Stroke::new(1.0, Color32::WHITE),
+        4.0,
+        4.0,
+    ));
 }
 
 /// # Arguments
@@ -725,10 +914,16 @@ impl Default for HdrColor {
     }
 }
 
-/// How many cached swatch textures to keep before clearing the whole cache
-/// (dropping the handles and with them the textures). There is no
-/// individual eviction; the cap bounds the cache.
-const HDR_SWATCH_CACHE_CAP: usize = 256;
+/// How many textures each HDR widget texture cache (the flat swatches and the
+/// exposure ramps) keeps before the whole cache is cleared — dropping the
+/// handles and with them the textures. There is no individual eviction; the
+/// cap bounds the cache.
+const HDR_TEXTURE_CACHE_CAP: usize = 256;
+
+/// Texel width of a cached exposure ramp: fixed regardless of the on-screen
+/// slider width (the texture is linearly sampled across whatever rect it is
+/// stretched over), so a texture never churns with layout.
+const HDR_EXPOSURE_RAMP_WIDTH: usize = 256;
 
 /// Show a swatch of the true HDR color.
 ///
@@ -887,37 +1082,25 @@ fn color_picker_hdr(ui: &mut Ui, hdr: &mut HdrColor) -> bool {
         changed = true;
     }
 
-    // Exposure in stops, −6..=+6 in ¼-stop steps. The gradient sweeps the
-    // exposure over the current color, encoded + clamped: the ramp is u8,
-    // so past SDR white it reads flat white even on an extended-range
-    // surface (§6 reserves float display for the flat swatches) — the true
-    // result is the preview swatch below, not the ramp.
-    let min = HdrColor::MIN_EXPOSURE_STOPS;
-    let max = HdrColor::MAX_EXPOSURE_STOPS;
-    let mut exposure_norm = remap_clamp(hdr.exposure_stops, min..=max, 0.0..=1.0);
-    let exposure = color_slider_1d(ui, &mut exposure_norm, |t| {
-        let factor = lerp(min..=max, t).exp2();
-        Color32::from_rgb(encode(r * factor), encode(g * factor), encode(b * factor))
-    });
-    exposure.widget_info(|| {
-        // The value the screen reader announces is the edited quantity
-        // (stops), not the slider's internal 0..1 normalization.
-        WidgetInfo::slider(
-            ui.is_enabled(),
-            f64::from(lerp(min..=max, exposure_norm)),
-            "Exposure (¼-stop)",
-        )
-    });
+    // Exposure in stops, −6..=+6 in ¼-stop steps, as an HDR ramp: the slider
+    // body is a float texture (`FloatImage::exposure_ramp` — §6's carve-out
+    // covers this axis-aligned rect), so on an extended-range surface it
+    // brightens past SDR white where the display's headroom allows, instead of
+    // reading flat white. The dashed line over it is the headroom boundary,
+    // re-read from the viewport's `ViewportInfo` every frame; the slider keeps
+    // its own ~10 fps repaints going while the picker is open (a brightness
+    // change is no winit event, so without them the line would freeze once the
+    // value is steady). The true-vs-clamped preview below stays: the ramp
+    // shows the *axis*, the preview swatches show the *current value*.
+    let exposure = hdr_exposure_slider(ui, hdr);
     if exposure
         .on_hover_text(format!(
-            "Exposure: {:+.2} stops (the ramp itself clamps at SDR white — the preview swatch \
-             below shows the true brightness)",
+            "Exposure: {:+.2} stops (the ramp shows true brightness on an extended-range surface; \
+             the dashed line marks the display's headroom boundary)",
             clamp_stops(hdr.exposure_stops)
         ))
         .changed()
     {
-        let stops = lerp(min..=max, exposure_norm);
-        hdr.exposure_stops = (stops / 0.25).round() * 0.25; // ¼-stop steps
         changed = true;
     }
 
@@ -986,7 +1169,7 @@ fn paint_hdr_swatch(
 /// the same bucket share a swatch: the texture shows whichever was
 /// uploaded first (the stored texel itself is never quantized).
 ///
-/// Cache policy: at [`HDR_SWATCH_CACHE_CAP`] entries the whole cache is
+/// Cache policy: at [`HDR_TEXTURE_CACHE_CAP`] entries the whole cache is
 /// cleared — the simplest honest policy. The cache owns the
 /// [`TextureHandle`]s (the last live reference), which is what keeps each
 /// cached texture alive between frames; the handle is what egui frees a
@@ -1011,7 +1194,7 @@ fn hdr_swatch_texture_id(ctx: &Context, color: &HdrColor) -> TextureId {
     );
     let id = texture.id();
     use_hdr_swatch_cache(ctx, |cache| {
-        if cache.len() >= HDR_SWATCH_CACHE_CAP {
+        if cache.len() >= HDR_TEXTURE_CACHE_CAP {
             cache.clear(); // drops the handles → frees the textures
         }
         cache.insert(key, texture);
@@ -1039,6 +1222,73 @@ fn use_hdr_swatch_cache<R>(
     f: impl FnOnce(&mut HashMap<[u8; 3], TextureHandle>) -> R,
 ) -> R {
     ctx.data_mut(|d| f(d.get_temp_mut_or_default(Id::unique("hdr_swatch_texture_cache"))))
+}
+
+/// The cache key for an exposure ramp: the channel color bucket ([`hdr_ramp_bucket`],
+/// the color the exposure axis sweeps) plus the stops range as a tag. The ramp
+/// depends on rgb but NOT on the current exposure value, so one texture serves
+/// every stops position — a whole drag touches neither the map nor the GPU.
+///
+/// A separate map from the flat-swatch cache (a ramp texture is 256× the
+/// memory of a 1×1 swatch, and its reuse pattern is different), but the same
+/// policy: [`HDR_TEXTURE_CACHE_CAP`] entries, then a wholesale clear; the map
+/// owns the [`TextureHandle`]s, never bare [`TextureId`]s.
+type ExposureRampKey = ([u8; 3], u32, u32);
+
+/// The cached float texture for the exposure slider's ramp
+/// ([`FloatImage::exposure_ramp`] at [`HDR_EXPOSURE_RAMP_WIDTH`]×1, stretched
+/// across the slider rect).
+fn exposure_ramp_texture_id(
+    ctx: &Context,
+    rgb: [f32; 3],
+    stops_min: f32,
+    stops_max: f32,
+) -> TextureId {
+    let bucket = hdr_ramp_bucket(rgb);
+    let key = (bucket, stops_min.to_bits(), stops_max.to_bits());
+
+    if let Some(id) = use_exposure_ramp_cache(ctx, |cache| cache.get(&key).map(TextureHandle::id)) {
+        return id;
+    }
+
+    let [r, g, b] = bucket;
+    let texture = ctx.load_texture(
+        format!("hdr_exposure_ramp_{r:02x}{g:02x}{b:02x}"),
+        FloatImage::exposure_ramp([HDR_EXPOSURE_RAMP_WIDTH, 1], rgb, stops_min, stops_max),
+        TextureOptions::LINEAR,
+    );
+    let id = texture.id();
+    use_exposure_ramp_cache(ctx, |cache| {
+        if cache.len() >= HDR_TEXTURE_CACHE_CAP {
+            cache.clear(); // drops the handles → frees the textures
+        }
+        cache.insert(key, texture);
+    });
+    id
+}
+
+/// The 8-bit-per-channel ramp cache key: the channel color (0..=1 linear — the
+/// ramp never sees exposure-applied values), encoded and normalized over the
+/// ramp's own domain, so 255 = SDR reference white. Same perceptual rationale
+/// as [`hdr_swatch_key`] — quantize in the encoded domain, where buckets are
+/// perceptually uniform (≈0.4% steps, below the ~1% Weber just-noticeable
+/// difference; the swatch key's 64×-normalization would waste four fifths of
+/// the key range on colors a ramp never holds). The stored texels are never
+/// quantized — this is only the bucket a ramp texture is reused for.
+fn hdr_ramp_bucket(rgb: [f32; 3]) -> [u8; 3] {
+    // The top of the ramp's domain: 1.0 linear (SDR reference white).
+    let max_encoded = gamma_from_linear(1.0);
+    rgb.map(|l| {
+        let encoded = gamma_from_linear(l.clamp(0.0, 1.0));
+        (encoded / max_encoded * 255.0) as u8 // saturating float→u8 cast
+    })
+}
+
+fn use_exposure_ramp_cache<R>(
+    ctx: &Context,
+    f: impl FnOnce(&mut HashMap<ExposureRampKey, TextureHandle>) -> R,
+) -> R {
+    ctx.data_mut(|d| f(d.get_temp_mut_or_default(Id::unique("hdr_exposure_ramp_texture_cache"))))
 }
 
 #[cfg(test)]
@@ -1128,12 +1378,12 @@ mod hdr_swatch_tests {
                 ids.push(hdr_swatch_texture_id(&ctx, &color_for_key(2 * c0, k1)));
             }
         }
-        assert!(ids.len() > HDR_SWATCH_CACHE_CAP);
+        assert!(ids.len() > HDR_TEXTURE_CACHE_CAP);
         assert!(ids.iter().all(|id| *id != first_id));
 
         use_hdr_swatch_cache(&ctx, |cache| {
             assert!(
-                cache.len() <= HDR_SWATCH_CACHE_CAP,
+                cache.len() <= HDR_TEXTURE_CACHE_CAP,
                 "cache stays capped, got {}",
                 cache.len()
             );
@@ -1148,5 +1398,165 @@ mod hdr_swatch_tests {
         );
         // …and it is cached again:
         assert_eq!(hdr_swatch_texture_id(&ctx, &first), re_id);
+    }
+}
+
+#[cfg(test)]
+mod hdr_exposure_tests {
+    use super::*;
+
+    const MIN: f32 = HdrColor::MIN_EXPOSURE_STOPS; // −6
+    const MAX: f32 = HdrColor::MAX_EXPOSURE_STOPS; // +6
+
+    /// The line math: `None` headroom means no line; SDR white (×1.0) is the
+    /// center of the −6..=+6 ramp; the boundaries clamp left and vanish at
+    /// (and above) the right end.
+    #[test]
+    fn headroom_line_fraction_rules() {
+        // Unknown headroom: no line, never a fabricated position.
+        assert_eq!(headroom_line_fraction(None, MIN, MAX), None);
+
+        // Some(1.0) = SDR white = 0 stops = the exact center:
+        assert!((headroom_line_fraction(Some(1.0), MIN, MAX).unwrap() - 0.5).abs() < 1e-6);
+
+        // Below the shown range: clamped to the left edge (everything right
+        // of it clips — real information). 0.5 headroom is −1 stop, *inside*
+        // the range; use values below 2^−6:
+        assert_eq!(
+            headroom_line_fraction(Some(MIN.exp2()), MIN, MAX),
+            Some(0.0)
+        );
+        assert_eq!(headroom_line_fraction(Some(0.01), MIN, MAX), Some(0.0));
+        assert_eq!(
+            headroom_line_fraction(Some(f32::EPSILON), MIN, MAX),
+            Some(0.0)
+        );
+
+        // Non-positive or NaN headroom is a broken report, not an unknown:
+        // total over f32 — clamped to the left edge, never NaN:
+        assert_eq!(headroom_line_fraction(Some(0.0), MIN, MAX), Some(0.0));
+        assert_eq!(headroom_line_fraction(Some(-1.0), MIN, MAX), Some(0.0));
+        assert_eq!(
+            headroom_line_fraction(Some(f32::NEG_INFINITY), MIN, MAX),
+            Some(0.0)
+        );
+        assert_eq!(headroom_line_fraction(Some(f32::NAN), MIN, MAX), Some(0.0));
+
+        // At the top of the shown range (and above): hidden — nothing on the
+        // ramp clips.
+        assert_eq!(headroom_line_fraction(Some(MAX.exp2()), MIN, MAX), None);
+        assert_eq!(
+            headroom_line_fraction(Some(MAX.exp2() * 8.0), MIN, MAX),
+            None
+        );
+
+        // Just below the top of the range: pinned to the right edge (the line
+        // slides off the end as the headroom rises):
+        let just_below = headroom_line_fraction(Some(MAX.exp2() * 0.999), MIN, MAX).unwrap();
+        assert!((just_below - 1.0).abs() < 0.01, "{just_below}");
+    }
+
+    /// Monotonicity: a larger headroom never moves the line left, and the
+    /// fraction stays in 0..=1 for every in-range headroom.
+    #[test]
+    fn headroom_line_fraction_is_monotone_and_bounded() {
+        let mut prev = 0.0_f32;
+        let mut headroom = MIN.exp2();
+        while headroom < MAX.exp2() {
+            let fraction = headroom_line_fraction(Some(headroom), MIN, MAX).unwrap();
+            assert!((0.0..=1.0).contains(&fraction), "h {headroom}: {fraction}");
+            assert!(fraction >= prev, "h {headroom}: {fraction} < {prev}");
+            prev = fraction;
+            headroom *= 1.25;
+        }
+    }
+
+    /// The ramp bucket: full 0..=255 span for the ramp's 0..=1 domain, clamped
+    /// outside, monotone — the ramp's top of range is SDR white, not the
+    /// swatch's 64× (which would waste the key range above 1.0).
+    #[test]
+    fn hdr_ramp_bucket_spans_the_ramp_domain() {
+        assert_eq!(hdr_ramp_bucket([0.0, 0.0, 0.0]), [0, 0, 0]);
+        assert_eq!(hdr_ramp_bucket([-1.0, -0.5, 0.0]), [0, 0, 0]); // clamped at black
+        assert_eq!(hdr_ramp_bucket([1.0, 1.0, 1.0]), [255, 255, 255]);
+        assert_eq!(hdr_ramp_bucket([2.0, 100.0, 1e9]), [255, 255, 255]); // clamped above
+
+        // Monotone per channel, independent channels:
+        let white = hdr_ramp_bucket([1.0, 0.0, 0.0]);
+        assert_eq!(white, [255, 0, 0]);
+        assert!(hdr_ramp_bucket([0.5, 0.0, 0.0])[0] < 255);
+        assert!(hdr_ramp_bucket([0.25, 0.0, 0.0])[0] < hdr_ramp_bucket([0.5, 0.0, 0.0])[0]);
+    }
+
+    /// The ramp texture depends on rgb but NOT on the current stops value:
+    /// one texture per color bucket serves a whole drag (no churn), a
+    /// different color is a different texture, and repeated lookups don't
+    /// re-upload.
+    #[test]
+    fn exposure_ramp_texture_is_stable_across_a_drag() {
+        let ctx = Context::default();
+        let rgb = [0.5, 0.25, 0.0625];
+
+        let at_min = exposure_ramp_texture_id(&ctx, rgb, MIN, MAX);
+        // The current value moves from −4.8 to +4.75 mid-drag; the ramp must not:
+        for stops in [-4.75_f32, 0.0, 2.5, 4.75] {
+            assert_eq!(
+                exposure_ramp_texture_id(&ctx, rgb, MIN, MAX),
+                at_min,
+                "stops {stops}: the ramp must not churn during a drag"
+            );
+        }
+
+        // Repeated lookup: no new texture.
+        assert_eq!(exposure_ramp_texture_id(&ctx, rgb, MIN, MAX), at_min);
+
+        // A clearly different color: a different texture.
+        let other = [0.1, 0.1, 0.1];
+        assert_ne!(
+            hdr_ramp_bucket(other),
+            hdr_ramp_bucket(rgb),
+            "test assumption: the two colors sit in different buckets"
+        );
+        assert_ne!(exposure_ramp_texture_id(&ctx, other, MIN, MAX), at_min);
+
+        // The stops range is part of the key (a different axis is a different ramp):
+        assert_ne!(exposure_ramp_texture_id(&ctx, rgb, MIN, 3.0), at_min);
+    }
+
+    /// Same shared policy as the swatch cache: at [`HDR_TEXTURE_CACHE_CAP`]
+    /// entries the whole cache is cleared, and a cleared entry re-uploads
+    /// (texture ids are never reused).
+    #[test]
+    fn exposure_ramp_cache_clears_at_cap() {
+        let ctx = Context::default();
+        let rgb = [0.5, 0.5, 0.5];
+
+        let first = exposure_ramp_texture_id(&ctx, rgb, MIN, MAX);
+
+        // Distinct keys via distinct stops ranges (same rgb bucket); i starts
+        // at 1 — i = 0 would be the first key itself:
+        let mut ids = Vec::new();
+        for i in 1..(HDR_TEXTURE_CACHE_CAP + 32) {
+            let max = MAX + i as f32; // distinct f32 bit patterns, valid ranges
+            ids.push(exposure_ramp_texture_id(&ctx, rgb, MIN, max));
+        }
+        assert!(ids.len() > HDR_TEXTURE_CACHE_CAP);
+        assert!(ids.iter().all(|id| *id != first));
+
+        use_exposure_ramp_cache(&ctx, |cache| {
+            assert!(
+                cache.len() <= HDR_TEXTURE_CACHE_CAP,
+                "cache stays capped, got {}",
+                cache.len()
+            );
+        });
+
+        // After the clear, the first key is a cache miss and re-uploads:
+        let re_id = exposure_ramp_texture_id(&ctx, rgb, MIN, MAX);
+        assert_ne!(
+            re_id, first,
+            "cleared entry must re-upload, not serve a stale id"
+        );
+        assert_eq!(exposure_ramp_texture_id(&ctx, rgb, MIN, MAX), re_id);
     }
 }

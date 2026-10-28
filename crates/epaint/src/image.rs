@@ -563,6 +563,67 @@ impl FloatImage {
         Self::filled(resolution, Primaries::Srgb, rgba)
     }
 
+    /// Create a **horizontal exposure ramp**: column `x` of `width` shows the
+    /// color swept over the exposure axis, column 0 at `stops_min` and the
+    /// last column at `stops_max` (linear interpolation in between).
+    ///
+    /// This is [`Self::from_linear`] applied per column — the texel is
+    /// `enc(rgb × 2^stops)` premultiplied in the encoded components
+    /// (`stored = a × enc(L)` with `a = 1.0`), encoded with
+    /// [`ecolor::gamma_from_linear`] in [`Primaries::Srgb`], stored as f16.
+    /// Values above 1.0 are stored unclamped: on an extended-range surface
+    /// the right end of the ramp is *brighter than SDR white*, which is the
+    /// point (egui's HDR exposure slider). Negative `rgb` components clamp
+    /// to `0.0` before encoding, exactly like [`Self::from_linear`].
+    ///
+    /// Every row of a column is identical: a ramp is 1 texel tall conceptually;
+    /// `height` repeats it so callers can stretch the texture freely.
+    ///
+    /// The ramp is deliberately **headroom-agnostic** — a pure function of
+    /// `(resolution, rgb, stops_min, stops_max)`. Where the display's headroom
+    /// ends is display state, not texture content; overlays that mark it (egui's
+    /// dashed headroom line) draw on top of the texture.
+    ///
+    /// Panics if `resolution[0] < 2` (a ramp needs distinct endpoints) or
+    /// `stops_min >= stops_max`.
+    pub fn exposure_ramp(
+        resolution: [usize; 2],
+        rgb: [f32; 3],
+        stops_min: f32,
+        stops_max: f32,
+    ) -> Self {
+        let [width, height] = resolution;
+        assert!(
+            width >= 2,
+            "exposure_ramp needs at least 2 columns for distinct endpoints, got {width}"
+        );
+        assert!(
+            stops_min < stops_max,
+            "exposure_ramp needs stops_min < stops_max, got {stops_min} >= {stops_max}"
+        );
+
+        let a = 1.0_f32;
+        // Per-column texel (the exposure axis is x-only), then laid out
+        // row-major per the pixel contract:
+        let columns: Vec<[half::f16; 4]> = (0..width)
+            .map(|x| {
+                let fraction = x as f32 / (width - 1) as f32;
+                let stops = emath::lerp(stops_min..=stops_max, fraction);
+                // Same encode path as `from_linear`, per column:
+                [
+                    a * gamma_from_linear(rgb[0].max(0.0) * stops.exp2()),
+                    a * gamma_from_linear(rgb[1].max(0.0) * stops.exp2()),
+                    a * gamma_from_linear(rgb[2].max(0.0) * stops.exp2()),
+                    a,
+                ]
+            })
+            .map(Self::texel)
+            .collect();
+        let pixels: Vec<[half::f16; 4]> =
+            (0..height).flat_map(|_y| columns.iter().copied()).collect();
+        Self::new(resolution, Primaries::Srgb, pixels)
+    }
+
     /// Lossily convert an 8-bit [`ColorImage`] into a [`FloatImage`].
     ///
     /// `Color32` texels are gamma-encoded, premultiplied in the encoded
@@ -1126,5 +1187,87 @@ mod tests {
         // `TexturesDelta` debug-panics when dropped with unapplied deltas.
         textures_a.clear();
         textures_b.clear();
+    }
+
+    /// `exposure_ramp` endpoints: column 0 is the color at `stops_min`, the
+    /// last column at `stops_max` — bit-identical to what [`FloatImage::from_linear`]
+    /// (the shared encode path) produces for those exposures.
+    #[test]
+    fn exposure_ramp_endpoints_match_from_linear() {
+        let rgb = [0.5, 0.25, 0.0625];
+        let (min, max) = (-6.0_f32, 6.0_f32);
+        let ramp = FloatImage::exposure_ramp([256, 2], rgb, min, max);
+
+        let low = FloatImage::from_linear([1, 2], rgb, min);
+        let high = FloatImage::from_linear([1, 2], rgb, max);
+        for y in 0..2 {
+            assert_eq!(ramp[(0, y)], low[(0, y)], "left endpoint = 2^stops_min");
+            assert_eq!(ramp[(255, y)], high[(0, y)], "right endpoint = 2^stops_max");
+        }
+    }
+
+    /// Monotone non-decreasing encoded components across the ramp for positive
+    /// rgb: the exposure axis sweeps 2^stops upward, encoding is monotone, so
+    /// no column may be darker than its left neighbor.
+    #[test]
+    fn exposure_ramp_encoded_luminance_is_monotone() {
+        let ramp = FloatImage::exposure_ramp([64, 1], [0.5, 0.25, 0.0625], -6.0, 6.0);
+        for x in 1..64 {
+            for channel in 0..3 {
+                assert!(
+                    ramp[(x, 0)][channel] >= ramp[(x - 1, 0)][channel],
+                    "column {x} channel {channel} decreased: {:?} < {:?}",
+                    ramp[(x - 1, 0)][channel],
+                    ramp[(x, 0)][channel]
+                );
+            }
+        }
+    }
+
+    /// Alpha is exactly 1.0 everywhere (opaque ramp, premultiplied identity),
+    /// every row of a column is identical (the axis is x-only), and the ramp
+    /// carries [`Primaries::Srgb`].
+    #[test]
+    fn exposure_ramp_is_opaque_and_column_constant() {
+        let ramp = FloatImage::exposure_ramp([8, 3], [0.5, 0.5, 0.5], 0.0, 2.0);
+        assert_eq!(ramp.primaries, Primaries::Srgb);
+        for x in 0..8 {
+            for y in 0..3 {
+                assert_eq!(ramp[(x, y)][3], half::f16::from_f32(1.0), "x {x}, y {y}");
+                assert_eq!(ramp[(x, y)], ramp[(x, 0)], "rows must match at x {x}");
+            }
+        }
+    }
+
+    /// The ramp is headroom-agnostic: a pure function of its arguments — no
+    /// context, no display state — so equal calls are bit-equal.
+    #[test]
+    fn exposure_ramp_is_pure() {
+        let rgb = [0.25, 0.5, 1.0];
+        assert_eq!(
+            FloatImage::exposure_ramp([16, 1], rgb, -2.0, 3.0),
+            FloatImage::exposure_ramp([16, 1], rgb, -2.0, 3.0),
+            "same arguments must produce the same texture"
+        );
+    }
+
+    /// A ramp needs distinct endpoints.
+    #[test]
+    #[should_panic(expected = "at least 2 columns")]
+    fn exposure_ramp_rejects_single_column() {
+        let _ = FloatImage::exposure_ramp([1, 1], [0.5; 3], 0.0, 1.0);
+    }
+
+    /// A degenerate (flat or inverted) exposure axis carries no information.
+    #[test]
+    #[should_panic(expected = "stops_min < stops_max")]
+    fn exposure_ramp_rejects_flat_axis() {
+        let _ = FloatImage::exposure_ramp([8, 1], [0.5; 3], 1.0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "stops_min < stops_max")]
+    fn exposure_ramp_rejects_inverted_axis() {
+        let _ = FloatImage::exposure_ramp([8, 1], [0.5; 3], 1.0, 0.0);
     }
 }
