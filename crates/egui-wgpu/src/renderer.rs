@@ -2976,6 +2976,29 @@ fn fs_test(in: TestVOut) -> TestFOut {
             "the native ExtendedDisplayP3 upload must also be f16-bit-exact"
         );
 
+        // sRGB-tagged content on the scRGB-linear space — what this pairing
+        // grants on fp16-capable surfaces (the `Off` target and the HDR
+        // preferences) — rides native the same way: the linear entry point
+        // decodes the gamma-encoded values (§7), so the upload is
+        // byte-identical and must be f16-bit-exact.
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::ExtendedSrgbLinear));
+        let scrgb_id = epaint::TextureId::Managed(105);
+        let scrgb_image = roundtrip_float_image(epaint::Primaries::Srgb);
+        let scrgb_delta =
+            epaint::ImageDelta::full(scrgb_image, epaint::textures::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, scrgb_id, &scrgb_delta);
+
+        let scrgb_texture = renderer
+            .texture(&scrgb_id)
+            .and_then(|t| t.texture.as_ref())
+            .expect("sRGB content on an ExtendedSrgbLinear surface must allocate a texture");
+        assert_eq!(scrgb_texture.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            read_rgba16float_bits(&device, &queue, scrgb_texture, 3, 2),
+            roundtrip_expected_bits(),
+            "the native ExtendedSrgbLinear upload must also be f16-bit-exact"
+        );
+
         // Partial (sub-region) float updates ride the same padded path: a
         // 3×2 patch written into a 3×4 texture (width 3 keeps forcing the
         // 256-byte pitch), then verified region-exact.
