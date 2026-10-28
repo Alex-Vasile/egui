@@ -2254,6 +2254,27 @@ impl Ui {
         *rgba_unmul = rgba.to_rgba_unmultiplied();
         response
     }
+
+    /// Shows a button with the given HDR color (the true color, displayed
+    /// via the float-texture path).
+    ///
+    /// If the user clicks the button, an HDR color picker is shown:
+    /// linear-light RGB and exposure stops, editing
+    /// [`crate::color_picker::HdrColor`].
+    ///
+    /// On an extended-range surface the color can be brighter than SDR
+    /// reference white; on an SDR surface it clamps.
+    pub fn color_edit_button_hdr(&mut self, hdr: &mut color_picker::HdrColor) -> Response {
+        color_picker::color_edit_button_hdr(self, hdr)
+    }
+
+    /// Shows a swatch of the given HDR color (displayed via the
+    /// float-texture path; no editing).
+    ///
+    /// See also [`Self::color_edit_button_hdr`].
+    pub fn swatch_hdr(&mut self, color: &color_picker::HdrColor) -> Response {
+        color_picker::swatch_hdr(self, color)
+    }
 }
 
 /// # Adding Containers / Sub-uis:

@@ -9,6 +9,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 ### ⭐ Added
 * Add `Primaries` and `FloatImage` plus `ImageData::Float`: tagged float content (HDR / wide-gamut images). Float pixels are gamma-encoded in the declared primaries, premultiplied in the encoded components (`stored = a × enc(L)`), unclamped above 1.0, odd-symmetric for negatives; 1.0 = SDR reference white. Stored as f16 (`half`), 1:1 with the `Rgba16Float` GPU upload. Helpers: `new`, `filled`, `from_rgba`, lossy `from_color_image` (result carries `Primaries::Srgb`)
+* `FloatImage::from_linear`: filled constructor from a linear-light color plus exposure — computes `rgb × 2^stops`, encodes with `ecolor::gamma_from_linear`, premultiplies explicitly (`a = 1`) and stores f16 in `Primaries::Srgb`; negative components clamp to 0 before encoding. The ergonomic boundary for linear-light producers (egui's HDR color editors)
 * `FloatImage` serializes its texels as raw IEEE 754 binary16 bit patterns (`u16`) — a stable on-the-wire representation that does not depend on `half`'s serde support
 
 ### ⚠️ Breaking changes

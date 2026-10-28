@@ -1,7 +1,8 @@
-//! Tagged float content demo: `ImageData::Float` through `ui.image()`.
+//! Tagged float content demo: `ImageData::Float` through `ui.image()`,
+//! plus the HDR editing widgets (ladder row 5).
 //!
-//! Shows the two content↔surface pairing outcomes from a plain app's point
-//! of view (plan §4):
+//! Shows the content↔surface pairing outcomes from a plain app's point of
+//! view (plan §4):
 //!
 //! - an **sRGB-tagged** float gradient (values in [0, 1]) — uploads natively
 //!   on every granted space (on a P3-referred surface it shifts exactly like
@@ -12,13 +13,17 @@
 //!   upload is **loudly rejected**: the texture is never created, a warning
 //!   logs once, and the placeholder renders — the empty bordered slot below.
 //!
+//! The bottom row is the HDR editing UI: `color_edit_button_hdr` +
+//! `swatch_hdr` on a linear-light color with exposure. With
+//! `SurfacePreference::WideGamutHdr` on an EDR display the extended surface
+//! shows the effective color as brightness above SDR white; on an SDR
+//! surface it clamps at white (correct per plan §7), and the picker's
+//! clamped-Color32 preview makes the clamp legible.
+//!
 //! The surface decision is parsed from the `surface_target` diagnostics
 //! string ([`egui::ViewportInfo::surface_target`], e.g.
-//! "`Bgra8Unorm + DisplayP3`") — same channel as `hdr_wide_gamut`.
-//!
-//! Everything here stays SDR: the float values are in [0, 1] (1.0 = SDR
-//! reference white). Displaying values above 1.0 is PR 3; this stage makes
-//! wide-gamut *images* possible.
+//! "`Rgba16Float + ExtendedDisplayP3`") — same channel as
+//! `hdr_wide_gamut`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 #![expect(rustdoc::missing_crate_level_docs)] // it's an example
@@ -38,9 +43,11 @@ fn main() -> Result<(), eframe::Error> {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 420.0]),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            // The fork opts in unconditionally (plan §2), so on a
-            // P3-capable display the P3 strip gets its native pairing.
-            surface_preference: SurfacePreference::WideGamut,
+            // The fork opts in unconditionally (plan §2). WideGamutHdr
+            // grants the extended surface on an EDR display (where the
+            // editing UI below shows true >1.0 colors) and falls back
+            // deterministically on SDR panels.
+            surface_preference: SurfacePreference::WideGamutHdr,
             ..Default::default()
         },
         ..Default::default()
@@ -57,6 +64,7 @@ fn main() -> Result<(), eframe::Error> {
 struct FloatImageApp {
     srgb_gradient: Option<egui::TextureHandle>,
     p3_strip: Option<egui::TextureHandle>,
+    hdr_color: egui::HdrColor,
     /// The last strip outcome logged, so the info line logs once per
     /// decision, not once per frame.
     logged_strip_outcome: Option<StripOutcome>,
@@ -189,6 +197,25 @@ impl eframe::App for FloatImageApp {
             }
             ui.add_space(8.0);
 
+            ui.heading("HDR color editing");
+            ui.label(
+                "Linear RGB + exposure (the edits are linear, NOT gamma-encoded). On an extended \
+                 surface the swatch shows the true color above SDR white; on an SDR surface it \
+                 clamps at white — the second swatch always shows the clamp.",
+            );
+            ui.horizontal(|ui| {
+                if ui.color_edit_button_hdr(&mut self.hdr_color).changed() {
+                    ui.ctx().request_repaint();
+                }
+                ui.swatch_hdr(&self.hdr_color);
+                let [r, g, b] = self.hdr_color.effective_linear();
+                let stops = self.hdr_color.exposure_stops;
+                ui.monospace(format!(
+                    "effective linear: R {r:.3}, G {g:.3}, B {b:.3}   ({stops:+.2} stops)"
+                ));
+            });
+            ui.add_space(8.0);
+
             ui.label(format!("Surface status: {status:?}"));
             ui.label(format!(
                 "Surface target: {}",
@@ -196,8 +223,9 @@ impl eframe::App for FloatImageApp {
             ));
             ui.label(
                 "The gradient is gamma-encoded in its declared primaries, premultiplied, \
-                 stored as f16 (Rgba16Float on the GPU). Values stay in [0,1] here — \
-                 HDR brightness above SDR white is a later stage.",
+                 stored as f16 (Rgba16Float on the GPU). The editing row's effective color \
+                 goes above 1.0: brightness above SDR white on an extended surface, clamped \
+                 at white on SDR surfaces.",
             );
         });
     }

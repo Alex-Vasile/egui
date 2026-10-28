@@ -11,7 +11,7 @@ with the surface, and what a panel does with the colors. Each step is marked
 |---|---|
 | `cargo run -p eframe --example hdr_smoke` | Windowed smoke: opens a window with `SurfacePreference::WideGamutHdr`, asserts the surfaced decision is coherent **and that display headroom is reported from the first frame** (`None` fails), logs the pairing + headroom, exits 0 after a few frames. |
 | `cargo run -p eframe --example hdr_wide_gamut` | Live readout: `ViewportInfo::surface_status` / `surface_target` and a full-width 2×3 primaries grid canvas (bold "sRGB primaries" / "display primaries" labels sandwich it) — top row the sRGB primaries converted at runtime into the granted color space's encoding, bottom row the display's native primaries as full-range bytes ((255, 0, 0), (0, 255, 0), (0, 0, 255)). |
-| `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` swatches (values above 1.0) through the real upload→pipeline→surface path; with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
+| `cargo run -p eframe --example hdr_float_image` | Float content end-to-end: `FloatImage` swatches (values above 1.0) through the real upload→pipeline→surface path, plus the HDR editing UI (`color_edit_button_hdr` + `swatch_hdr` on a linear color with exposure). Requests `WideGamutHdr`: with `SurfacePreference::Hdr`/`WideGamutHdr` the extended surface shows them as brightness, on SDR surfaces they clip at white. |
 
 The log line `Surface decision: Rgba16Float + ExtendedDisplayP3 (Granted),
 headroom 1.2×` (or the example's on-screen readout) is the primary reading
@@ -150,6 +150,34 @@ Rules of thumb:
   idles in `ControlFlow::Wait` at 0% CPU once the value is steady.
   **CI cannot validate this.**
 
+### E. HDR color editing widgets (PR 5)
+
+The `color_edit_button_hdr` + `swatch_hdr` row at the bottom of
+`hdr_float_image`. The edits are linear RGB (NOT gamma-encoded) in 0..=1 and
+an exposure in stops (−6..=+6, ¼-step); the effective color is
+`rgb × 2^stops`, 1.0 = SDR reference white.
+
+1. Run `hdr_float_image` (it requests `WideGamutHdr`) on an EDR Mac.
+   Expected: `Granted` with an fp16 extended pairing
+   (`Rgba16Float + ExtendedDisplayP3`). The big `swatch_hdr` swatch shows
+   the effective color as **brightness above SDR white** — drag the
+   exposure slider past 0 stops and the swatch visibly glows above the
+   surrounding UI, peaking at 1.0 × 2⁶ = 64× SDR white. In the opened
+   picker, the two preview swatches differ above SDR white: the left one
+   (float-texture path) is brighter, the right one (clamped `Color32`)
+   sits at SDR white. **CI cannot validate this.**
+2. Same command on an SDR panel (deterministic `FellBack` onto the sRGB
+   target). Expected: the swatch clamps at white once the effective value
+   exceeds 1.0 — pushing the exposure slider runs it into flat white and
+   stopping there — and in the picker the two preview swatches coincide at
+   the clamp. That is the correct §7 behavior, made visible by the
+   pair. **CI cannot validate this.**
+3. Cache sanity (any panel): scrub a channel slider back and forth — the
+   swatch updates without texture churn or flicker (swatch textures are
+   cached per 8-bit encoded color bucket, 256 entries, cleared wholesale
+   at the cap; a cap overflow is invisible beyond a one-frame re-upload).
+   **CI cannot validate this.**
+
 ## Windows — manual-only
 
 PR 1's `WideGamut` pairing (u8 + `DisplayP3`) is never reported on DX12; that
@@ -182,8 +210,8 @@ the SDR reference white. **CI cannot validate this.**
    falls back to `(Bgra8Unorm, Srgb)` on Windows: its chrome also tracks the
    slider, but through the DWM's SDR scaling of the plain sRGB surface — not
    through egui's uniform.) **CI cannot validate this.**
-3. Float content end-to-end: point `hdr_float_image` at
-   `SurfacePreference::WideGamutHdr` and run it on the scRGB surface.
+3. Float content end-to-end: run `hdr_float_image` (it requests
+   `SurfacePreference::WideGamutHdr`) on the scRGB surface.
    Expected: the >1.0 swatches render as brightness above SDR white; the
    swatches' SDR values look identical to their appearance in an sRGB app.
    **CI cannot validate this.**

@@ -1,4 +1,4 @@
-use ecolor::linear_f32_from_linear_u8;
+use ecolor::{gamma_from_linear, linear_f32_from_linear_u8};
 use emath::Vec2;
 
 use crate::{Color32, textures::TextureOptions};
@@ -531,6 +531,38 @@ impl FloatImage {
         Self::new(resolution, primaries, pixels)
     }
 
+    /// Create an image filled with a **linear-light** color, applying the
+    /// exposure and the sRGB encode for you: the ergonomic boundary for
+    /// producers that hold linear values (e.g. a color editor) rather than
+    /// contract-layout pixels.
+    ///
+    /// The effective linear color is `rgb × 2^exposure_stops` per channel,
+    /// unclamped above 1.0 (1.0 = SDR reference white, so 4.0 is 4× SDR
+    /// white). Each component is then encoded with
+    /// [`ecolor::gamma_from_linear`] in [`Primaries::Srgb`], premultiplied
+    /// in the encoded components — `stored = a × enc(L)` with `a = 1.0`
+    /// (identity at full opacity, kept explicit per the contract) — and
+    /// stored as f16. Every texel is identical, so this is the
+    /// flat-swatch / solid-color constructor.
+    ///
+    /// Negative `rgb` components are clamped to `0.0` before encoding: the
+    /// contract's odd-symmetric negative extension exists for *content*,
+    /// not for editor input, and a linear editor clamps at black.
+    /// `exposure_stops` is applied as given; callers clamp it (egui's HDR
+    /// color widgets clamp to ±6 stops).
+    pub fn from_linear(resolution: [usize; 2], rgb: [f32; 3], exposure_stops: f32) -> Self {
+        let linear: [f32; 3] = rgb.map(|c| c.max(0.0) * exposure_stops.exp2());
+        // The premultiply, explicit: `stored = a × enc(L)` with a = 1.0.
+        let a = 1.0_f32;
+        let rgba = [
+            a * gamma_from_linear(linear[0]),
+            a * gamma_from_linear(linear[1]),
+            a * gamma_from_linear(linear[2]),
+            a,
+        ];
+        Self::filled(resolution, Primaries::Srgb, rgba)
+    }
+
     /// Lossily convert an 8-bit [`ColorImage`] into a [`FloatImage`].
     ///
     /// `Color32` texels are gamma-encoded, premultiplied in the encoded
@@ -868,6 +900,7 @@ impl ImageDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ecolor::linear_from_gamma;
 
     #[test]
     fn float_image_helpers_match_resolution_and_layout() {
@@ -930,6 +963,109 @@ mod tests {
         let transparent =
             FloatImage::from_color_image(&ColorImage::filled([1, 1], Color32::TRANSPARENT));
         assert_eq!(transparent[(0, 0)], [half::f16::from_f32(0.0); 4]);
+    }
+
+    /// `from_linear`: the `decode ∘ encode` round-trip holds within f16
+    /// precision for representative values, including exposures > 1 and the
+    /// two transfer-function knees.
+    #[test]
+    fn from_linear_encode_round_trip() {
+        let cases: &[([f32; 3], f32)] = &[
+            ([0.0, 0.0, 0.0], 0.0),
+            ([0.5, 0.25, 0.125], 0.0),
+            ([1.0, 1.0, 1.0], 0.0),
+            ([0.5, 0.5, 0.5], 2.0),              // L = 2.0
+            ([0.25, 0.5, 1.0], 4.0),             // L up to 16.0
+            ([1.0, 0.5, 0.25], -6.0),            // L down to 1/64, deep in the toe
+            ([0.040_45, 0.003_130_8, 0.5], 1.0), // both knees, shifted
+        ];
+        for &(rgb, stops) in cases {
+            let image = FloatImage::from_linear([1, 1], rgb, stops);
+            assert_eq!(image.primaries, Primaries::Srgb);
+            let texel = image[(0, 0)];
+            assert_eq!(texel[3], half::f16::from_f32(1.0)); // opaque
+            for (channel, &linear) in rgb.iter().enumerate() {
+                let want = linear.max(0.0) * stops.exp2();
+                let got = linear_from_gamma(texel[channel].to_f32());
+                if want == 0.0 {
+                    assert_eq!(got, 0.0, "rgb: {rgb:?}, stops: {stops}");
+                } else {
+                    // f16 rounding of the encoded value (~2^-11 relative)
+                    // is amplified by at most the 2.4-power on decode:
+                    let rel = ((got - want) / want).abs();
+                    assert!(
+                        rel < 0.002,
+                        "rgb: {rgb:?}, stops: {stops}, channel {channel}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The plan §4 contract test, in `from_linear` terms: the a=1 swatch at
+    /// L=4 stores `1.0 × enc(4.0)` — and the §4 premultiply rule itself is
+    /// re-asserted numerically: stored = a × enc(L) composites a 50%-alpha
+    /// L=4 content to a linear display value of ≈0.81, not the photometric
+    /// 2.0 (the encoded-space attenuation baked into storage).
+    #[test]
+    fn from_linear_contract_swatch_at_l4() {
+        let enc4 = gamma_from_linear(4.0);
+
+        // The a=1 swatch (what `from_linear` builds):
+        let swatch = FloatImage::from_linear([1, 1], [1.0, 1.0, 1.0], 2.0);
+        assert_eq!(swatch[(0, 0)][0], half::f16::from_f32(1.0 * enc4));
+        assert_eq!(swatch[(0, 0)][3], half::f16::from_f32(1.0));
+
+        // The premultiply rule at a=0.5 (storage side, per §4):
+        let stored_half = 0.5 * enc4;
+        // …and its compositing consequence: 50% alpha on L=4 displays
+        // linear ≈0.81 (−1.3 stops vs the photometric 2.0).
+        let displayed = linear_from_gamma(stored_half);
+        assert!((displayed - 0.81).abs() < 0.005, "{displayed}");
+
+        // Sanity on the §4 numbers themselves: enc(4) ≈ 1.825 (unclamped).
+        assert!((enc4 - 1.825).abs() < 0.01, "{enc4}");
+    }
+
+    /// `from_linear` at the exposure boundaries the widgets clamp to:
+    /// +6 stops on 1.0 = 64× SDR white (encoded ≈ 5.91, unclamped storage),
+    /// −6 stops = 1/64 SDR white.
+    #[test]
+    fn from_linear_exposure_boundaries() {
+        let up = FloatImage::from_linear([1, 1], [1.0, 0.0, 0.0], 6.0);
+        assert_eq!(up[(0, 0)][0], half::f16::from_f32(gamma_from_linear(64.0)));
+        assert_eq!(up[(0, 0)][1], half::f16::from_f32(0.0));
+
+        let down = FloatImage::from_linear([1, 1], [1.0, 1.0, 1.0], -6.0);
+        let want = gamma_from_linear(1.0 / 64.0);
+        assert_eq!(down[(0, 0)][0], half::f16::from_f32(want));
+        assert_eq!(down[(0, 0)][2], half::f16::from_f32(want));
+    }
+
+    /// `from_linear` clamps negative input to 0 before encoding (editor
+    /// input clamps at black; the contract's odd-symmetric negative
+    /// extension is for content, carried by `from_rgba`/`filled`).
+    #[test]
+    fn from_linear_clamps_negative_input_to_zero() {
+        let image = FloatImage::from_linear([1, 1], [-1.0, 0.0, 0.5], 0.0);
+        assert_eq!(image[(0, 0)][0], half::f16::from_f32(0.0));
+        assert_eq!(image[(0, 0)][1], half::f16::from_f32(0.0));
+        assert_eq!(
+            image[(0, 0)][2],
+            half::f16::from_f32(gamma_from_linear(0.5))
+        );
+
+        // A multi-texel resolution fills every texel identically:
+        let filled = FloatImage::from_linear([3, 2], [0.5, 0.5, 0.5], 1.0);
+        assert_eq!(filled.resolution(), [3, 2]);
+        for x in 0..3 {
+            for y in 0..2 {
+                assert_eq!(
+                    filled[(x, y)][0],
+                    half::f16::from_f32(gamma_from_linear(1.0))
+                );
+            }
+        }
     }
 
     /// `ImageData::Float` round-trips through serde exactly, and the wire
