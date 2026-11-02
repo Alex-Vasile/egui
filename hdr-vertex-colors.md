@@ -1140,7 +1140,7 @@ producers and no colour threading (the text field is a source that feeds one of 
 
 Consequences:
 
-- **Opacity/fade dim HDR content exactly once — and `adjust_colors` is where that happens.**
+- **Opacity dims HDR content exactly once — and `adjust_colors` is where that happens.**
   `Painter::transform_shape` calls `multiply_opacity` / `tint_shape_towards`
   (`egui/src/painter.rs:201-207`, `:555-569`), which land in `shape_transform::adjust_colors`
   (`shape_transform.rs:9-130`) *before* tessellation. That function's single `adjust_color` closure is
@@ -1714,8 +1714,11 @@ correcting again.
 2. **The fade mirror prescribed "halve alpha"** (§9). `tint_color_towards` leaves alpha alone at
    `a >= 170` (`ecolor/src/lib.rs:279-300`); following the prescription would have dimmed an opaque
    HDR mesh on wgpu while its `Color32` twin on glow stayed opaque — a divergence on the one path
-   (`fade_to_color`) that has a twin to diverge from. The text now requires the three branches
-   themselves, with `target` scaled into `0..=1`.
+   (`fade_to_color`) that has a twin to diverge from. The text then required the three branches
+   themselves, with `target` scaled into `0..=1`; the mirror was **later deleted as unreachable**
+   (quality round 1, Q3) — `fade_to_color` is only ever `None` or `TRANSPARENT`, and `add` /
+   `extend` / `set` return before `tint_shape_towards` for exactly that value, so no in-tree caller
+   reaches the branches.
 3. **`render()`'s single up-front lookup was still implied** (§11). With the tier in the cache key,
    an HDR-only frame has no SDR entry, so the existing `.expect(…)` (`renderer.rs:652-660`) would
    panic on exactly the frames the tier exists for. Stated: one resolved handle per tier, the second
@@ -1773,17 +1776,20 @@ wording pinned; the third is reversed.
    `is_hdr()` reused, paint order preserved by construction, no allocation for uniform shapes). The
    new cost is an undeclared precondition on the public `tessellate_shape` — `out` empty or the same
    tier as everything `shape` emits — which §9 states. C.6 item 1 is superseded, not wrong.
-2. **The fade rule holds; its scale did not** (§9). Traced end to end: the only non-`None`
+2. **The fade rule held; its scale did not** (§9). Traced end to end: the only non-`None`
    `fade_to_color` any in-tree caller sets is `TRANSPARENT` (`painter.rs:123`), and `Painter::add` /
    `extend` / `set` return before `tint_shape_towards` when it is set (`:214-216`, `:227-230`,
    `:243`), so the reachable fade path is identical on both backends by construction. For a
    non-transparent target — reachable through epaint's public `adjust_colors`, which is why the mirror
-   still has to be right — the three branches do what C.6 says: alpha is preserved at the plateau and
-   halved below it, and the `a == 0` branch halves rgb. What the text had not pinned is the *scale*:
-   a stored alpha is `0..=1`, so the literal `a >= 170` reads only in the `Color32` path's 0..=255
-   units, and the middle branch's divisor is the integer `2·255/a8`, not `2/a` (at `a8 = 128` a
-   float port gives `1/3.98` where the twin's integer `510/a8` gives `1/3` — the float *under*-weights
-   the target; C.8 corrects this pass's own inverted comparison). Pinned.
+   was then required to be right — the three branches do what C.6 says: alpha is preserved at the
+   plateau and halved below it, and the `a == 0` branch halves rgb. What the text had not pinned is
+   the *scale*: a stored alpha is `0..=1`, so the literal `a >= 170` reads only in the `Color32`
+   path's 0..=255 units, and the middle branch's divisor is the integer `2·255/a8`, not `2/a` (at
+   `a8 = 128` a float port gives `1/3.98` where the twin's integer `510/a8` gives `1/3` — the float
+   *under*-weights the target; C.8 corrects this pass's own inverted comparison). Pinned at the time;
+   the mirror itself was **later deleted as unreachable** (quality round 1, Q3), because the private
+   `fade_to_color` is only ever `None` or `TRANSPARENT` and the `Painter` entry points short-circuit
+   it.
 3. **Per-tier handle resolution holds; its wording could still panic** (§11). "keeps one resolved
    pipeline per tier and looks the second one up" left the *first* handle resolved up front — and an
    HDR-only frame's first mesh is HDR, so that reading panics on exactly the frame C.6 item 3 set out
@@ -1823,16 +1829,18 @@ left one branch of the old behaviour behind.
    `tessellate_shape` itself stays as declared: the tessellator's own paths satisfy it, a direct
    caller is routed at `:1564-1565`, and a violation lands in `Mesh::is_valid`'s length clause under
    `tessellate_shapes`'s final `debug_assert!` — a diagnostic, not repaired pixels.
-2. **The fade mirror reproduces the twin; its comparison did not** (§9). Re-traced
+2. **The fade mirror reproduced the twin; its comparison did not** (§9). Re-traced
    `tint_color_towards` (`ecolor/src/lib.rs:279-300`): `a == 0` halves rgb and leaves alpha; `a < 170`
    also halves alpha and adds `target / ((2·255/a) as u8)`; `a >= 170` blends rgb and keeps alpha. The
-   pinned form (`a8 = round(a × 255)`, integer divisor, target scaled to `0..=1`) reproduces all three
+   pinned form (`a8 = round(a × 255)`, integer divisor, target scaled to `0..=1`) reproduced all three
    on the sidecar: `a8 = 128`, target `TRANSPARENT` gives `rgb/2, a8 = 64` on both sides, and
    `multiply_opacity`'s `gamma_multiply` is `(x·factor + 0.5) as u8` over all four components, which
    the sidecar's four-component multiply matches up to rounding. C.7's parenthetical had the
    float comparison inverted (corrected in place above): a float `2/a` divisor is `1/3.98` at
    `a8 = 128` (a quarter), while the twin's integer `510/128 = 3` pulls by a third, so the float port
-   *under*-weights the target. The prescription is unchanged.
+   *under*-weights the target. The mirror was **later deleted as unreachable** (quality round 1, Q3):
+   the private `fade_to_color` is only ever `None` or `TRANSPARENT`, and `add` / `extend` / `set`
+   return before `tint_shape_towards` for that value, so no in-tree caller reaches the branches.
 3. **Lazy handles resolve, but the switch lost the callback re-set** (§11). Both lookups are possible
    from `&self` (the cache is a `Mutex<HashMap>`), each on the first mesh of its tier, and total given
    the tier scan: the fold that would host that scan touches no `self` field (`renderer.rs:1294-1314`
@@ -1865,3 +1873,5 @@ for the style loop — eight passes, of which seven changed the document (C.1–
 The design that survived them: per-mesh colour sidecar, `[u16; 4]` colour bits, no `enable f16`,
 no capability gate, promote on `append`, surface-referred untagged vertex colour, `Shape::Hdr` as
 the operator that re-colours coverage, and the SDR path untouched byte-for-byte.
+
+**C.10 — quality review round 2 (2026-11-02).** Wording only, design unchanged: §9's heading says *opacity* (the fade half was deleted as unreachable in quality round 1, Q3), and C.6/C.7/C.8's fade-mirror passages were corrected to record that deletion.

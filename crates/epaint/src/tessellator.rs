@@ -3315,6 +3315,20 @@ mod hdr_tests {
             .tessellate_shapes(vec![ClippedShape::new(Rect::EVERYTHING, shape)])
     }
 
+    /// `pixels_per_point` is 1.0, so the tessellator's feathering is exactly
+    /// `feathering_size_in_pixels`.
+    fn tessellate_with_feathering(
+        shape: Shape,
+        feathering_size_in_pixels: f32,
+    ) -> Vec<ClippedPrimitive> {
+        let options = TessellationOptions {
+            feathering_size_in_pixels,
+            ..Default::default()
+        };
+        Tessellator::new(1.0, options, [1024, 1024], vec![])
+            .tessellate_shapes(vec![ClippedShape::new(Rect::EVERYTHING, shape)])
+    }
+
     fn meshes(primitives: &[ClippedPrimitive]) -> Vec<&Mesh> {
         primitives
             .iter()
@@ -3384,31 +3398,53 @@ mod hdr_tests {
     }
 
     #[test]
-    fn hdr_uv_evaluates_per_position() {
-        let source = Arc::new(|_rect: Rect, pos: Pos2| {
-            HdrVertexColor::from_rgba_premultiplied([pos.x, 0.0, 0.0, 1.0])
-        });
-        let shape = Shape::hdr(
-            Shape::line(
+    fn hdr_uv_receives_feathered_bounds_and_evaluates_per_position() {
+        // The callback's first argument is the shape's visual bounds expanded
+        // by the tessellator's feathering — the same rect `ColorMode::UV` gets
+        // (`color.rs:73-76`). A test that ignores it passes for any rect,
+        // including `Rect::NOTHING`. Two feathering sizes: a constant rect
+        // cannot match both.
+        for feathering_size_in_pixels in [1.0, 2.0] {
+            let inner = Shape::line(
                 vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0)],
                 PathStroke::new(2.0, Color32::WHITE),
-            ),
-            HdrColorMode::UV(source),
-        );
-        let primitives = tessellate(shape);
-        let [mesh] = meshes(&primitives)[..] else {
-            panic!("expected one mesh");
-        };
-        assert!(mesh.is_hdr());
-        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
-        let mut saw_positional = false;
-        for (color, vertex) in core::iter::zip(colors, &mesh.vertices) {
-            if vertex.color.a() == 255 {
-                assert_eq!(color.to_array()[0], vertex.pos.x);
-                saw_positional = true;
+            );
+            let expected = inner
+                .visual_bounding_rect()
+                .expand(feathering_size_in_pixels);
+
+            let seen = Arc::new(crate::mutex::Mutex::new(Vec::new()));
+            let seen_in_source = Arc::clone(&seen);
+            let source = Arc::new(move |rect: Rect, pos: Pos2| {
+                seen_in_source.lock().push(rect);
+                HdrVertexColor::from_rgba_premultiplied([pos.x, 0.0, 0.0, 1.0])
+            });
+
+            let primitives = tessellate_with_feathering(
+                Shape::hdr(inner, HdrColorMode::UV(source)),
+                feathering_size_in_pixels,
+            );
+
+            let seen = seen.lock();
+            assert!(!seen.is_empty(), "the source must be consulted");
+            for rect in seen.iter() {
+                assert_eq!(*rect, expected, "feathering {feathering_size_in_pixels}");
             }
+
+            let [mesh] = meshes(&primitives)[..] else {
+                panic!("expected one mesh");
+            };
+            assert!(mesh.is_hdr());
+            let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+            let mut saw_positional = false;
+            for (color, vertex) in core::iter::zip(colors, &mesh.vertices) {
+                if vertex.color.a() == 255 {
+                    assert_eq!(color.to_array()[0], vertex.pos.x);
+                    saw_positional = true;
+                }
+            }
+            assert!(saw_positional, "the ramp must reach the interior vertices");
         }
-        assert!(saw_positional, "the ramp must reach the interior vertices");
     }
 
     #[test]
