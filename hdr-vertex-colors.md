@@ -1826,3 +1826,11 @@ twin, §9's three dimming rules, §13's SDR budget, and the non-negotiables — 
 (20 B/vertex, one staging buffer, no per-frame CPU conversion, SDR pipeline count unchanged),
 `Shape` 64 B, no `unsafe`, no new mandatory dependency. Anchors were not re-swept; the three new ones
 in this section were read.
+
+**C.9 — Fixed point (round 8).** A final pass made **no edits**: the round-7 callback
+pass-through passage, its `§16 Q5`/`§12` counterparts, and the rayon test gating all agree with
+the tree, no `§` reference dangles, and no non-negotiable weakened. This is the convergence point
+for the style loop — eight passes, of which seven changed the document (C.1–C.8) and one did not.
+The design that survived them: per-mesh colour sidecar, `[u16; 4]` colour bits, no `enable f16`,
+no capability gate, promote on `append`, surface-referred untagged vertex colour, `Shape::Hdr` as
+the operator that re-colours coverage, and the SDR path untouched byte-for-byte.
