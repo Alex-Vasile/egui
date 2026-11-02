@@ -848,6 +848,20 @@ fn set_clip_rect(
     }
 }
 
+/// What these tests can and cannot prove about the glow seam.
+///
+/// Proven here: the byte layout `Painter::new` declares to the VAO (stride 20,
+/// colour at offset 16); that an HDR mesh's uploaded colour bytes are the
+/// sidecar's projection — the twin glow draws — and that SDR meshes are
+/// untouched; and that `HdrMeshWarning::warn_once` warns exactly once per
+/// painter and never for SDR.
+///
+/// Inspection-only: the call site that routes a mesh into that warning,
+/// `self.hdr_mesh_warning.warn_once(mesh)` in `Painter::paint_mesh`. A GL
+/// context needs a real driver and a window, and none exists in-tree, so
+/// `paint_mesh` cannot be driven from a test — deleting the call leaves every
+/// test below green. There is deliberately no fake GL harness: it would assert
+/// on the harness rather than on the call. The call is kept correct by review.
 #[cfg(test)]
 mod tests {
     use super::*;

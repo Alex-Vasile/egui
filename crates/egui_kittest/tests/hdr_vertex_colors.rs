@@ -582,12 +582,18 @@ fn hdr_feathered_edge_midpoint_is_between_zero_and_the_interior() {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshots: the u8 proof of the twin
+// Snapshots: silhouette, AA, geometry, and per-channel clipping in a u8 PNG
 // ---------------------------------------------------------------------------
 
-/// §12's Snapshot row. A u8 PNG cannot show above 1.0 by definition, so this
-/// pins the *other* half of the contract: the HDR gradient draws its SDR twin,
-/// range-reduced uniformly (hue preserved, not per-channel clamped).
+/// §12's Snapshot row. Values above 1.0 clip in a u8 PNG by definition, and
+/// the harness target is `Rgba8Unorm` while an HDR mesh goes through
+/// `vs_main_hdr`, which never reads the u8 twin — so what this pins is the
+/// silhouette, the antialiasing, the geometry, and *per-channel* clipping
+/// (each ramp channel saturates to 255 on its own schedule). The twin's
+/// uniform range reduction is a CPU contract: `epaint::tessellator`'s
+/// `text_twin_is_the_projection_of_the_sidecar`, plus
+/// `egui_glow::painter`'s `glow_draws_the_hdr_twin_and_leaves_sdr_bytes_alone`
+/// for the bytes glow actually uploads.
 #[cfg(feature = "snapshot")]
 #[test]
 fn hdr_gradient_snapshot() {
@@ -608,8 +614,11 @@ fn hdr_gradient_snapshot() {
     harness.snapshot("hdr_gradient");
 }
 
-/// §12's Snapshot row for text: the glyphs' twin, so an SDR-only backend's
-/// HDR label is visibly the range-reduced colour rather than SDR white.
+/// §12's Snapshot row for text: the glyph silhouette and its antialiasing,
+/// under the same u8 limit. The glyph interior here measures
+/// `(255, 255, 188)` for `[4, 2, 0.5]` — the HDR value per-channel clamped —
+/// not the twin `(255, 188, 99)`; the twin is proven by the CPU and glow byte
+/// tests named above.
 #[cfg(feature = "snapshot")]
 #[test]
 fn hdr_label_snapshot() {

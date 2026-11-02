@@ -2537,7 +2537,8 @@ mod tests {
 
     /// §13: an SDR-only frame stages exactly the bytes and the slice count it
     /// staged before the sidecar existed — one 20-byte-per-vertex slice per
-    /// mesh, one *empty* sidecar slice per mesh, and no sidecar staging at all.
+    /// mesh, one *empty* sidecar slice per mesh, and no sidecar bytes staged
+    /// (the sidecar buffer's capacity never grows).
     #[test]
     fn sdr_frame_stages_unchanged_bytes_and_slices() {
         let Some((device, queue)) = test_device("sdr_frame_stages_unchanged_bytes_and_slices")
@@ -2601,7 +2602,7 @@ mod tests {
         );
         assert_eq!(
             renderer.hdr_color_buffer.capacity, sidecar_capacity_before,
-            "no sidecar staging buffer is even created for SDR-only content"
+            "the sidecar staging buffer's capacity is unchanged: an SDR-only frame never grows it"
         );
     }
 

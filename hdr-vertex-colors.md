@@ -644,7 +644,10 @@ Constructors/accessors follow `ecolor`'s value-type naming, not a private dialec
   premultiplies again: `stored = a × enc(rgb / a)`. That is the same order as
   `impl From<Rgba> for Color32` (`ecolor/src/lib.rs:75-90`), and the test pins agreement with it.
   Encoding the premultiplied value in place would store `enc(a × L)`, a different photometric
-  reading for every translucent colour.)
+  reading for every translucent colour. At `a == 0` there is no straight colour to recover, so the
+  components are encoded as they are and alpha stays 0 (`hdr_color.rs:234-242`) — the same branch
+  `impl From<Rgba> for Color32` takes (`ecolor/src/lib.rs:78-85`), which is what makes the two
+  impls agree for additive and fully transparent values too.)
 
 There is deliberately no way to detect "is this `HdrVertexColor` also a `Color32`": the tier is a
 property of the *mesh*, never of a value, which is what keeps the SDR path free.
