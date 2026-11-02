@@ -1149,36 +1149,25 @@ Consequences:
   parameter is a breaking change to a public epaint fn, already covered by 6a's `CHANGELOG` entry
   (`Mesh` gained a field, `Shape` gained a variant). `multiply_opacity` passes "multiply all four
   components" for both; `tint_shape_towards` passes `tint_color_towards`
-  (`ecolor/src/lib.rs:279-300`) for `Color32` and, for stored HDR values, its encoded-space mirror
-  toward `HdrVertexColor::from(target)`: **the same three branches `tint_color_towards` takes**,
-  applied to the stored premultiplied components — with `a` and the divisor on the `Color32` path's
-  own 0..=255 scale (`a8 = round(a × 255)`, and the middle branch's `2·255/a8` kept as the *integer*
-  it is there), `target` scaled into `0..=1`. So a stored value at `a8 >= 170` blends encoded RGB
-  and keeps its alpha, and only below that threshold does alpha halve. The scale is part of the rule,
-  not a detail: the stored alpha is `0..=1`, so a literal `a >= 170.0` is never true and would
-  reinstate the always-halve bug, and a float `2/a` divisor pulls toward the target by a quarter at
-  `a8 = 128` where the `Color32` twin's integer `510/a8 = 3` pulls by a third — the integer divisor
-  is the truncated float, so the float port under-weights the target, not over-weights it. Stated
-  this way, a twin-representable value (every
-  component `<= 1`) lands on the same 8-bit result up to rounding; above 1.0 there is no twin to
-  agree with, and the mirror *is* the definition. Reproducing the branches is not optional:
-  "always halve alpha" would dim an opaque HDR mesh on wgpu while its `Color32` twin on glow stayed
-  opaque — a backend divergence the fade path must not introduce.
+  (`ecolor/src/lib.rs:279-300`) for `Color32` and a **no-op for HDR**, because the fade path cannot
+  reach HDR content at all: `Painter::fade_to_color` is private and is only ever `None` or
+  `Some(Color32::TRANSPARENT)` (`egui/src/painter.rs:55,124`), and `add` / `extend` / `set` all
+  short-circuit exactly that value (`:215`, `:228`, `:244`), so `tint_shape_towards` never runs with
+  a target that would need an HDR definition. An HDR mirror of `tint_color_towards` *was* written
+  during implementation and **deleted during quality review as unreachable code** — including the
+  `a8 >= 170` threshold and the integer `510/a8` divisor it needed. If `fade_to_color` ever gains a
+  non-transparent target, reintroducing it is a new decision, and the deleted version's reasoning
+  belongs in Appendix C rather than in the contract.
   Three rules, one per level — the asymmetry is the point, and a test pins each:
   - `Shape::Hdr` recurses into `inner` and **does not touch the mode**: the wrapper's mask is the
     inner alpha, so dimming the mode as well would apply the factor twice. The HDR colour is dimmed
-    once, in encoded space, which is the §3 contract. Consequence of the alpha-only mask, stated
-    because `fade_to_color` accepts any target: only the alpha half of a fade reaches wrapped HDR
-    content — the wrapper has already discarded the inner RGB, so its hue is never tinted — and
-    `tint_color_towards` leaves alpha alone at `a >= 170` (`ecolor/src/lib.rs:279-300`), so an
-    RGB-only fade dims the wrapper's SDR neighbours and not the wrapper. Fades to transparent (the
-    animation case) are exact: `Painter::add` drops the shape outright when
-    `fade_to_color == Some(Color32::TRANSPARENT)` (`egui/src/painter.rs:214-216`), and
+    once, in encoded space, which is the §3 contract. Fades to transparent (the animation case) stay
+    exact because `Painter::add` drops the shape outright at
+    `fade_to_color == Some(Color32::TRANSPARENT)` (`egui/src/painter.rs:215`), and
     `TextShape::opacity_factor` is a four-component multiply that the mask follows too.
   - `Shape::Mesh` applies `adjust_hdr` to every `hdr_colors` entry — otherwise a directly-built HDR
-    mesh would ignore `Ui::multiply_opacity` and `fade_to_color` entirely on wgpu, because the only
-    channel the `Color32` fold reaches is the *glow* twin. Opacity is a component multiply and needs
-    no target; a fade blends toward `HdrVertexColor::from(target)` in encoded space (above).
+    mesh would ignore `Ui::multiply_opacity` entirely on wgpu, because the only channel the
+    `Color32` fold reaches is the *glow* twin. Opacity is a component multiply and needs no target.
   - `Shape::Text` **must not** apply `adjust_hdr` to `hdr_color`, and this is the one rule of the
     three that is easy to get wrong in the "do the same thing everywhere" direction. The text
     sidecar is not stored before tessellation — it is *derived* as

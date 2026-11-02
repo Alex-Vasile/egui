@@ -483,25 +483,38 @@ impl Painter {
         self.add(RectShape::stroke(rect, corner_radius, stroke, stroke_kind))
     }
 
-    /// Show an arrow starting at `origin` and going in the direction of `vec`, with the length `vec.length()`.
-    pub fn arrow(&self, origin: Pos2, vec: Vec2, stroke: impl Into<Stroke>) {
+    /// The three segments of an arrow from `origin` along `vec`: the shaft and
+    /// two head strokes.
+    ///
+    /// Shared by [`Self::arrow`] and [`Self::arrow_hdr`] so the head geometry —
+    /// the `TAU / 10` angle and the `0.25` tip fraction — is defined once.
+    fn arrow_segments(origin: Pos2, vec: Vec2) -> [[Pos2; 2]; 3] {
         use crate::emath::Rot2;
         let rot = Rot2::from_angle(core::f32::consts::TAU / 10.0);
         let tip_length = vec.length() * 0.25;
         let tip = origin + vec;
         let dir = vec.normalized();
+        [
+            [origin, tip],
+            [tip, tip - tip_length * (rot * dir)],
+            [tip, tip - tip_length * (rot.inverse() * dir)],
+        ]
+    }
+
+    /// Show an arrow starting at `origin` and going in the direction of `vec`, with the length `vec.length()`.
+    pub fn arrow(&self, origin: Pos2, vec: Vec2, stroke: impl Into<Stroke>) {
         let stroke = stroke.into();
-        self.line_segment([origin, tip], stroke);
-        self.line_segment([tip, tip - tip_length * (rot * dir)], stroke);
-        self.line_segment([tip, tip - tip_length * (rot.inverse() * dir)], stroke);
+        for points in Self::arrow_segments(origin, vec) {
+            self.line_segment(points, stroke);
+        }
     }
 
     /// Show an arrow in an HDR color.
     ///
     /// [`Self::arrow`] is a procedure (three `line_segment` calls), not a
     /// builder, so it cannot be wrapped after the fact — hence its own twin.
-    /// The three segments are built with the same geometry as [`Self::arrow`]
-    /// and flattened into the HDR wrapper together.
+    /// It draws the very segments [`Self::arrow`] draws, flattened into one
+    /// HDR wrapper.
     pub fn arrow_hdr(
         &self,
         origin: Pos2,
@@ -509,18 +522,10 @@ impl Painter {
         stroke: impl Into<Stroke>,
         color: impl Into<HdrVertexColor>,
     ) {
-        use crate::emath::Rot2;
-        let rot = Rot2::from_angle(core::f32::consts::TAU / 10.0);
-        let tip_length = vec.length() * 0.25;
-        let tip = origin + vec;
-        let dir = vec.normalized();
         let stroke = stroke.into();
-        let segments = Shape::Vec(vec![
-            Shape::line_segment([origin, tip], stroke),
-            Shape::line_segment([tip, tip - tip_length * (rot * dir)], stroke),
-            Shape::line_segment([tip, tip - tip_length * (rot.inverse() * dir)], stroke),
-        ]);
-        self.add_hdr(segments, color.into());
+        let segments =
+            Self::arrow_segments(origin, vec).map(|points| Shape::line_segment(points, stroke));
+        self.add_hdr(Shape::Vec(segments.into()), color.into());
     }
 
     /// An image at the given position.
@@ -657,7 +662,13 @@ fn tint_shape_towards(shape: &mut Shape, target: Color32) {
                 *color = crate::ecolor::tint_color_towards(*color, target);
             }
         },
-        move |hdr| tint_hdr_towards(hdr, target),
+        // HDR values are left alone: `tint_color_towards` is defined on
+        // `Color32` (an 8-bit encoded blend with an integer divisor), and
+        // there is no HDR twin of that definition to agree with above 1.0.
+        // `fade_to_color` is only ever `None` or `TRANSPARENT` — which
+        // `add`/`extend`/`set` short-circuit — so this adjuster is never
+        // reached in practice either.
+        |_hdr| {},
     );
 }
 
@@ -673,47 +684,6 @@ fn multiply_opacity(shape: &mut Shape, opacity: f32) {
             *hdr = hdr.scaled(opacity);
         },
     );
-}
-
-/// The encoded-space mirror of [`ecolor::tint_color_towards`] for a stored HDR
-/// value.
-///
-/// It reproduces the three branches of the `Color32` function exactly, on the
-/// sidecar's `0..=1` scale: the `a8 = round(a × 255)` threshold, the middle
-/// branch's *integer* `2·255/a8` divisor, and the `a == 0` branch that halves
-/// rgb without touching alpha. Reproducing them is what keeps an opaque HDR
-/// mesh and its `Color32` twin from diverging on a fade.
-///
-/// Above 1.0 there is no twin to agree with, and this mirror *is* the
-/// definition; below it, a twin-representable value lands on the same 8-bit
-/// result up to rounding.
-fn tint_hdr_towards(color: &mut HdrVertexColor, target: Color32) {
-    let [r, g, b, a] = color.to_array();
-    let a8 = (a * 255.0 + 0.5) as u8;
-    let toward = |component: u8| f32::from(component) / 255.0;
-
-    let [r, g, b, a] = if a8 == 0 {
-        [r / 2.0, g / 2.0, b / 2.0, a]
-    } else if a8 < 170 {
-        // Same integer divisor as the `Color32` path: at a8 = 128 the integer
-        // 510/128 = 3 pulls by a third, where a float `2/a` would pull by a
-        // quarter.
-        let div = (2 * 255 / i32::from(a8)) as u8;
-        [
-            r / 2.0 + toward(target.r() / div),
-            g / 2.0 + toward(target.g() / div),
-            b / 2.0 + toward(target.b() / div),
-            a / 2.0,
-        ]
-    } else {
-        [
-            r / 2.0 + toward(target.r() / 2),
-            g / 2.0 + toward(target.g() / 2),
-            b / 2.0 + toward(target.b() / 2),
-            a,
-        ]
-    };
-    *color = HdrVertexColor::from_rgba_premultiplied([r, g, b, a]);
 }
 
 #[cfg(test)]
@@ -741,50 +711,6 @@ mod tests {
         let shape = shapes.next().expect("expected one shape");
         assert!(shapes.next().is_none(), "expected exactly one shape");
         shape
-    }
-
-    /// `a8 >= 170`: only rgb moves, alpha is untouched.
-    #[test]
-    fn tint_hdr_towards_keeps_alpha_above_the_threshold() {
-        let target = Color32::from_rgb(255, 0, 0);
-        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 1.0]);
-        tint_hdr_towards(&mut color, target);
-        let [r, g, b, a] = color.to_array();
-        assert_eq!(a, 1.0, "a8 = 255 is the `a8 >= 170` branch");
-        let toward = |component: u8| f32::from(component) / 255.0;
-        assert!((r - (0.25 + toward(127))).abs() < 1e-3, "r = {r}");
-        assert!((g - 0.25).abs() < 1e-3, "g = {g}");
-        assert!((b - 0.25).abs() < 1e-3, "b = {b}");
-    }
-
-    /// `a8 < 170`: the middle branch halves alpha and pulls by the *integer*
-    /// `2 * 255 / a8` divisor (3 at a8 = 128, not the float `2 / a`'s 4).
-    #[test]
-    fn tint_hdr_towards_uses_the_integer_divisor_below_the_threshold() {
-        let target = Color32::from_rgb(255, 0, 0);
-        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 0.5]);
-        assert_eq!((0.5_f32 * 255.0 + 0.5) as u8, 128, "a8 = 128");
-        tint_hdr_towards(&mut color, target);
-        let [r, g, b, a] = color.to_array();
-        assert!((a - 0.25).abs() < 1e-3, "alpha halves: {a}");
-        // 255 / 3 / 255 = 1/3, where a float `2 / a` divisor would give 1/4.
-        assert!((r - (0.25 + 1.0 / 3.0)).abs() < 1e-3, "r = {r}");
-        assert!((g - 0.25).abs() < 1e-3, "g = {g}");
-        assert!((b - 0.25).abs() < 1e-3, "b = {b}");
-    }
-
-    /// `a8 == 0`: rgb halves and alpha stays zero, so a transparent value
-    /// cannot acquire coverage on a fade.
-    #[test]
-    fn tint_hdr_towards_leaves_zero_alpha_at_zero() {
-        let target = Color32::from_rgb(255, 0, 0);
-        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 0.0]);
-        tint_hdr_towards(&mut color, target);
-        let [r, g, b, a] = color.to_array();
-        assert_eq!(a, 0.0);
-        assert!((r - 0.25).abs() < 1e-3);
-        assert!((g - 0.25).abs() < 1e-3);
-        assert!((b - 0.25).abs() < 1e-3);
     }
 
     /// A wrapped shape dims through its inner alpha only: dimming the mode as
@@ -884,46 +810,6 @@ mod tests {
         assert!(
             (1.9..=2.1).contains(&peak),
             "the sidecar must be dimmed exactly once, peak was {peak}"
-        );
-    }
-
-    /// The fade path is the same traversal: a bare HDR mesh tints once, and
-    /// the wrapper is not tinted twice.
-    #[test]
-    fn fade_tints_each_hdr_level_once() {
-        let target = Color32::from_rgb(255, 0, 0);
-
-        let mut painter = new_painter();
-        painter.fade_to_color = Some(target);
-
-        let mut mesh = Mesh::default();
-        mesh.add_colored_rect_hdr(Rect::EVERYTHING, four());
-        painter.add(Shape::Mesh(mesh.into()));
-        painter.add(Shape::hdr(
-            Shape::rect_filled(Rect::EVERYTHING, 0.0, Color32::WHITE),
-            four(),
-        ));
-
-        let mut recorded = Vec::new();
-        painter.for_each_shape(|clipped| recorded.push(clipped.shape.clone()));
-        assert_eq!(recorded.len(), 2);
-
-        let Shape::Mesh(mesh) = &recorded[0] else {
-            panic!("expected the mesh first");
-        };
-        let mut wanted = four();
-        tint_hdr_towards(&mut wanted, target);
-        for color in mesh.hdr_colors.as_ref().expect("sidecar") {
-            assert_eq!(*color, wanted, "the bare mesh's sidecar is tinted once");
-        }
-
-        let Shape::Hdr { color, .. } = &recorded[1] else {
-            panic!("expected the wrapper second");
-        };
-        assert_eq!(
-            *color,
-            HdrColorMode::Solid(four()),
-            "the wrapper's mask must not be tinted"
         );
     }
 }

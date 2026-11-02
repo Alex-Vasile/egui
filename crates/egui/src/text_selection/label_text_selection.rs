@@ -202,9 +202,8 @@ impl LabelSelectionState {
         self.states.clear();
     }
 
-    /// Handle text selection state for a label or similar widget.
-    /// This also takes care of painting the galley.
-    /// Paint a label's galley with selection support.
+    /// Handle text selection state for a label or similar widget, and paint
+    /// its galley with that selection.
     ///
     /// `hdr_color` is the label's [`epaint::TextShape::hdr_color`], if any;
     /// selection clearing works the same way, because the HDR sidecar is

@@ -1683,10 +1683,18 @@ impl Tessellator {
                 // The operator: tessellate the inner shape, then recolour the
                 // vertices it just emitted by their own coverage.
                 //
-                // `filter` is the bounding box the positional mode sees: the
+                // `rect` is the bounding box the positional mode sees: the
                 // inner shape's visual bounds expanded by the tessellator's
                 // feathering, the same construction `ColorMode::UV` gets.
-                let rect = inner.visual_bounding_rect().expand(self.feathering);
+                // Computing it walks the inner shape's geometry (every vertex
+                // of a mesh, every point of a path, the whole sub-tree of a
+                // `Vec`), so it is computed only for the positional mode;
+                // `Solid` never reads it.
+                let rect = if matches!(color, HdrColorMode::UV(_)) {
+                    inner.visual_bounding_rect().expand(self.feathering)
+                } else {
+                    Rect::NOTHING
+                };
                 let color_at = |pos: Pos2| match &color {
                     HdrColorMode::Solid(color) => *color,
                     HdrColorMode::UV(callback) => callback(rect, pos),
@@ -2562,11 +2570,17 @@ impl Tessellator {
             }
 
             if hdr_color.is_some() {
-                // The twin, for every vertex this row emitted (glyphs,
-                // backgrounds, underline). It is the projection of the sidecar
-                // and nothing else — the SDR-only backends draw only this
-                // value, so leaving it at the galley colour would make HDR text
-                // on those backends show no HDR hue at all.
+                // The twin, for the glyph vertices this row recoloured: their
+                // sidecar entry is the HDR value, so the SDR-only backends
+                // must draw its projection or HDR text would show no HDR hue
+                // at all.
+                //
+                // Everything else the row emitted (backgrounds, underlines)
+                // keeps the colour it was authored with: its sidecar entry is
+                // the exact lift of that colour, and projecting it back is only
+                // accurate to within one 8-bit step for translucent values
+                // (see `HdrVertexColor::projected_color32`). Leaving the
+                // authored bytes alone keeps them exact.
                 let Mesh {
                     vertices,
                     hdr_colors,
@@ -2574,11 +2588,14 @@ impl Tessellator {
                 } = out;
                 let sidecar = hdr_colors.as_mut().expect("promoted above");
                 debug_assert_eq!(sidecar.len(), vertices.len(), "length invariant");
-                for (vertex, &hdr) in vertices[vertex_start..]
+                for (local, (vertex, hdr)) in vertices[vertex_start..]
                     .iter_mut()
                     .zip(&sidecar[vertex_start..])
+                    .enumerate()
                 {
-                    vertex.color = hdr.projected_color32();
+                    if row.visuals.glyph_vertex_range.contains(&local) {
+                        vertex.color = hdr.projected_color32();
+                    }
                 }
             }
         }
@@ -2793,6 +2810,25 @@ impl Tessellator {
         //
         // Runs are contiguous, not grouped by tier: primitive order is paint
         // order, so `[SDR, HDR, SDR]` must stay three primitives.
+        //
+        // Whether the subtree mixes tiers is decided without cloning or
+        // allocating anything: `should_parallelize` is true for precisely the
+        // frame's largest shapes, and the common answer is "uniform", so
+        // deep-cloning the whole shape just to discover that would be pure
+        // waste. `tier` records the first leaf's tier on the way down.
+        fn tier_mix(shape: &Shape, tier: &mut Option<bool>) -> bool {
+            match shape {
+                Shape::Vec(children) => children.iter().any(|child| tier_mix(child, tier)),
+                other => match *tier {
+                    None => {
+                        *tier = Some(other.is_hdr());
+                        false
+                    }
+                    Some(first) => first != other.is_hdr(),
+                },
+            }
+        }
+
         fn flatten_into(shape: &Shape, out: &mut Vec<Shape>) {
             match shape {
                 Shape::Vec(children) => {
@@ -2805,19 +2841,16 @@ impl Tessellator {
         }
 
         fn tier_runs(shape: &Shape) -> Option<Vec<Shape>> {
-            let mut flat = Vec::new();
-            flatten_into(shape, &mut flat);
-            let mut tier = flat.first()?.is_hdr();
-            let mut mixed = false;
-            for shape in &flat {
-                if shape.is_hdr() != tier {
-                    mixed = true;
-                    break;
-                }
-            }
-            if !mixed {
+            let mut tier = None;
+            if !tier_mix(shape, &mut tier) {
                 return None;
             }
+            let mut tier = tier.expect("a mixed shape has at least one leaf");
+
+            // Only a mixed tree is walked again, and only now do the leaves
+            // have to be owned: each run is handed its own `Shape::Vec`.
+            let mut flat = Vec::new();
+            flatten_into(shape, &mut flat);
 
             let mut runs = Vec::new();
             let mut run = Vec::new();
@@ -2835,8 +2868,9 @@ impl Tessellator {
             Some(runs)
         }
 
-        // Allocation-free for uniform frames: the replacement `Vec` is only
-        // built once a split is actually emitted.
+        // Allocation-free for uniform frames: `tier_runs` decides without
+        // touching the heap, and the replacement `Vec` is only built once a
+        // split is actually emitted.
         let mut replaced: Option<Vec<ClippedShape>> = None;
         for (index, clipped_shape) in shapes.iter().enumerate() {
             let runs = should_parallelize(&clipped_shape.shape)
@@ -3508,7 +3542,7 @@ mod hdr_tests {
     }
 
     #[test]
-    fn text_twin_is_the_projection_of_the_sidecar() {
+    fn text_glyph_twin_is_the_projection_of_the_sidecar() {
         use crate::text::{FontDefinitions, Fonts, TextOptions};
 
         // A chromatic, above-white value: the projection is *not* white, so a
@@ -3522,6 +3556,8 @@ mod hdr_tests {
             FontId::proportional(24.0),
             Color32::WHITE,
         );
+        let glyph_vertex_range = galley.rows[0].visuals.glyph_vertex_range.clone();
+        assert!(!glyph_vertex_range.is_empty());
 
         let underline = Stroke::new(1.0, Color32::from_rgb(10, 20, 30));
         let text_shape = TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE)
@@ -3535,30 +3571,42 @@ mod hdr_tests {
         let colors = mesh.hdr_colors.as_ref().expect("sidecar");
         assert_eq!(colors.len(), mesh.vertices.len());
 
-        for (i, (vertex, &hdr)) in core::iter::zip(&mesh.vertices, colors).enumerate() {
+        // The glyphs really did carry the HDR value, so the check below is not
+        // vacuously "everything is the SDR lift".
+        assert!(colors.contains(&hdr_color));
+
+        // Only the recoloured glyph vertices draw a projection. This is the
+        // value an SDR-only backend shows, so it has to be the sidecar's
+        // projection and not the galley colour.
+        for index in glyph_vertex_range {
             assert_eq!(
-                vertex.color,
-                hdr.projected_color32(),
-                "vertex {i}: the twin must be the sidecar's projection, not the galley colour"
+                mesh.vertices[index].color,
+                colors[index].projected_color32(),
+                "glyph vertex {index}: the twin must be the sidecar's projection"
             );
         }
 
-        // The glyphs really did carry the HDR value, so the check above is not
-        // vacuously "everything is the SDR lift".
-        assert!(colors.contains(&hdr_color));
-        assert!(
-            mesh.vertices
-                .iter()
-                .any(|vertex| vertex.color == hdr_color.projected_color32()),
-            "a glyph vertex must draw the HDR projection"
-        );
+        // Everything else (the underline here) keeps the colour it was authored
+        // with, so it agrees with the projection only to within one 8-bit step.
+        for (i, (vertex, &hdr)) in core::iter::zip(&mesh.vertices, colors).enumerate() {
+            let projected = hdr.projected_color32().to_array();
+            for (got, want) in vertex.color.to_array().iter().zip(projected) {
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "vertex {i}: the twin drifted from the sidecar by more than one step"
+                );
+            }
+        }
     }
 
     #[test]
-    fn text_background_run_keeps_its_sdr_colour() {
+    fn text_background_run_keeps_its_exact_sdr_colour() {
         use crate::text::{FontDefinitions, Fonts, LayoutJob, TextFormat, TextOptions};
 
-        const BACKGROUND: Color32 = Color32::from_rgb(10, 20, 30);
+        // Translucent, so `HdrVertexColor::from(c).projected_color32()` moves
+        // its blue by one 8-bit step (143 -> 142): a twin rewrite is visible
+        // here, where an opaque background would hide it.
+        const BACKGROUND: Color32 = Color32::from_rgba_premultiplied(0, 0, 143, 230);
 
         let mut job = LayoutJob::default();
         job.append(
@@ -3585,22 +3633,30 @@ mod hdr_tests {
         // Background vertices are outside the glyph range, so they take the
         // exact SDR lift: the HDR tier recolours glyphs, never the run's
         // background.
-        let expected = HdrVertexColor::from(BACKGROUND);
+        let lift = HdrVertexColor::from(BACKGROUND);
+        assert_ne!(
+            lift.projected_color32(),
+            BACKGROUND,
+            "the fixture only means something if the projection would differ"
+        );
         assert!(
-            colors.contains(&expected),
+            colors.contains(&lift),
             "the background must stay at its own colour"
         );
-        assert!(
-            mesh.vertices.iter().any(|vertex| {
-                let [r, g, b, a] = vertex.color.to_array();
-                let [er, eg, eb, ea] = BACKGROUND.to_array();
-                r.abs_diff(er) <= 1
-                    && g.abs_diff(eg) <= 1
-                    && b.abs_diff(eb) <= 1
-                    && a.abs_diff(ea) <= 1
-            }),
-            "and the drawn background stays SDR"
-        );
+
+        // And the twin is the authored bytes, untouched: no projection, no
+        // rounding.
+        let mut seen = 0;
+        for (vertex, &hdr) in core::iter::zip(&mesh.vertices, colors) {
+            if hdr == lift {
+                assert_eq!(
+                    vertex.color, BACKGROUND,
+                    "a background vertex's twin must keep its authored colour"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 4, "one background quad, four vertices");
     }
 
     #[test]

@@ -343,36 +343,8 @@ impl Mesh {
     /// [`Vertex::color`], and `color` in the sidecar.
     #[inline]
     pub fn add_rect_with_uv_hdr(&mut self, rect: Rect, uv: Rect, color: HdrVertexColor) {
-        #![expect(clippy::identity_op)]
         self.promote_to_hdr().extend([color; 4]);
-
-        let twin = color.projected_color32();
-        let idx = self.vertices.len() as u32;
-        self.indices
-            .extend_from_slice(&[idx + 0, idx + 1, idx + 2, idx + 2, idx + 1, idx + 3]);
-
-        self.vertices.extend_from_slice(&[
-            Vertex {
-                pos: rect.left_top(),
-                uv: uv.left_top(),
-                color: twin,
-            },
-            Vertex {
-                pos: rect.right_top(),
-                uv: uv.right_top(),
-                color: twin,
-            },
-            Vertex {
-                pos: rect.left_bottom(),
-                uv: uv.left_bottom(),
-                color: twin,
-            },
-            Vertex {
-                pos: rect.right_bottom(),
-                uv: uv.right_bottom(),
-                color: twin,
-            },
-        ]);
+        self.add_rect_with_uv(rect, uv, color.projected_color32());
     }
 
     /// Uniformly HDR-colored rectangle.

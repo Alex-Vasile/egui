@@ -136,9 +136,10 @@ impl HdrVertexColor {
     /// per-channel clamp: every inter-channel ratio among the positive
     /// components is preserved, so hue and saturation survive range
     /// reduction. Per-channel clamping would shift saturated colors toward
-    /// white. Values already inside the SDR range are unchanged (the scale is
-    /// `1 / max(peak, 1.0)`), so lifting a legal `Color32` and projecting it
-    /// back is stable.
+    /// white. Values already inside the SDR range are left alone (the scale
+    /// is `1 / max(peak, 1.0)`), so lifting a legal `Color32` and projecting
+    /// it back is unchanged to within one 8-bit step — and exact for opaque
+    /// values, where the un-premultiply step is a division by one.
     ///
     /// It is total:
     ///
@@ -151,8 +152,10 @@ impl HdrVertexColor {
     /// - Mixed-sign values are scaled by the positive peak and their negative
     ///   components drop to zero: no uniform positive scale can put a negative
     ///   component in `0..=1`.
-    /// - Non-finite input cannot reach the quantizer: an `inf` peak makes the
-    ///   scale `0`, and a `NaN` component is ignored by the `max` fold.
+    /// - Non-finite input cannot reach the quantizer: an `inf` peak takes the
+    ///   identity scale (so an overflowing channel saturates to white rather
+    ///   than collapsing the color to black), and a `NaN` component is
+    ///   ignored by the `max` fold.
     ///
     /// To project a *feathered* value, [`scaled`](Self::scaled) it first: the
     /// reduction divides by the alpha, so scaling the value and scaling the
@@ -186,7 +189,16 @@ impl HdrVertexColor {
 
         // Values already inside the SDR range are untouched; only the excess
         // is range-reduced, uniformly across channels.
-        let k = 1.0 / peak.max(1.0);
+        //
+        // A non-finite peak takes the identity scale rather than its
+        // reciprocal: `1 / inf` would be `0`, which multiplies every channel
+        // to zero and projects the brightest representable input to *black*.
+        // With `k == 1.0`, an overflowing channel saturates to white instead.
+        let k = if peak.is_finite() {
+            1.0 / peak.max(1.0)
+        } else {
+            1.0
+        };
         let scaled = lin.map(|c| (c * k).max(0.0));
 
         // Encode each straight component, *then* premultiply by the
@@ -498,6 +510,61 @@ mod tests {
         // A mid-gray SDR value must not brighten.
         let gray = Color32::from_gray(128);
         assert_eq!(HdrVertexColor::from(gray).projected_color32(), gray);
+    }
+
+    #[test]
+    fn projection_of_an_infinite_peak_saturates_to_white() {
+        // `from_linear` encodes first and *then* rounds to binary16, so a
+        // large enough linear value stores `inf`. That used to make the scale
+        // `1 / inf == 0`, projecting the brightest representable input to
+        // black; it must saturate instead.
+        let overflow = 1.0e30_f32; // finite; its encoding is ~4e13, past binary16
+        assert!(overflow.is_finite());
+        let from_linear = HdrVertexColor::from_linear([overflow, 0.0, 0.0, 1.0]);
+        assert_eq!(from_linear.to_array()[0], f32::INFINITY);
+        assert_eq!(
+            from_linear.projected_color32(),
+            Color32::from_rgba_premultiplied(255, 0, 0, 255)
+        );
+
+        // `scaled` overflows the same way: the largest finite encoded value
+        // times two is `inf`. The alpha stays finite, so this is the plain
+        // `inf` peak path and not the `NaN`-ratio one.
+        let near_max = HdrVertexColor::from_rgba_premultiplied([65504.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            near_max.projected_color32(),
+            Color32::from_rgba_premultiplied(255, 0, 0, 255),
+            "the last finite value was already correct"
+        );
+        let overflowed = near_max.scaled(2.0);
+        assert_eq!(overflowed.to_array()[0..2], [f32::INFINITY, 0.0]);
+        assert_eq!(
+            overflowed.projected_color32(),
+            Color32::from_rgba_premultiplied(255, 0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn projection_of_a_translucent_lift_can_move_by_one_step() {
+        // Measured over the whole premultiplied colour cube (1,082,146,816
+        // colors): 8,435,729 of them differ by exactly one 8-bit step on a
+        // lift/project round trip, all translucent. `b / a` divides two
+        // separately f16-rounded values and the result is requantized with the
+        // `.5`-truncating round, so a value on a quantizer boundary can flip.
+        // This is the counterexample that keeps the doc at "within one step".
+        let color = Color32::from_rgba_premultiplied(0, 0, 143, 230);
+        let projected = HdrVertexColor::from(color).projected_color32();
+        assert_eq!(projected, Color32::from_rgba_premultiplied(0, 0, 142, 230));
+        assert_eq!(projected.b().abs_diff(color.b()), 1);
+
+        // Opaque values are exact — there is no un-premultiply step.
+        for color in [
+            Color32::from_rgb(0, 0, 143),
+            Color32::from_rgb(200, 100, 50),
+            Color32::from_gray(1),
+        ] {
+            assert_eq!(HdrVertexColor::from(color).projected_color32(), color);
+        }
     }
 
     #[cfg(feature = "serde")]

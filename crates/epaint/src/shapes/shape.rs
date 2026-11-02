@@ -489,17 +489,20 @@ impl Shape {
 
     /// Does this shape carry the HDR vertex-color tier?
     ///
-    /// Total over the three producers: the [`Self::Hdr`] operator, the
-    /// [`TextShape::hdr_color`] field, and a hand-built [`Mesh`] with a
-    /// sidecar. The tessellator's mesh-grouping key uses this to keep HDR and
-    /// SDR content in separate primitives, so this method has to be complete —
-    /// a missed arm silently promotes the neighbouring SDR geometry.
+    /// Total over the producers: the [`Self::Hdr`] operator, the
+    /// [`TextShape::hdr_color`] field, a hand-built [`Mesh`] with a sidecar,
+    /// and — recursively — a [`Self::Vec`] containing any of those (what
+    /// [`Self::hdr`] hands back for multi-child input). The tessellator's
+    /// mesh-grouping key uses this to keep HDR and SDR content in separate
+    /// primitives, so this method has to be complete — a missed arm silently
+    /// promotes the neighbouring SDR geometry.
     #[must_use]
     pub fn is_hdr(&self) -> bool {
         match self {
             Self::Hdr { .. } => true,
             Self::Text(text) => text.hdr_color.is_some(),
             Self::Mesh(mesh) => mesh.is_hdr(),
+            Self::Vec(shapes) => shapes.iter().any(Self::is_hdr),
             _ => false,
         }
     }
@@ -863,6 +866,28 @@ mod hdr_tests {
         let mut mesh = Mesh::default();
         mesh.add_colored_rect_hdr(rect(), HdrVertexColor::WHITE);
         assert!(Shape::mesh(mesh.clone()).is_hdr());
+
+        // A `Vec` reports the tier of its contents, recursively — `Shape::hdr`
+        // hands one back for multi-child input, so that value must report HDR.
+        assert!(
+            Shape::hdr(
+                Shape::Vec(vec![
+                    Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+                    wrap(Shape::Noop, HdrVertexColor::WHITE),
+                ]),
+                HdrVertexColor::WHITE,
+            )
+            .is_hdr()
+        );
+        assert!(
+            !Shape::Vec(vec![
+                Shape::Noop,
+                Shape::rect_filled(rect(), 0.0, Color32::WHITE)
+            ])
+            .is_hdr()
+        );
+        assert!(Shape::Vec(vec![Shape::mesh(mesh)]).is_hdr());
+        assert!(!Shape::Vec(Vec::new()).is_hdr());
 
         // `Shape::Hdr` transforms and bounds delegate to the inner shape.
         let mut shape = wrap(

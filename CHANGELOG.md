@@ -19,7 +19,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 ### ⭐ Added
 * HDR painting: `Painter::add_hdr(shape, color)` / `add_hdr_uv(shape, callback)` wrap any shape in `epaint::Shape::Hdr` and recolour it by coverage, so strokes, polylines, polygon fills, images and every future shape can be painted above SDR white; `rect_filled_hdr`, `line_segment_hdr` and `arrow_hdr` are the positional-colour mirrors of the SDR builders
 * `RichText::color_hdr` + `Ui::hdr_label`: HDR glyph color, read by `Label` before the layout job consumes the text (the layout road is `Color32`-bound). `From<HdrColor> for HdrVertexColor` makes an HDR picker value usable directly as a painting color
-* HDR values participate in `Ui::multiply_opacity` and `fade_to_color`: the painter's colour fold now carries an encoded-space HDR mirror of `tint_color_towards` (same three branches and integer divisor), so an HDR mesh does not diverge from its `Color32` twin on the GL backend
+* HDR values participate in `Ui::multiply_opacity`: the painter's colour fold scales each mesh's HDR sidecar by the same factor it applies to `Color32`. `fade_to_color` stays `Color32`-only — it is an internal all-or-nothing clear, and the HDR sidecar is deliberately left alone there
 
 ### ⚠️ Breaking changes
 * `text_selection::LabelSelectionState::label_text_selection` takes the label's `Option<epaint::HdrVertexColor>` as a new final argument

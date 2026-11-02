@@ -248,6 +248,13 @@ impl PaintStats {
             if let Primitive::Mesh(mesh) = &clipped_primitive.primitive {
                 self.vertices += AllocInfo::from_slice(&mesh.vertices);
                 self.indices += AllocInfo::from_slice(&mesh.indices);
+                if let Some(hdr_colors) = &mesh.hdr_colors {
+                    // The HDR sidecar is per-vertex storage, and it is part of
+                    // the mesh's heap footprint — counted here exactly as
+                    // `AllocInfo::from_mesh` counts it, so an HDR frame's actual
+                    // bytes are not under-reported.
+                    self.vertices += AllocInfo::from_slice(hdr_colors);
+                }
             }
         }
         self
@@ -256,4 +263,36 @@ impl PaintStats {
 
 fn megabytes(size: usize) -> String {
     format!("{:.2} MB", size as f64 / 1e6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PaintStats;
+    use crate::{ClippedPrimitive, Color32, HdrVertexColor, Mesh, Pos2, Primitive, Rect, vec2};
+
+    #[test]
+    fn clipped_primitives_count_the_hdr_sidecar() {
+        let clip_rect = Rect::from_min_size(Pos2::ZERO, vec2(4.0, 4.0));
+
+        let mut sdr = Mesh::default();
+        sdr.add_colored_rect(clip_rect, Color32::WHITE);
+        let mut hdr = Mesh::default();
+        hdr.add_colored_rect_hdr(clip_rect, HdrVertexColor::WHITE);
+        assert_eq!(sdr.vertices.len(), hdr.vertices.len());
+
+        let vertices_stat = |mesh: Mesh| {
+            PaintStats::default()
+                .with_clipped_primitives(&[ClippedPrimitive {
+                    clip_rect,
+                    primitive: Primitive::Mesh(mesh),
+                }])
+                .vertices
+        };
+
+        assert_eq!(
+            vertices_stat(hdr).num_bytes(),
+            vertices_stat(sdr).num_bytes() + 4 * core::mem::size_of::<HdrVertexColor>(),
+            "the sidecar is per-vertex storage, so an HDR frame's bytes must include it"
+        );
+    }
 }
