@@ -10,9 +10,11 @@ full (§1), re-grounded against the tree (§4), and turned into a design space (
 (§8), and a PR ladder (§14). Nothing here changes a decision already shipped in PRs 1–5.
 
 **Anchors:** re-verified against the working tree at `714f2a0cf`
-(`hdr-side-items-test-app`, 2026-11-02), then re-checked in a second (house-style) pass on the same
-day — the §4 line numbers and the §5 measurements below are the second pass's (Appendix C.3). Line
-numbers are as of this branch.
+(`hdr-side-items-test-app`, 2026-11-02), then re-checked in a second (house-style) pass, then a
+third pass (review of the second) re-resolved **every** anchor in this document against the file it
+names and re-ran the §5 layout probe; stale anchors, one non-existent file (`egui/src/visuals.rs`)
+and one orphan-rule violation were corrected in that third pass (Appendix C.4). Line numbers are as
+of this branch and were confirmed by reading, not by arithmetic.
 
 ---
 
@@ -50,6 +52,16 @@ draw-record/batching layer to key on a tier (§11), and glow's warn-once convent
 `TextureId`, which a mesh does not have (§11). Each correction is recorded where it bites and
 summarised in Appendix C.3; none of them weakens the three capabilities, the §3 contract, or the
 SDR-is-untouched rule.
+
+Reviewed again the same day (third pass, Appendix C.4): C.3's measurements and its one reversal
+stand, but its *mechanism* claims did not. The blocking ones were an incomplete `Shape::is_hdr()`
+(a hand-built HDR mesh missed the batching key), opacity/fade never reaching HDR content, a twin
+projection that divided by zero on feather vertices and inverted all-negative values, a text sidecar
+that ignored the underline, an `impl From<Rgba>` that cannot compile where it was placed, a wrapper
+over `Shape::Callback` that would panic, and §11/§13 disagreeing about whether an SDR frame compiles
+an HDR pipeline. All seven are fixed where they bite; the SDR-is-untouched rule is *stronger* for it
+(an SDR frame now provably creates one pipeline, dims nothing differently, and allocates nothing
+new).
 
 ---
 
@@ -194,15 +206,18 @@ content approaches the ceiling.
 - `epaint/src/tessellator.rs:2328-2358` — text vertex propagation: `override_text_color`,
   `PLACEHOLDER` fallback, color-glyph anti-tint, opacity factor.
 - `epaint/src/shape_transform.rs:88-111,132-147` — color adjustment for placed rows and
-  `ColorMode` callbacks (must gain the HDR arm). `:114-120` destructures
+  `ColorMode` callbacks (must gain the HDR arm). `:114-121` destructures
   `Mesh { indices: _, vertices, texture_id: _ }` **exhaustively** — it stops compiling the moment
-  `Mesh` gains a field, which is the compiler doing the work of finding every such site.
+  `Mesh` gains a field, which is the compiler doing the work of finding every such site. This
+  function is also where `Painter::multiply_opacity` / `tint_shape_towards`
+  (`egui/src/painter.rs:555-570`) land, so it is the one place that has to learn to dim
+  `Mesh::hdr_colors` and `TextShape::hdr_color` (§9).
 - `epaint/src/shapes/shape.rs:437-445` — `Shape::texture_id()`: an `if let` chain, **not** an
   exhaustive match, so the compiler will *not* point at it when `Shape` gains a variant. It drives
-  the tessellator's mesh-grouping (`tessellator.rs:1490-1535`), so a variant that wraps geometry
+  the tessellator's mesh-grouping (`tessellator.rs:1512-1535`), so a variant that wraps geometry
   must delegate here or the tessellator appends across textures and panics on
-  `tessellator.rs:952-956`'s `assert_eq!`.
-- `epaint/src/shapes/shape.rs:403-433` — `visual_bounding_rect` (exhaustive, compiler-visible) and
+  `tessellator.rs:954-957`'s `assert_eq!`.
+- `epaint/src/shapes/shape.rs:403-431` — `visual_bounding_rect` (exhaustive, compiler-visible) and
   `transform` (`:467`).
 - `epaint/src/stats.rs:192-230` — `PaintStats::add` (exhaustive; a new `Shape` variant needs an
   arm), `:160-176` its fields, `:232-245` `with_clipped_primitives`. `AllocInfo` (`:13-19`) is a
@@ -213,8 +228,16 @@ content approaches the ceiling.
 - `epaint/src/text/text_layout.rs:1284-1330` — glyph vertex emission.
 - `epaint/src/shapes/rect_shape.rs:24,30,56` — `fill: Color32`, `stroke: Stroke`, `brush`.
 - `epaint/src/shapes/band_shape.rs:59-71`, `shapes/shape.rs:27-78` — shape payloads.
-- `egui/src/visuals.rs:87-89` — text color override writes `vertex.color` directly.
-- `egui/src/text_selection/label_text_selection.rs:294-298` — selection clears `vertex.color`.
+- `egui/src/visuals.rs` **does not exist** (an earlier draft cited `:87-89` here). The
+  text-colour-override mechanism is a `TextShape` field, not a `vertex.color` write:
+  `TextShape::override_text_color` (`text_shape.rs:30-33`) consumed in `tessellate_text`
+  (`tessellator.rs:2330-2337`), glyph-range only. That is the exact scope `TextShape::hdr_color`
+  copies (§8.6).
+- `egui/src/text_selection/label_text_selection.rs:286-305` — the selection *hides* already-painted
+  text by setting `row.visuals.mesh.vertices[i].color = Color32::TRANSPARENT` on the **galley mesh**,
+  i.e. before `tessellate_text` runs. This is safe for the tier only if the HDR sidecar carries the
+  vertex alpha as a factor (a cleared vertex must produce a zero sidecar), which is why §8.6 folds
+  `vertex.color.a()` into the stored value rather than relying on the fragment.
 
 **GPU side**
 
@@ -234,17 +257,19 @@ content approaches the ceiling.
   (`fs_main_linear_framebuffer` vs `fs_main_gamma_framebuffer`).
 - `egui-wgpu/src/renderer.rs:551-552,1373-1410` — vertex staging: one contiguous buffer,
   `bytemuck::cast_slice(&mesh.vertices)`, per-mesh byte ranges (the `SlicedBuffer` at `:207-211`).
-- `egui-wgpu/src/egui.wgsl:1-5` — `VertexOutput{tex_coord, color (gamma), position}`;
-  `:60-70` `unpack_color`; `:96-110` `vs_main`; `:180-215` the two fragment entry points
+- `egui-wgpu/src/egui.wgsl:1-5` — `VertexOutput{tex_coord, color, position}` (the `color` comment
+  still says "gamma 0-1" and needs the tier's "may exceed 1.0" in 6a);
+  `:60-70` `unpack_color`; `:79-90` `vs_main`; `:169-212` the two fragment entry points
   (`DITHER_CAPABLE` is an existing spliced constant — the precedent for compile-time *branching*;
   note the tier deliberately does **not** follow it, see the pipeline-matrix bullet below).
 - `egui-wgpu/src/egui_transfer.wgsl` — transfer fns shared by production and the round-trip test.
 - `egui-wgpu/src/renderer.rs:1452-1570` — `PairingRejection` for tagged float content (textures).
 - `egui-wgpu/src/surface_policy.rs:328-380` — pairing walk; `is_u8` `:348`, `is_f16` `:361`.
-- `egui_glow/src/painter.rs:222-252` — VAO layout: `a_srgba` = 4 × `UNSIGNED_BYTE` at
-  `offset_of!(Vertex, color)`, stride `size_of::<Vertex>()`; `:480-486` raw `cast_slice` upload.
-- `egui_glow/src/shader/vertex.glsl:24-36` — `v_rgba_in_gamma = a_srgba / 255.0`.
-- `egui_glow/src/shader/fragment.glsl:56-70` — gamma-space multiply + dither.
+- `egui_glow/src/painter.rs:224-252` — VAO layout: `a_srgba` = 4 × `UNSIGNED_BYTE` at
+  `offset_of!(Vertex, color)` (`:250`), stride `size_of::<Vertex>()`; `:483-491` raw `cast_slice`
+  upload.
+- `egui_glow/src/shader/vertex.glsl:22-36` — `v_rgba_in_gamma = a_srgba / 255.0` (`:34`).
+- `egui_glow/src/shader/fragment.glsl:46-57` — gamma-space multiply (`:50`) + dither.
 
 **Testing / capture**
 
@@ -266,13 +291,17 @@ content approaches the ceiling.
 
 `cargo run -p epaint --example size_probe` (throwaway probe, removed) on aarch64 macOS. Re-run
 2026-11-02 for the *proposed* layouts as well as the shipped ones — the proposed columns are the
-ones that decide §8, and one early claim did not survive the re-run (consequence 3 below).
+ones that decide §8, and one early claim did not survive the re-run (consequence 3 below). The
+layout probe was re-run a third time in the review pass with a standalone `rustc` file that mirrors
+`Color32`/`HdrVertexColor`/`ColorMode`/`HdrColorMode`/`PathStroke`/`PathShape`/`TextShape`/`Mesh`/
+`Shape` field-for-field; every number in both tables below reproduced, and `HdrColorMode` and the
+`Shape::Hdr` payload are now measured rows rather than inferences from `ColorMode`.
 
 | Type | Bytes | Headroom |
 |---|---|---|
 | `Vertex` | 20 | — |
 | `Mesh` / `Mesh16` | 64 / 64 | `Mesh` is `Arc`-ed inside `Shape`; growth is cheap |
-| `Shape` | **64** | **has a hard guard** (`shapes/shape.rs:80-91`) |
+| `Shape` | **64** | **has a hard guard** (`shapes/shape.rs:61-72`) |
 | `PathShape` | 56 | inside a 64 B `Shape`: effectively none (the tag rides the remainder) |
 | `RectShape` | 56 | effectively none |
 | `TextShape` | 48 | 8 B — exactly one `Option<HdrVertexColor>` (§8.6) |
@@ -288,6 +317,7 @@ Proposed types, measured the same way:
 |---|---|---|
 | `HdrVertexColor` (8, `[u16; 4]`) | 8 | — |
 | `Option<HdrVertexColor>` | 10 | `TextShape` 48 → 56; `Shape` unchanged (payload ceiling is `PathShape`'s 56) |
+| `HdrColorMode` (`{Solid(HdrVertexColor), UV(Arc<dyn Fn…>)}`) | 16 | — (the same niche layout as `ColorMode`; measured, not inferred) |
 | `Shape::Hdr { inner: Arc<Shape>, color: HdrColorMode }` payload | 24 | `Shape` unchanged (24 ≤ 56) |
 | `Mesh` + `Option<Vec<HdrVertexColor>>` / `Option<Box<[… ]>>` | 88 / 80 | unchanged (`Arc`-ed) |
 | `ColorMode` with one or two extra variants | **24** | `PathStroke` 32, `PathShape` 64 → **`Shape` grows** |
@@ -305,19 +335,21 @@ Consequences, decided here rather than discovered in review:
    measure **24 B** (the payload type is irrelevant). Verified independently with a standalone
    `rustc` probe: 2 variants → 16 B, 3 variants → 24 B, and adding a fourth does not grow it
    further. The *reason* is rustc's layout choice rather than a property of the enum, so treat
-   `ColorMode` as **full at 16 B** and do not build a design on a future re-packing. 24 B `ColorMode` → `PathStroke` 32 → `PathShape` 64 → `Shape`
-   past its guard. So HDR path colour does **not** ride `ColorMode`; it rides the `Shape::Hdr`
-   wrapper, whose 24 B payload fits under `PathShape`'s 56 B ceiling (§8.3). This is a measured
-   reversal of the §5-era assumption, not a preference.
-4. **`TextShape` has room for exactly one `Option<HdrVertexColor>`** (48 → 56, measured), and
-   `Shape` stays 64 because `PathShape` sets the payload ceiling. Anything wider than 8 B of
-   payload there needs the boxed/`add_hdr` fallback (§8.6).
+   `ColorMode` as **full at 16 B** and do not build a design on a future re-packing.
+   24 B `ColorMode` → `PathStroke` 32 → `PathShape` 64 → `Shape` past its guard. So HDR path
+   colour does **not** ride `ColorMode`; it rides the `Shape::Hdr` wrapper, whose 24 B payload fits
+   under `PathShape`'s 56 B ceiling (§8.3). This is a measured reversal of the §5-era assumption,
+   not a preference.
+4. **`TextShape` has room for exactly one `Option<HdrVertexColor>`** (48 → 56, measured: the 10-byte
+   `Option` lands in the struct's 4 bytes of tail padding plus 6 new bytes), and `Shape` stays 64
+   because `PathShape` sets the payload ceiling. There is no room for a *second* such field — the
+   next text-only HDR datum takes the boxed/`add_hdr` fallback (§8.6).
 5. **`Stroke` stays 8 B** → `Shape::LineSegment` stays SDR. HDR segments are meshes or wrapped
    shapes.
 6. Every PR that touches `Shape` sub-structs must keep `shape_size` green, and must add a guard for
    anything new that is size-sensitive (`PathStroke`, `ColorMode`, `Shape::Hdr`'s payload,
    `TextShape`, `Mesh`'s field set). The guard is a `#[test]`, not a `const` assert
-   (`shapes/shape.rs:81-91`), so it runs in the normal test job.
+   (`shapes/shape.rs:61-72`), so it runs in the normal test job.
 
 `Mesh` is 64 B as `indices: Vec` (24) + `vertices: Vec` (24) + `texture_id: TextureId` (16)
 — the surprising 16 is `TextureId`'s two-variant `u64` enum (`epaint/src/lib.rs:105-116`), not
@@ -339,7 +371,7 @@ pushed vertex. Resolved here (it was §16 question 6) rather than deferred: **`V
 - **For:** one array, one geometry code path (`translate`/`rotate`/`append`/`split_to_u16` just work),
   one staging buffer, no length invariant.
 - **Against:** +40% vertex memory and vertex-fetch bandwidth for **every** app, including the ~all-SDR
-  majority; touches every `Vertex` literal (12 sites), the `unity` variant, `Vertex`'s serde shape,
+  majority; touches every `Vertex` literal (13 sites, the §4 list), the `unity` variant, `Vertex`'s serde shape,
   and any external code that constructs `Vertex` by literal (breaking change).
 - **Note:** storing the field as `[u16; 4]` (f16 *bits*) rather than `[half::f16; 4]` preserves
   `Eq` and the serde derive with no new trait surface — the §11 "`Eq` drop" concern dissolves for
@@ -459,7 +491,7 @@ Two results from the same investigation are folded into §6.3 and §11 rather th
 
 | | SDR bytes/vertex | HDR bytes/vertex | Vertex literals touched | glow | `Vertex` serde | new invariants | pipelines |
 |---|---|---|---|---|---|---|---|
-| **A** dual field in `Vertex` | 28 (+40%) | 28 | 12 sites + `unity` | untouched | changed | none | 2 (or 1 with A′) |
+| **A** dual field in `Vertex` | 28 (+40%) | 28 | 13 sites + `unity` | untouched | changed | none | 2 (or 1 with A′) |
 | **B** sidecar (**recommended**) | **20** | 28 | none | untouched | unchanged | 1 (`len` match) | 2 |
 | **C** mesh uniform | 20 | 20 | none | untouched/ignored | unchanged | none | 1 + per-draw uniform (new machinery) |
 | **D** dual vertex types | 20 | 24 | new type, parallel | two paths | two reprs | two geometry impls | 2 |
@@ -485,8 +517,10 @@ Because B leaves `Vertex` alone:
   Option<Vec<HdrVertexColor>>` — the *gated* form every optional serde attribute in this tree uses
   (`tessellator.rs:665`, `style.rs:243`, …); a bare `#[serde(default)]` does not compile without
   the feature. `Mesh16` has no derives at all (`mesh.rs:337-348`), so it takes the field and no
-  serde obligation. Old serialized meshes load as SDR (the correct semantic). New meshes read by old
-  code lose the HDR tier — acceptable, and documented.
+  serde obligation. `TextShape` **is** serde-derived (`text_shape.rs:11-12`), so its new
+  `hdr_color` field takes the same gated `serde(default)` form (§8.6) — the only HDR field that
+  crosses a serialization boundary. Old serialized meshes load as SDR (the correct semantic). New
+  meshes read by old code lose the HDR tier — acceptable, and documented.
 - `HdrVertexColor` stores `[u16; 4]` (f16 bit patterns) so `Eq`/`PartialEq`/serde derive without a
   NaN caveat: bit equality is the right semantics for a *render list* (a different NaN payload is a
   different byte pattern, and `-0.0 ≠ 0.0` is harmless). This is a deliberate deviation from
@@ -502,11 +536,31 @@ Because B leaves `Vertex` alone:
 
 ## 8. API surface
 
+**Two notions, not two mechanisms.** The tier appears at two levels, and they are layers of one
+design, not competing conventions:
+
+| Level | Type | What it says | Existing SDR counterpart |
+|---|---|---|---|
+| Storage (data plane) | `Mesh::hdr_colors` | *these vertices* carry HDR values | `Vertex::color` |
+| Operator (shape level) | `Shape::Hdr { inner, color }` | paint this already-tessellated geometry in this HDR colour, using its **coverage** | `RectShape::fill` / `PathStroke::color` |
+| Source (per-shape) | `HdrColorMode::{Solid, UV}` | how the operator's colour is evaluated per vertex | `ColorMode::{Solid, UV}` |
+| Field (text only) | `TextShape::hdr_color` | the glyph colour of this text run | `TextShape::override_text_color` |
+
+The operator lowers *into* the storage: `Shape::Hdr` writes the sidecar for the vertices it
+recolours (§9). That is the same relationship `ColorMode` has with the mesh it tessellates, and the
+same relationship `RectShape::fill` has with the vertices `RectShape` emits — one vocabulary at the
+shape level, one storage at the vertex level. What is deliberately *not* added is a second storage
+(a field on `Vertex`) or a second path-colour enum inside tessellation (`ColorMode::Hdr*`): §5
+rules both out by measurement, and §8.3 records the reversal. The narrowing that keeps this honest:
+`Shape::Hdr` is an **operator over coverage** and never the way to carry per-vertex HDR data a caller
+already has — that is `Mesh::hdr_colors` + a hand-built mesh, and the operator's rustdoc says so.
+
 ### 8.1 `epaint::HdrVertexColor` (new, `epaint/src/hdr_color.rs`)
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]   // wire form *is* the bits: `[u16; 4]`
 #[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[repr(C)]
 pub struct HdrVertexColor { bits: [u16; 4] }   // f16 patterns, §3 contract
@@ -525,6 +579,9 @@ Constructors/accessors follow `ecolor`'s value-type naming, not a private dialec
   is `FloatImage::from_rgba`, `image.rs:519`).
 - `to_array() -> [f32; 4]` — back, lossy (`Color32::to_array` / `Rgba::to_array`, `color32.rs:231`,
   `rgba.rs:188`). Not `encoded()`: every accessor in `ecolor` that returns components is `to_*`/`r()`.
+- `projected_color32(&self) -> Color32` — the SDR twin: the legal-premultiplied range reduction the
+  GL backend draws and the HDR mesh's unused `Vertex::color` carries (§8.5). Total on every input,
+  including transparent and negative values.
 - `from_linear([f32; 4]) -> Self` — the ergonomic constructor. Input is **straight (unmultiplied)**
   linear RGBA: each component is encoded with `ecolor::gamma_from_linear` (odd-symmetric since PR 2a)
   and then premultiplied, `stored = a × enc(L)`; `a` is the coverage and is not encoded. Say so in
@@ -537,12 +594,18 @@ Constructors/accessors follow `ecolor`'s value-type naming, not a private dialec
 - `TRANSPARENT` (`[0.0; 4]`), `WHITE`, `from_white_alpha(f32)` — the `Color32` const/method set,
   names included (`TRANSPARENT` at `color32.rs:60`, `from_white_alpha` at `:171`). `ZERO`/`from_alpha`
   would be a second vocabulary for the same two values.
-- `From<HdrColor>` lives in `egui` (epaint must not depend on the picker type) and goes through
-  `HdrColor::effective_linear` → `from_linear([r, g, b, 1.0])`; `egui` may also provide
-  `impl From<Rgba>`.
+- `From<HdrColor>` lives in `egui` (epaint must not depend on the picker type; `HdrColor` is an
+  egui type) and goes through `HdrColor::effective_linear` → `from_linear([r, g, b, 1.0])`.
+  `effective_linear` clamps only the *exposure* to ±6 stops and scales `rgb` by `2^stops`
+  (`color_picker.rs:887-892`); nothing is per-channel clamped on the way in, so the ratio is
+  preserved and alpha is exactly 1 (`HdrColor` is opaque by design).
+- `impl From<Rgba> for HdrVertexColor` lives in **epaint**, next to `impl From<Color32>`: both
+  `From` and `Rgba` are foreign to `egui`, so an impl there would violate the orphan rule and not
+  compile. (Rgba's components are linear *and* premultiplied — `Rgba::from_rgba_premultiplied`'s
+  convention — so the impl encodes in place, unlike `from_linear`.)
 
-Not `Copy`-detectable from `Color32` at the type level: the tier is a property of the mesh, not of a
-value, which is what keeps the SDR path free.
+There is deliberately no way to detect "is this `HdrVertexColor` also a `Color32`": the tier is a
+property of the *mesh*, never of a value, which is what keeps the SDR path free.
 
 ### 8.2 `Mesh` / `Mesh16`
 
@@ -557,17 +620,24 @@ value, which is what keeps the SDR path free.
 - `colored_vertex_hdr(pos, color: HdrVertexColor)`, `add_colored_rect_hdr(rect, color)`,
   `add_rect_with_uv_hdr(rect, uv, color)` — the last one builds the four sidecar entries alongside
   the existing four `Vertex` literals (`mesh.rs:199-227`); the other two delegate to it the way
-  `add_colored_rect` delegates today (`mesh.rs:229-237`).
-- **Tier mixing (`append`/`append_ref`):** if exactly one side is HDR, `promote_to_hdr()` the SDR
-  side — lifting every `Color32` via `HdrVertexColor::from(Color32)` preserves appearance within
-  f16's worst-case relative error (~2^-11 ≈ 4.9e-4, i.e. well under half an 8-bit step, the
-  `< 1/512` assertion §8.1 carries). Nothing in the merge is clamped. Never mix by silently dropping
-  the HDR side. `promote_to_hdr()` is public and idempotent.
+  `add_colored_rect` delegates today (`mesh.rs:231-237`).
+- **Tier mixing (`append`/`append_ref`):** the merge never silently drops the HDR side, and it
+  never needs to: an SDR `Color32` lifts to `HdrVertexColor::from(Color32)` within f16's worst-case
+  relative error (~2^-11 ≈ 4.9e-4, well under half an 8-bit step — the `< 1/512` assertion §8.1
+  carries), and nothing in the merge is clamped. `promote_to_hdr()` is public and idempotent.
+  The two entry points differ in what they can mutate, and the doc must say so because
+  `append_ref(&mut self, other: &Self)` (`mesh.rs:147`) cannot touch `other`:
+  - `append(self, other: Self)` — promote whichever side is SDR (owned, so either is writable).
+  - `append_ref(&mut self, other: &Self)` — if `other.is_hdr()` and `self` is SDR, `self.promote_to_hdr()`
+    then extend; if `self` is HDR and `other` is SDR, lift `other`'s colours **into the extension
+    iterator** (no mutation of `other`, no temporary `Vec`).
 - `split_to_u16` carries the sidecar through both the fast path and the split path (`mesh.rs:242-303`);
   `bytes_used` counts it (`:92-97`); `clear` clears it (`:85-90`); `AllocInfo::from_mesh` counts it so
   the perf numbers do not lie (§4); and `translate`/`transform`/`rotate` are colour-free and
   unchanged.
-- `Mesh::append_ref`'s existing "same texture" assert is unchanged.
+- `Mesh::append_ref`'s existing "same texture" assert is unchanged. The tessellator's grouping key
+  (`tessellator.rs:1518-1535`) has two halves: the texture half is `Shape::texture_id()`, which
+  `Shape::Hdr` must delegate (§4), and the tier half is `Shape::is_hdr()` (§9).
 
 ### 8.3 Path color: `ColorMode` stays untouched (**decision reversed 2026-11-02**)
 
@@ -587,7 +657,7 @@ rest of the API uses (§8.4):
 - **HDR ramps along path-shaped geometry** (§1.2 item 3): the wrapper's positional colour source.
 
 ```rust
-// epaint/src/color.rs, next to `ColorMode` — the same two-variant shape, so also 16 B
+// epaint/src/color.rs, next to `ColorMode` — the same two-variant niche layout; measured 16 B (§5)
 pub enum HdrColorMode {
     /// One HDR value for the whole shape.
     Solid(HdrVertexColor),
@@ -599,7 +669,7 @@ pub enum HdrColorMode {
 }
 ```
 
-- `Clone`, `Debug` and `PartialEq` follow `ColorMode`'s treatment (`color.rs:8,28-44`): hand-written
+- `Clone`, `Debug` and `PartialEq` follow `ColorMode`'s treatment (`color.rs:9,32-50`): hand-written
   `Debug`/`PartialEq`, `UV == UV` is `false`. **No serde at all** — `Shape` is not serde-derived
   (`shapes/shape.rs:26`: `Clone, Debug, PartialEq`), so `Shape::Hdr`'s payload never crosses a
   serialization boundary and a `serde(skip)` attribute would be dead weight. `impl From<HdrVertexColor>
@@ -610,7 +680,7 @@ pub enum HdrColorMode {
   `MarginF32`, `Stroke` / `PathStroke`. There is no generic-with-default type in `epaint` or `egui`
   (only `egui_kittest::Harness<'a, State = ()>`), generalising would make `ColorMode`'s
   `Color32`-specific `Default`/`TRANSPARENT` conditional, force the first generic serde derive in
-  `epaint`, and buy no shared implementation — `get_color` (`tessellator.rs:1118-1121`) and
+  `epaint`, and buy no shared implementation — `get_color` (`tessellator.rs:1119-1123`) and
   `adjust_color_mode` (`shape_transform.rs:132-147`) are `Color32`-only either way. Two contracts
   under one name (path colour vs. post-tessellation coverage mask) would be the cost with no benefit.
 - **`PathStroke`, `ColorMode`, `Stroke`, `Shape::LineSegment`, `get_color`, `mul_color`,
@@ -621,10 +691,10 @@ pub enum HdrColorMode {
 ### 8.4 Fills (deliberately not widened)
 
 `PathShape::fill` and `RectShape::fill` are `Color32` and their structs are at the `Shape` ceiling
-(§5). HDR *fills* are expressed as meshes:
+(§5). HDR *fills* are expressed as meshes, or as a wrapped shape:
 
 - **`Shape::gradient_rect_hdr(rect, direction, [HdrVertexColor; 2])`** — the exact mirror of the
-  existing `Shape::gradient_rect` (`epaint/src/shapes/shape.rs:323-346`), which is already a
+  existing `Shape::gradient_rect` (`epaint/src/shapes/shape.rs:329-347`), which is already a
   four-vertex mesh. Same `Direction` semantics, same corner assignment, plus the sidecar. Shipping a
   differently-named `gradient_quad` instead would be inventing a second API for a solved problem.
 - **`Painter::rect_filled_hdr(rect, corner_radius, color)`** — `add_hdr(RectShape::filled(rect,
@@ -632,7 +702,8 @@ pub enum HdrColorMode {
   `(1,1,1,1)` and take the colour, feather vertices are transparent and stay transparent, and the
   component-wise multiply of two premultiplied encoded pairs is exactly what the fragment shader
   does with a texel. This inherits rounded corners, stroke kinds, blur, brushes and every future
-  `RectShape` feature instead of duplicating corner tessellation.
+  `RectShape` feature instead of duplicating corner tessellation — with the caveat that a brush's
+  texels keep multiplying *on top of* the HDR tint (§8.4's operator note).
 - **`Painter::add_hdr(shape: impl Into<Shape>, color: impl Into<HdrColorMode>) -> ShapeIdx`** — the
   generic escape hatch behind the parity map in §8.7. **Mechanism: a `Shape` wrapper, not eager
   tessellation.** The painter does not tessellate, and there is no public "tessellate one shape"
@@ -643,71 +714,118 @@ pub enum HdrColorMode {
   Shape::Hdr { inner: Arc<Shape>, color: HdrColorMode }   // §8.3 for the mode
   ```
 
-  with one tessellator arm (§9): tessellate `inner` into `out`, then for the vertices it just
-  emitted set `hdr = color(pos) × (vertex.alpha / 255)` and
-  `vertex.color = hdr.projected_color32(alpha)`. `color(pos)` is the solid value or the callback
-  evaluated on `inner.visual_bounding_rect().expand(feathering)` — the analogue of the path
-  tessellator's `uv_bbox` (`tessellator.rs:1111-1116`). The inner shape's RGB is discarded; **its
-  alpha channel is the coverage mask**, which is why feathering, rounded corners, antialiasing and
-  glyph edges all keep working with no new geometry code.
+  with one tessellator arm (§9): record the vertex cursor, tessellate `inner` into `out`, then
+  `out.promote_to_hdr()` and for the vertices it just emitted set
+  `hdr = color(pos) × (vertex.alpha / 255)` (sidecar) and
+  `vertex.color = hdr.projected_color32()` (the glow twin, §8.5). `color(pos)` is the solid value or
+  the callback evaluated on `inner.visual_bounding_rect().expand(feathering)`, where `feathering` is
+  `TessellationOptions::feathering_size_in_pixels` on the tessellator that is running the arm. That
+  is the same construction as the path tessellator's `uv_bbox` (`tessellator.rs:1111-1116`: path
+  bounds + half the stroke width + feathering) but *not* bit-identical for `StrokeKind::Inside`/
+  `Outside` strokes, because `PathShape::visual_bounding_rect` (`path_shape.rs:69-75`) uses the
+  unshifted points while `uv_bbox` uses the stroke-shifted ones; the difference is ±`width/2` on the
+  rect the callback sees, and it is stated rather than papered over.
+
+  **What the operator does to colour, exactly.** It replaces the *vertex colour* and keeps everything
+  else: UVs, `texture_id` and the geometry are untouched, so textured content keeps its texels and the
+  wrapper acts as an **HDR tint** (fragment: `in.color * tex_gamma`). For untextured geometry the
+  white texture makes that tantamount to a replace. **The alpha channel is the coverage mask** —
+  combined with the HDR value's own alpha — which is why feathering, rounded corners, antialiasing and
+  glyph edges keep working with no new geometry code.
 
   Consequences to document, and to test: a shape's fill and stroke collapse to one colour (uniform
   recolour), and an inner `ColorMode::UV` ramp is lost — a per-position ramp needs
   `HdrColorMode::UV`, `gradient_rect_hdr` (6a) or a hand-built mesh (6b).
 
+  **Clipping and transforms need no code.** Clipping is a renderer scissor over the primitive's
+  `clip_rect`; the tessellator only uses `self.clip_rect` for culling, so a wrapped shape participates
+  exactly like an unwrapped one. `tessellate_clipped_shape`'s `transform_after_tessellation` branch
+  moves vertices *after* the arm runs (`tessellator.rs:1545-1556`), and the sidecar holds colours, so
+  it needs no transform. `Shape::transform` on the wrapper transforms `inner` and leaves the mode
+  alone: like `ColorMode::UV`, the callback is defined against the shape's *recomputed* bounding box,
+  so the ramp moves with the shape instead of shearing.
+
   The constructor **flattens `Shape::Vec` at construction**, because `tessellate_shape`'s own
-  contract says it can panic for `Vec`/`Callback` (`tessellator.rs:1563-1564`) and its mesh-level
+  contract says it can panic for `Vec`/`Callback` (`tessellator.rs:1562-1563`) and its mesh-level
   `Vec` branch loops children into one mesh, tripping the texture accumulator's
-  `assert_eq!(out.texture_id, …)` (`tessellator.rs:952-956`) the moment two children use different
+  `assert_eq!(out.texture_id, …)` (`tessellator.rs:954-957`) the moment two children use different
   textures. `Shape::hdr(inner, color)` therefore maps over `Vec` children recursively (so each child
   keeps its own primitive split and its own tier decision, §9), and passes `Shape::Callback` through
-  uncoloured with a `debug_assert` — a callback owns its pipeline, so there is nothing to recolour and
-  the honest fallback is uncoloured, not a rewrite of the callback's semantics. Constructing
-  `Shape::Hdr` twice collapses to the outer colour (the inner wrapper's colour is already baked into
-  its alpha mask); document that, and collapse it in the constructor.
+  uncoloured — a callback owns its pipeline, so there is nothing to recolour and the honest fallback
+  is uncoloured, not a rewrite of the callback's semantics. The `Callback` case **cannot** be handled
+  inside `tessellate_shape` (that function cannot emit a `Primitive::Callback` and panics on one), so
+  `tessellate_clipped_shape` intercepts `Shape::Hdr { inner: Callback }` next to its existing
+  `Shape::Callback` fast path (`tessellator.rs:1509-1516`) and emits it uncoloured with a
+  `debug_assert`; the constructor's pass-through is the ergonomic path, the interception is the
+  contract for directly-constructed variants. Constructing `Shape::Hdr` twice collapses to the outer
+  colour (the inner wrapper's colour is already baked into its alpha mask); document that, and
+  collapse it in the constructor.
 
   The variant needs arms in every exhaustive `match Shape`: `shape_transform::adjust_colors`
-  (recurse — alpha-only is what matters, and the existing opacity/fade fold happens there, §9),
-  `visual_bounding_rect` (`shape.rs:403-435`), `transform` (`:467+`), `PaintStats::add`
-  (`stats.rs:192-230`), `tessellate_shape` (`tessellator.rs:1568`+), `should_parallelize`
-  (`:2536-2552`) — and a **delegating `texture_id()` arm** (`shape.rs:437-445`), which is *not* an
-  exhaustive match and therefore will not be flagged by the compiler (§4).
+  (**recurse into `inner` only** — the HDR mode must *not* be dimmed, because the inner alpha is the
+  single dimming path, §9), `visual_bounding_rect` (`shape.rs:403-431`, delegate to `inner`),
+  `transform` (`:467`+, transform `inner`), `PaintStats::add` (`stats.rs:192-230`, delegate — the
+  sidecar is counted once, by the mesh's `AllocInfo`), `tessellate_shape`
+  (`tessellator.rs:1568`+), `should_parallelize` (`:2535-2552`, recurse) — and a **delegating
+  `texture_id()` arm** (`shape.rs:437-445`), which is *not* an exhaustive match and therefore will not
+  be flagged by the compiler (§4).
 - **`Painter::add_hdr_uv(shape, callback)`** (6b) — `add_hdr(shape, HdrColorMode::UV(Arc::new(callback)))`,
   taking the closure directly the way `PathStroke::new_uv` does (`stroke.rs:151-161`), so a ramp call
   site never spells `Arc` either.
 - `Painter::rect_filled_hdr` is then one line:
   `add_hdr(RectShape::filled(rect, cr, Color32::WHITE), color)` — the fill color supplies alpha only.
 - A `Shape` variant carrying a *sized* HDR fill payload is still **not** proposed: the wrapper above
-  is 24 bytes, while a per-shape HDR field would need headroom these structs do not have (§5).
-  Boxing the wrapper (`Shape::Hdr(Arc<HdrShape>)`, the `Shape::Mesh` idiom) buys 16 B and costs an
-  allocation per wrapped shape; 24 B already fits, so it is not worth it until a second HDR-only
-  field appears.
+  is 24 bytes, while a per-shape HDR field would need headroom these structs do not have (§5). The
+  `Arc<Shape>` is mandatory, not a size trick — `Shape` cannot contain itself inline — so the wrapper
+  costs one allocation per wrapped shape per frame, exactly like `Shape::Mesh`'s `Arc<Mesh>`. Boxing
+  the *whole* wrapper (`Shape::Hdr(Arc<HdrShape>)`) would shrink the payload 24 → 8 B and still
+  allocate, saving nothing under `PathShape`'s 56 B ceiling; it is not worth it until a second
+  HDR-only field appears.
 
 ### 8.5 The u8 twin (`Vertex::color` on an HDR mesh)
 
 The wgpu HDR path reads `@location(3)` only, so `Vertex::color`'s four bytes are unread *there*.
 The tessellator still writes them, as the **legal-premultiplied-`Color32` projection** of the HDR
 color. Those bytes are the GL backend's entire rendering of an HDR mesh (§11): `egui_glow` reads
-`a_srgba` at `offset_of!(Vertex, color)` (`painter.rs:244-252`) and its shader multiplies it in gamma
-space (`shader/vertex.glsl:24-36`, `shader/fragment.glsl:56-70`), so the twin is a shipped consumer,
+`a_srgba` at `offset_of!(Vertex, color)` (`painter.rs:250`) and its shader multiplies it in gamma
+space (`shader/vertex.glsl:22-36`, `shader/fragment.glsl:46-57`), so the twin is a shipped consumer,
 not dormant data — which is what keeps it inside the stack's "nothing dead" binding rule instead of
 being a projection nobody ever looks at.
 
-**The projection scales in linear light; it does not clamp per channel.**
+**The projection scales in linear light; it never clamps per channel, and it is total.** It is
+`HdrVertexColor::projected_color32(&self) -> Color32` (§8.1), a pure function of the stored bits
+that both the tessellator (§9) and any test can call:
 
 ```rust
-// straight alpha first, or alpha contaminates the maximum
-let lin = [r / a, g / a, b / a];
-let k = 1.0 / lin.iter().fold(0.0_f32, |m, c| m.max(*c));
-let scaled = lin.map(|c| c * k);          // chromaticity preserved exactly
-// re-premultiply, encode, quantize: rgb <= a keeps the Color32 legal
+let [r, g, b, a] = self.to_array();          // stored, encoded, premultiplied
+if a <= 0.0 { return Color32::TRANSPARENT; } // feather rings and cleared text land here
+let lin = [r / a, g / a, b / a];             // straight light, or alpha contaminates the maximum
+let peak = lin.iter().fold(0.0_f32, |m, c| m.max(*c));   // ignore negatives: SDR cannot show them
+if peak <= 0.0 { return Color32::TRANSPARENT; }          // all-negative (sub-black) content
+let k = 1.0 / peak;
+let scaled = lin.map(|c| (c * k).max(0.0));  // uniform scale, then drop unrepresentable negatives
+// re-premultiply by a, encode each component, quantize: rgb <= a keeps the Color32 legal
 ```
 
-A uniform scale of the tristimulus vector *is* a luminance change — every inter-channel ratio is
-preserved, so hue and saturation are untouched by construction. Per-channel clamping alters the
-ratios (`[6.0, 2.0, 0.5] → [1.0, 1.0, 0.5]`: a 3:1 red:green ratio becomes 1:1, a large hue shift)
-and, in the encoded domain, compounds the error with the transfer curve. Two independent mistakes,
-and neither is acceptable in a value the GL backend displays *today* (§11).
+Three guards, each with a reason, and each is a test (§12):
+
+- **`a <= 0`** — the wrapper writes a fully transparent sidecar on every feather vertex (§9), so the
+  formula is evaluated on them on every antialiased edge. Without the guard it divides by zero and
+  produces NaN that poisons the `Color32` quantizer.
+- **`peak <= 0`** — the §3 contract is odd-symmetric, so an all-negative (or black) value is legal.
+  `max` over negatives would return a negative peak, `k` would be negative, and the "scaled" colour
+  would flip sign (a −4.0 red would display as white, not black).
+- **`.max(0.0)` after the scale** — mixed-sign values (`[+4.0, −1.0, 0.2]`) have *no* positive `k`
+  that puts every component in `0..=1`; the uniform scale is applied to the positives (their ratios
+  are preserved exactly, which is the property that matters) and negative components drop to black
+  rather than being folded in.
+
+A uniform scale of the positive tristimulus *is* a luminance change — every inter-channel ratio among
+the positive components is preserved, so hue and saturation are untouched by construction.
+Per-channel clamping alters the ratios (`[6.0, 2.0, 0.5] → [1.0, 1.0, 0.5]`: a 3:1 red:green ratio
+becomes 1:1, a large hue shift) and, in the encoded domain, compounds the error with the transfer
+curve. Two independent mistakes, and neither is acceptable in a value the GL backend displays *today*
+(§11).
 
 **Where Oklab fits — and where it does not.** `ecolor` has no Lab/Oklab/Oklch today (only
 `Color32`, `Rgba`, `Hsva`, `HsvaGamma`, plus the transfer functions), and this tier does not need
@@ -733,8 +851,10 @@ user-facing output — which is why the twin does not copy it.
 Measured (§5): `Option<HdrVertexColor>` is 10 B and fits `TextShape`'s trailing padding — 48 → 56,
 `Shape` unchanged. So text takes a field, no boxing, and no need to dismiss text HDR:
 
-- `TextShape::hdr_color: Option<HdrVertexColor>`: when set, it replaces the *glyph* colour of the
-  whole shape — the same scope as `override_text_color` (`text_shape.rs:28-33`), and deliberately
+- `TextShape::hdr_color: Option<HdrVertexColor>` (serde-gated with the same `serde(default)` form as
+  `Mesh::hdr_colors`, because `TextShape` *is* serde-derived, `text_shape.rs:11-12`). When set, it
+  replaces the *glyph* colour of the whole shape — the same scope as `override_text_color`
+  (`text_shape.rs:30-33`), i.e. **only vertices inside `glyph_vertex_range`** — and deliberately
   **not** the backgrounds, underline or strikethrough, which keep their own colours. That is the
   reason this is a `TextShape` field rather than `add_hdr` over a text shape: the wrapper's uniform
   alpha mask would recolour a text background too (§8.4).
@@ -745,13 +865,32 @@ Measured (§5): `Option<HdrVertexColor>` is 10 B and fits `TextShape`'s trailing
   `Shape::Text` per colour run (or leave the text SDR).
 - `egui::RichText::color_hdr` / `ui.hdr_label(...)` as the public ergonomics — `RichText::color`'s
   mirror (`widget_text.rs:320`), and `hdr_label` is `colored_label`'s mirror
-  (`ui.rs:1828-1834`: colour first, then text). The `hdr_text` texture-cache prototype from the main
-  plan §6 is retired by this PR.
-- The tessellator writes glyph vertices with the HDR sidecar set (coverage × color happens in the
-  fragment shader, where `in.color * tex_gamma` is already value-transparent); the three special
-  cases at `tessellator.rs:2328-2358` map as: `override_text_color` → the HDR value wins (it is the
-  stronger override), `PLACEHOLDER` → HDR fallback, color-glyph anti-tint
-  (`from_white_alpha(color.a())`) → alpha-only HDR value.
+  (`ui.rs:1828-1832`: colour first, then text). **Where the value is stored matters**, because
+  `RichText::color` reaches the text through the *layout job* (`TextFormat.color`) and that road is
+  `Color32`-bound (§8.6's next bullet): `color_hdr` therefore stores
+  `RichText::hdr_color: Option<HdrVertexColor>` and `Label` reads it from its `WidgetText` **before**
+  `into_galley` (`label.rs:280`), then applies it to the `TextShape` it builds at `label.rs:318-320`
+  via `TextShape::with_hdr_color`. `hdr_label` is the supported ergonomic; in 6c only `Label` (and
+  therefore `ui.label`/`ui.hdr_label`) learns the field — `Button`, `Heading`, `SelectableLabel` and
+  `TextEdit` keep SDR text until they opt in, which is stated in the rustdoc rather than implied.
+  The `hdr_text` texture-cache prototype from the main plan §6 is retired by this PR.
+- **The tessellator writes a sidecar entry for *every* vertex it emits from `tessellate_text`, not
+  just the glyphs**, because the tier is a property of the mesh and `is_valid` demands
+  `hdr_colors.len() == vertices.len()`. Two vertex sources exist in that one `out`:
+  - **glyph vertices** (`glyph_vertex_range`): sidecar = `hdr_color × (vertex.color.a() / 255)`.
+    The vertex alpha is the mask — it carries `opacity_factor`, the galley's own alpha, and the
+    selection-clear write (§4, `label_text_selection.rs:286-305`) — so hiding a vertex also hides its
+    HDR value. The *glyph coverage* is the font atlas' texel alpha, applied by the fragment's
+    `in.color * tex_gamma`; the two are different things and both are needed.
+  - **everything else** (the underline emitted by `tessellate_line_segment` at
+    `tessellator.rs:2364-2370`, and any galley vertices outside the glyph range): sidecar =
+    `HdrVertexColor::from(vertex.color)`, the exact SDR lift — so underlines and backgrounds still
+    render, at their own colours, instead of disappearing or breaking the invariant.
+  The three special cases at `tessellator.rs:2328-2358` map as: `override_text_color` → the HDR
+  value wins for glyph vertices (it is the stronger override), `PLACEHOLDER` → the twin keeps using
+  `fallback_color` and the sidecar is the lift of that, color-glyph anti-tint
+  (`from_white_alpha(color.a())`) → alpha-only HDR value (`from_white_alpha`), i.e. colour glyphs
+  keep their own pixels and only their coverage drives the HDR tint.
 
 ### 8.7 API parity map
 
@@ -766,6 +905,7 @@ colors positionally* (so the call reads like the SDR one).
 | `Shape::gradient_rect(rect, dir, [Color32; 2])` | `Shape::gradient_rect_hdr(rect, dir, [HdrVertexColor; 2])` | 6a |
 | `Painter::rect_filled(rect, cr, color)` | `Painter::rect_filled_hdr(rect, cr, color)` | 6a |
 | `Painter::add(Shape::Mesh(mesh))` | `Mesh` with `hdr_colors` — no new method | 6a |
+| `Painter::image` / `Shape::image(texture, rect, uv, tint)` | `add_hdr(Shape::image(…, Color32::WHITE), color)` — an HDR **tint**: the texels keep multiplying underneath (`in.color * tex_gamma`), so this is tinting, not flat recolouring | 6a |
 | `PathStroke` / `ColorMode::Solid` | `add_hdr(Shape::line(points, stroke), color)` — `ColorMode` untouched (§8.3) | 6a |
 | `ColorMode::UV` (ramp along a path) | `add_hdr_uv(Shape::line(points, stroke), \|rect, pos\| …)` (`HdrColorMode::UV`) | 6b |
 | `Painter::line_segment` / `hline` / `vline` | `add_hdr(Shape::line_segment(points, stroke), color)` — no bespoke method; `Stroke` cannot grow | 6a |
@@ -820,28 +960,56 @@ After the tier:
 
 ## 9. Tessellator integration
 
-The tier is a property of a **mesh**, never of a vertex, so the tessellator has exactly two
-producers and no colour threading:
+The *storage* is a property of a **mesh**, never of a vertex, so the tessellator has exactly two
+producers and no colour threading (the text field is a source that feeds one of them):
 
 - **`Shape::Hdr`** (§8.4) — one new arm in `tessellate_shape` (`tessellator.rs:1568`). Record
-  `let first = out.vertices.len()`, tessellate `inner` (`Vec` → recurse per child, `Callback` →
-  pass through uncoloured with a `debug_assert`, everything else → the existing arms), then for
-  `out.vertices[first..]`: `a = vertex.color.a() / 255`, `color = source(rect, pos) × a`, write the
-  sidecar entry and overwrite `vertex.color` with the projection (§8.5). `rect` is
-  `inner.visual_bounding_rect()` expanded by the feathering margin, matching what
-  `ColorMode::UV` receives today (`color.rs:16-19`). No `get_color` arm, no `mul_color` arm, no
-  `PathStroke` field.
-- **`TextShape::hdr_color`** (§8.6) — `tessellate_text` (`:2228`) writes the sidecar for emitted
-  glyph vertices when the field is set; same projection for the twin.
+  `let first = out.vertices.len()`, tessellate `inner` (everything except `Vec`/`Callback` → the
+  existing arms; a `Vec` that reaches the arm is mapped to one `Hdr` per child rather than
+  tessellated into `out` — the constructor already flattens, but the variant is public and this keeps
+  the arm total without tripping the texture assert; a directly-constructed `Hdr{inner: Callback}`
+  was intercepted in `tessellate_clipped_shape`, §8.4), then `out.promote_to_hdr()` — the prefix can
+  be SDR when `tessellate_shape` is called directly, and promotion is idempotent when it is not —
+  and finally for `out.vertices[first..]`:
+  `a = vertex.color.a() / 255`, `hdr = source(rect, pos) × a`, write the sidecar entry, and overwrite
+  `vertex.color` with `hdr.projected_color32()` (§8.5). `rect` is
+  `inner.visual_bounding_rect().expand(feathering_size_in_pixels)` — the same construction as
+  `ColorMode::UV`'s `uv_bbox` (`color.rs:16-19`), with the `StrokeKind` caveat §8.4 states. No
+  `get_color` arm, no `mul_color` arm, no `PathStroke` field.
+- **`TextShape::hdr_color`** (§8.6) — `tessellate_text` (`:2228`) writes a sidecar entry for **every**
+  vertex it emits when the field is set: glyph vertices inside `glyph_vertex_range` get
+  `hdr_color × (vertex.color.a() / 255)`, everything else (the underline, non-glyph galley vertices)
+  gets `HdrVertexColor::from(vertex.color)`; same projection for the twin. The invariant is
+  `hdr_colors.len() == vertices.len()` on every path, including the underline.
 
 Consequences:
 
-- **Opacity/fade keep working with no HDR-space code.** `Painter::transform_shape` folds opacity and
-  fade into `inner`'s `Color32` alpha before tessellation (`painter.rs:200-210`), and the wrapper
-  reads alpha as the mask — so the HDR colour is dimmed exactly once, in encoded space, which is the
-  §3 contract.
+- **Opacity/fade dim HDR content exactly once — and `adjust_colors` is where that happens.**
+  `Painter::transform_shape` calls `multiply_opacity` / `tint_shape_towards`
+  (`egui/src/painter.rs:199-207`, `:555-569`), which land in `shape_transform::adjust_colors`
+  (`shape_transform.rs:9-130`) *before* tessellation. That function's single `adjust_color` closure is
+  `Color32`-valued, so the HDR side needs a **second, HDR-valued adjuster**:
+  `adjust_colors(shape, adjust_color, adjust_hdr)` — one traversal, two value spaces. Adding the
+  parameter is a breaking change to a public epaint fn, already covered by 6a's `CHANGELOG` entry
+  (`Mesh` gained a field, `Shape` gained a variant). `multiply_opacity` passes "multiply all four
+  components" for both; `tint_shape_towards` passes `tint_color_towards`
+  (`ecolor/src/lib.rs:279-300`) for `Color32` and its encoded-space mirror toward
+  `HdrVertexColor::from(target)` for the HDR value (halve alpha, blend the encoded components the
+  same way). Two rules, one per level:
+  - `Shape::Hdr` recurses into `inner` and **does not touch the mode**: the wrapper's mask is the
+    inner alpha, so dimming the mode as well would apply the factor twice. The HDR colour is dimmed
+    once, in encoded space, which is the §3 contract. Consequence of the alpha-only mask, stated
+    because `fade_to_color` accepts any target: a fade toward a *non-transparent* colour only scales
+    the wrapper's alpha — the wrapper has already discarded the inner RGB, so its hue is not tinted.
+    Fades to transparent (the animation case) are exact.
+  - `Shape::Mesh` applies `adjust_hdr` to every `hdr_colors` entry and `Shape::Text` applies it to
+    `hdr_color` — otherwise a directly-built HDR mesh (or HDR text, which is not wrapped) would
+    ignore `Ui::multiply_opacity` and `fade_to_color` entirely on wgpu, because the only channel the
+    `Color32` fold reaches is the *glow* twin. Opacity is a component multiply and needs no target;
+    a fade blends toward `HdrVertexColor::from(target)` in encoded space (above).
 - **Feathering** is the alpha-0 outer ring the tessellator already emits; the wrapper writes a
-  transparent sidecar there, and the encoded-space multiply keeps premultiplication exact.
+  transparent sidecar there (`a == 0`, handled by §8.5's guard), and the encoded-space multiply keeps
+  premultiplication exact.
 - **"One mesh per (texture, tier)" is enforced where the tessellator already enforces one mesh per
   texture.** `tessellate_clipped_shape` starts a new primitive when
   `output_mesh.texture_id != shape.texture_id()` (`tessellator.rs:1524`); that condition gains
@@ -849,10 +1017,29 @@ Consequences:
   promotes the whole accumulated primitive (§8.2) — correct, but it would make §6.3's "sparse HDR
   costs proportionally nothing" claim false, because the merge granularity is the contiguous
   same-texture run and nearly every shape shares the white texture. With it, the tier is part of the
-  batching key and the claim holds. `Shape::is_hdr()` is the predicate (`Shape::Hdr`, or
-  `Shape::Text` with `hdr_color`), also the thing a `PaintCallback` can ask (§16 question 5).
+  batching key and the claim holds.
+
+  `Shape::is_hdr()` is the predicate, and it must be **complete** — one method, three arms, or
+  hand-built meshes silently miss the key and promote their SDR neighbours:
+
+  ```rust
+  pub fn is_hdr(&self) -> bool {
+      match self {
+          Self::Hdr { .. } => true,                                  // the operator
+          Self::Text(text) => text.hdr_color.is_some(),              // the text field
+          Self::Mesh(mesh) => mesh.is_hdr(),                         // sidecar built by hand
+          _ => false,
+      }
+  }
+  ```
+
+  It is also the thing a `PaintCallback` can ask (§16 question 5).
 - **A mesh is never mixed.** `Mesh::append`/`append_ref` promote (§8.2); the tessellator above never
   needs to, because it splits first.
+- **Transforms:** `transform_after_tessellation` moves vertices after the arm (§8.4); the sidecar is
+  colour-only. `Shape::transform` transforms `inner` and leaves the mode alone.
+- **Clipping** is the renderer's scissor over `clip_rect`; the tessellator uses `clip_rect` only for
+  culling, so neither the operator nor the text field needs a clip arm.
 - Anti-aliased `ColorMode::UV` gradients still clamp at 1.0; `HdrColorMode::UV` does not, because the
   ramp is evaluated on the HDR side of the wrapper.
 
@@ -888,8 +1075,12 @@ Consequences:
   value-transparent, so no fragment change is needed at all — the multiply and the odd-symmetric
   decode already do the right thing at any magnitude.
 - Renderer: a second `SlicedBuffer` (`renderer.rs:207-211`) for the sidecar, filled by a staging loop
-  that mirrors the vertex one (`:1373-1410`) and pushed in lockstep so the two `slices` vectors stay
-  index-aligned. `set_vertex_buffer(0, ..)` gains slot 1 on HDR meshes (`:728`).
+  that mirrors the vertex one (`:1359-1409`) and pushed **in lockstep — one slice per `Primitive::Mesh`,
+  including the SDR meshes with an empty range**. That last part is load-bearing: the vertex staging
+  loop only allocates when `vertex_count > 0` and pushes one slice per mesh, so a sidecar loop that
+  skipped SDR meshes would offset every later mesh's colour by the number of SDR meshes before it.
+  `set_vertex_buffer(0, ..)` gains slot 1 on HDR meshes (`:728`); an SDR pipeline ignores the stale
+  slot-1 binding, so no unbind is needed.
 - **No batching layer exists to key on.** `render()` draws one `draw_indexed` per `Primitive::Mesh`
   in paint order (`:714-735`) and sets the pipeline exactly once per pass (`:686`), from a lookup
   performed up front (`:652-661`). So the tier is honoured the only way this renderer can honour any
@@ -897,10 +1088,16 @@ Consequences:
   a state switch, **never a reorder**. Batching by tier would reorder egui's primitives, and
   primitive order *is* paint order for translucent HDR content; that is a correctness regression, not
   an optimization. The cache key (`:305`) gains the tier component.
-- **Both variants must exist before `render()`.** Pipelines are created in `update_buffers`
-  (`ensure_pipeline`, `:597-624`, called at `:1262`); `render()` takes `&self` and no device, so it
-  can only look up and `.expect(…)`. `ensure_pipeline` therefore checks and creates *both* tiers for
-  the frame's `(format, encoding)` pair — two `contains_key` checks, one creation each, on first use.
+- **The tier's pipeline must exist before `render()`, and only when the frame needs it.** Pipelines
+  are created in `update_buffers` (`ensure_pipeline`, `:597-624`, called at `:1262`); `render()` takes
+  `&self` and no device, so it can only look up and `.expect(…)`. The signature therefore becomes
+  `ensure_pipeline(device, target_format, tier)` and `update_buffers` calls it **once per tier present
+  in that frame** — it already folds over `paint_jobs` to count vertices (`:1294-1314`), so the
+  `is_hdr()` scan is that same pass, not a new one. This is what keeps the non-negotiable intact: an
+  SDR-only frame compiles and caches exactly the pipeline it does today, and the HDR variant costs a
+  second `contains_key` + one creation only on the first frame that actually has HDR content. (An
+  earlier draft created both tiers unconditionally; that is a first-frame cost every existing app
+  would pay for a feature it does not use — rejected here.)
 - The zero-size-clip skip (`:694-710`) advances the index and vertex slice iterators by hand; it must
   advance the sidecar iterator too, or a clipped HDR mesh silently shifts every later mesh's colour.
 - Dithering stays off for float targets (PR 3), unaffected.
@@ -922,7 +1119,7 @@ Two consequences, stated because they contradict the earlier draft of this secti
   (`color_picker.rs:850-851`, main plan §7), while a *tagged* upload the surface cannot interpret is
   the thing that rejects.
 - **The warning needs a different key.** The existing warns are once-per-`TextureId`
-  (`float_content_warned: HashSet<TextureId>`, `painter.rs:99-100`) because textures persist and own
+  (`float_content_warned: HashSet<TextureId>`, `painter.rs:101`) because textures persist and own
   an id. Meshes are per-frame and have none, so the painter keeps a single `bool` and warns once per
   painter on the first HDR mesh: one line, no allocation, no per-frame spam. The message names the
   consequence (range-reduced SDR projection) and the escape hatch.
@@ -948,16 +1145,19 @@ scope" (Open Question 1): nothing here expands that scope.
 
 | Layer | Test | Why it can plausibly fail |
 |---|---|---|
-| CPU contract | `HdrVertexColor`: `From<Color32>` error `< 1/512`; `from_rgba_premultiplied` ↔ `to_array` round-trip; negatives preserved; `>1.0` preserved; premultiplication invariant under feathering multiply; `from_linear` premultiplies after encoding | f16 rounding and odd-symmetry at the negative branch are exactly where PR 2a found a real bug, and "linear" without a premultiplication convention is where every translucent value goes wrong |
+| CPU contract | `HdrVertexColor`: `From<Color32>` error `< 1/512`; `from_rgba_premultiplied` ↔ `to_array` round-trip **on f16-representable inputs** (arbitrary `f32` cannot round-trip through 11 bits, and a test that expects it to would encode a lie); negatives preserved; `>1.0` preserved; premultiplication invariant under feathering multiply; `from_linear` premultiplies after encoding | f16 rounding and odd-symmetry at the negative branch are exactly where PR 2a found a real bug, and "linear" without a premultiplication convention is where every translucent value goes wrong |
 | CPU structure | `size_of::<Shape>() == 64` still passes; `PathStroke`/`ColorMode`/`Vertex` asserted **unchanged** (24/16/20); new guards for `Shape::Hdr`'s payload and `TextShape` (56); the `hdr_colors.len()` invariant checked through `Mesh::is_valid`; `promote_to_hdr` idempotence; `split_to_u16` carries the tier | silent size regressions and forgotten mutation paths |
-| CPU projection | the u8 twin preserves chromaticity (channel ratios intact within quantization), never emits `rgb > a`, and `promote_to_hdr` ↔ twin is stable across a round-trip | per-channel clamping is the tempting wrong implementation, and it is silently plausible |
-| CPU wrapper | `Shape::Hdr` around a textured mesh starts its own primitive (the `texture_id` delegation, §8.4) instead of panicking in `append_ref`; a wrapped `Shape::Vec` tessellates child-by-child; a wrapped `Shape::Callback` passes through uncoloured | `Shape::texture_id()` is the one `Shape` site the compiler cannot point at (§4) |
+| CPU projection | the u8 twin preserves chromaticity (positive channel ratios intact within quantization), never emits `rgb > a`, and `promote_to_hdr` ↔ twin is stable across a round-trip; **`a == 0` and all-negative values return `TRANSPARENT`** (§8.5's guards — the feather ring evaluates both on every antialiased edge) | per-channel clamping is the tempting wrong implementation, and it is silently plausible; the divide-by-zero and the sign flip are *not* plausible on inspection, which is why they are asserted |
+| CPU wrapper | `Shape::Hdr` around a textured mesh starts its own primitive (the `texture_id` delegation, §8.4) instead of panicking in `append_ref`; a wrapped `Shape::Vec` tessellates child-by-child; a wrapped `Shape::Callback` passes through uncoloured; a **directly constructed** `Hdr{inner: Callback}` also passes through (the `tessellate_clipped_shape` interception, §8.4) instead of hitting `tessellate_shape`'s panic | `Shape::texture_id()` is the one `Shape` site the compiler cannot point at (§4), and the callback path is the one the constructor hides |
+| CPU batching | a hand-built HDR mesh appended after an SDR shape starts its own primitive: `Shape::is_hdr()` returns true for `Shape::Mesh` with a sidecar (§9), so the SDR mesh is not promoted and keeps 20 B/vertex | the predicate is the only thing standing between "sparse HDR" and "every SDR vertex becomes HDR" |
+| CPU opacity | `multiply_opacity` / `tint_shape_towards` over (a) a `Shape::Hdr` wrapper, (b) a bare HDR mesh, (c) HDR text: the wrapper dims once (inner alpha only, mode untouched), the bare mesh and the text dim their sidecar / `hdr_color` | §9's rule is asymmetric per level, so an implementation that "does the same thing everywhere" is wrong in one of the three cases |
+| CPU text | `TextShape::hdr_color` with an underline and with a background-coloured galley: sidecar length equals vertex count, the underline and the background still draw, only `glyph_vertex_range` vertices take the HDR value, and a vertex cleared to `TRANSPARENT` (the selection path, §4) yields a zero sidecar | the underline is emitted by a *different* call inside the same `out`, which is exactly the kind of thing the invariant catches |
 | GPU numeric | kittest fp16 readback: mesh at 4.0 reads 4.0; at −2.0 reads −2.0; alpha-feathered edge midpoint; a `Shape::Hdr` gradient (`HdrColorMode::UV`) sampled at the midpoint of 1.0→6.0 | the whole point — u8 snapshots cannot see >1.0 |
 | GPU numeric (variant) | same, MSAA 4× on fp16 | resolved-multisample fp16 readback is the PR 3 trap |
 | Snapshot | HDR gradient + HDR text PNGs: silhouette, AA, and geometry only (values above 1.0 clip in a u8 PNG by definition); SDR snapshots must be **byte-identical** | a regression on the SDR path is the one unacceptable outcome |
-| Serde | `Mesh` round-trip with and without the sidecar; old payload → SDR; `HdrVertexColor` serializes as its `[u16; 4]` bits; `Shape` round-trips **without** an HDR mode at all (`Shape` is not serde-derived) | the `cfg_attr(serde(default))` form on the new `Mesh` field, and the old-payload path |
+| Serde | `Mesh` round-trip with and without the sidecar; old payload → SDR; `HdrVertexColor` serializes as its `[u16; 4]` bits (`serde(transparent)`, §8.1); `TextShape` round-trip with and without `hdr_color`, and an old `TextShape` payload still loads; `Shape` round-trips **without** an HDR mode at all (`Shape` is not serde-derived) | the `cfg_attr(serde(default))` form on the two new fields, and the old-payload paths |
 | glow | SDR snapshot byte-identical; an HDR mesh draws its **twin** and logs one warning per painter (asserted through the same `log` capture PR 2b's reject test uses) | a backend that degrades must say so once, not silently |
-| Perf | demo app vertex bytes/frame before/after via `stats`; SDR frame path asserted unchanged | the claim that makes B acceptable |
+| Perf | demo app vertex bytes/frame before/after via `stats`; SDR frame path asserted unchanged; the pipeline cache holds **one** entry after an SDR-only frame (§11, §13) | the claim that makes B acceptable, and the lazy-tier rule is the only thing keeping the SDR first frame cost identical |
 
 The GPU numeric and snapshot tests live in `crates/egui_kittest/tests/hdr_vertex_colors.rs`, next to
 the existing per-concern files (`fp16_target.rs`, `snapshot_colorspace.rs`,
@@ -971,12 +1171,15 @@ applied to the GPU round-trip.
 
 ## 13. Performance budget
 
-- **SDR:** 20 B/vertex, one staging buffer, one pipeline per `(format, encoding)` — unchanged.
-  Assert it: a test that stages a mesh with `hdr_colors: None` must produce the same byte count and
-  the same pipeline handle as before the change.
+- **SDR:** 20 B/vertex, one staging buffer, one *cached* pipeline per `(format, encoding, Sdr)` —
+  unchanged in count and in bytes. The key gains a component (§11) but an SDR-only frame still
+  creates exactly one pipeline, on the same first use, and never touches the HDR one.
+  Assert it: a test that stages a mesh with `hdr_colors: None` must produce the same byte count, the
+  same slice count, and the same pipeline handle as before the change (and no HDR pipeline in the
+  cache).
 - **HDR meshes:** 28 B/vertex total (20 + 8) and a second traffic stream. The one CPU cost is the
   twin (§8.5): per emitted HDR vertex, at tessellation, a reciprocal, a max-reduce over three
-  channels, a scale, and three `gamma_u8_from_linear` + quantize — paid only by meshes that asked for
+  channels, a scale, and three `ecolor::gamma_u8_from_linear_f32` + quantize — paid only by meshes that asked for
   the tier, never by the SDR path. **No backend converts anything**: wgpu and glow cast slices
   (`bytemuck::cast_slice`), and glow reads the twin exactly as it reads an SDR vertex.
 - **Worst case:** a full-frame HDR mesh costs +40% vertex bandwidth. Measure with the demo app's
@@ -991,9 +1194,9 @@ applied to the GPU round-trip.
 
 | PR | Ships | Consumer | Tests |
 |---|---|---|---|
-| **6a** | `epaint::HdrVertexColor`; `Mesh`/`Mesh16` sidecar + the `is_valid` length invariant + promote + serde; `Shape::Hdr` wrapper with `HdrColorMode::Solid` and `Painter::add_hdr`; `Shape::gradient_rect_hdr`, `Painter::rect_filled_hdr`; wgpu layout variant + `vs_main_hdr` + cache key + second `SlicedBuffer` + per-mesh pipeline switch; glow draws the twin with a warn-once; `CHANGELOG` entries in `crates/epaint`, `crates/egui-wgpu`, `crates/egui_glow` and the root `CHANGELOG.md` (including epaint's `⚠️ Breaking changes`: `Mesh` gained a field, `Shape` gained a variant) | raw HDR geometry in any eframe app; the picker's flat swatches (§8.8) | CPU contract + twin projection, size guards (incl. `PathStroke`/`ColorMode` unchanged), wrapper/`texture_id` test, fp16 numeric readback (4.0 / −2.0), MSAA variant, serde, SDR-byte-identical, glow twin + warn-once, parity (`gradient_rect_hdr` equals `gradient_rect` for SDR-equivalent colors) |
+| **6a** | `epaint::HdrVertexColor` (incl. `projected_color32`); `Mesh`/`Mesh16` sidecar + the `is_valid` length invariant + promote + serde; `Shape::Hdr` wrapper with `HdrColorMode::Solid`, `Painter::add_hdr`, the `Shape::is_hdr()` predicate and the `tessellate_clipped_shape` callback interception; `shape_transform::adjust_colors`' HDR parameter + arms (mesh sidecar, text field, wrapper recursion); `Shape::gradient_rect_hdr`, `Painter::rect_filled_hdr`; wgpu layout variant + `vs_main_hdr` + cache key + **lazy per-tier `ensure_pipeline`** + second `SlicedBuffer` (one slice per mesh, SDR included) + per-mesh pipeline switch; glow draws the twin with a warn-once; `CHANGELOG` entries in `crates/epaint`, `crates/egui-wgpu`, `crates/egui_glow` and the root `CHANGELOG.md` (including epaint's `⚠️ Breaking changes`: `Mesh` gained a field, `Shape` gained a variant) | raw HDR geometry in any eframe app; the picker's flat swatches (§8.8) | CPU contract + twin projection, size guards (incl. `PathStroke`/`ColorMode` unchanged), wrapper/`texture_id` test, fp16 numeric readback (4.0 / −2.0), MSAA variant, serde, SDR-byte-identical, glow twin + warn-once, parity (`gradient_rect_hdr` equals `gradient_rect` for SDR-equivalent colors) |
 | **6b** | `HdrColorMode::UV` + `Painter::add_hdr_uv` (positional HDR ramps on any wrapped shape); `Painter::arrow_hdr`; the stroke/polyline/band/plot-trace story that `add_hdr` already carries gets its snapshots and its documented density limit; no `PathStroke`, `ColorMode`, `Stroke` or `Shape::LineSegment` change | antialiased HDR strokes, polylines, plot traces, band gradients | ramp sampling at the 1.0→6.0 midpoint, feathering through the mask, snapshot of an HDR trace, SDR path identical |
-| **6c** | `TextShape::hdr_color`, `RichText::color_hdr`, `ui.hdr_label`; tessellator's three text special cases; retire the demo's `hdr_text` prototype | HDR labels/readouts as first-class content | numeric readback of glyph cores >1.0, color-glyph anti-tint, SDR text snapshots identical |
+| **6c** | `TextShape::hdr_color` (+ `serde(default)`), the `tessellate_text` sidecar for **all** emitted vertices (glyph range HDR, underline/background lifted), `RichText::hdr_color` read by `Label` before layout, `ui.hdr_label`; the three text special cases; epaint `CHANGELOG` (TextShape gained a field — a breaking change for struct-literal users); retire the demo's `hdr_text` prototype | HDR labels/readouts as first-class content | numeric readback of glyph cores >1.0, color-glyph anti-tint, SDR text snapshots identical |
 | **6d** | picker re-wiring (§8.8: flat swatches off float textures, `HDR_TEXTURE_CACHE_CAP` narrowed to ramps, §6-era comments superseded), `MANUAL_TESTING.md` HDR section, perf write-up, demo `hdr_test_app` migrated off texture-strips | adoption + evidence for upstream | picker snapshots unchanged; full-suite |
 
 **Definition of done for the tier:** all three §1.2 items demonstrably solved in the demo app
@@ -1035,6 +1238,19 @@ vertex-color tier on web, HDR10 plumbing).
    with the matrices.
 9. **Serde evolution.** Sidecar field defaults to `None`; old payloads keep working; new payloads
    read by old code lose the tier (documented, not a data-loss bug — the mesh still renders).
+10. **"Why two mechanisms (`Mesh::hdr_colors` and `Shape::Hdr`)?"** They are a storage and an
+   operator, not two spellings of one thing (§8's table): the sidecar is where per-vertex HDR lives
+   (the only place it can live without growing `Vertex`), and the wrapper is how an arbitrary shape
+   gets HDR colour without a per-shape field. The wrapper *writes* the sidecar, so there is one
+   storage; §8.3 measured why the third option (`ColorMode::Hdr*`) is not available.
+11. **"Why does HDR text not go through `add_hdr` like everything else?"** Because the wrapper's mask
+   is alpha, and a text mesh's background and underline share the mesh; `TextShape::hdr_color` is
+   glyph-range-only (§8.6), which is the same shape as `override_text_color`. The trade is stated:
+   one HDR value per text shape, mixed `RichText` runs lose their variation.
+12. **"`Ui::multiply_opacity` silently ignores HDR?** It must not, and §9 says exactly where the fold
+    lives (`shape_transform::adjust_colors`) and which of the three levels dims what — the wrapper
+    dims once via its mask, a bare HDR mesh and HDR text dim their own values. This is the finding
+    that turned a "no HDR-space code needed" claim into one explicit rule and one test.
 
 ---
 
@@ -1053,7 +1269,9 @@ vertex-color tier on web, HDR10 plumbing).
    library calls it per emitted vertex per frame, document the density limit or provide a precomputed
    `Vec<HdrVertexColor>` path. (Solid HDR content never pays it: `HdrColorMode::Solid` is a copy.)
 5. **Tier interaction with `Shape::Callback`** (custom paint callbacks) — callbacks own their
-   pipelines; note only that they can read `Mesh::is_hdr()`.
+   pipelines; note only that they can read `Mesh::is_hdr()`. Wrapping a callback in `Shape::Hdr` is
+   defined, not undefined: it passes through uncoloured (§8.4), because the alternative would be a
+   panic in `tessellate_shape` on a public variant.
 6. ~~**`Option<Vec<_>>` vs `Option<Box<[_]>>`**~~ — **resolved 2026-11-02 (§5):** `Vec`. The sidecar
    grows in lockstep with `vertices` in the tessellator and in `append`/`promote_to_hdr`/
    `split_to_u16`; a boxed slice reallocates and copies on every pushed vertex to save 8 bytes on an
@@ -1149,7 +1367,7 @@ capability, the §3 contract, or the SDR-untouched rule.
    *switch* when the tier changes, never by reordering; and the zero-size-clip skip (`:694-710`) must
    advance a third slice iterator.
 3. **glow's warn-once cannot key on a mesh** (§11, §8.5) — every existing warn is once per
-   `TextureId` (`float_content_warned`, `painter.rs:99-100`) because textures own ids; meshes do not.
+   `TextureId` (`float_content_warned`, `painter.rs:101`) because textures own ids; meshes do not.
    The GL path therefore renders the u8 twin (which makes the twin a shipped consumer rather than
    dormant data) and warns once per painter through a `bool`. That also resolved an internal
    contradiction: §8.5 already called glow the twin's consumer while §11 skipped the mesh.
@@ -1158,3 +1376,54 @@ Two smaller items from the same pass: naming now follows `ecolor`'s value-type v
 (`from_rgba_premultiplied`/`to_array`/`TRANSPARENT`/`from_white_alpha`, `impl From<Color32>`), and the
 `sized` claims that were "measure before committing" are measured (§5: `Option<HdrVertexColor>` is
 10 B and `TextShape` lands at 56, `Shape` unchanged; the wrapper payload is 24 B).
+
+**C.4 — review of C.3 (third pass, 2026-11-02).** The second pass was re-derived from the tree rather
+than trusted. It was right about the measurements (both §5 tables reproduced exactly, including
+`HdrColorMode` = 16 B and the `Shape::Hdr` payload = 24 B) and about the reversal itself; it was
+incomplete or wrong in eight places, and each is now fixed where it bites:
+
+1. **`Shape::is_hdr()` was incomplete** (§9). It named `Shape::Hdr` and `Shape::Text` but not
+   `Shape::Mesh` with a sidecar, so a mesh built with `Mesh::colored_vertex_hdr` — the documented
+   low-level path — would miss the tessellator's batching key and promote the whole accumulated
+   SDR primitive to +40% bytes. The predicate is now spelled out with all three arms and has its own
+   test.
+2. **Opacity/fade did not reach HDR at all** (§9). C.3's "opacity/fade keep working with no
+   HDR-space code" was true only for the wrapper (which reads inner alpha). For a bare HDR mesh and
+   for HDR text the channel the fold touches (`vertex.color`) is the *glow* twin, so on wgpu
+   `Ui::multiply_opacity` was a no-op. `shape_transform::adjust_colors` now gains an HDR-valued
+   adjuster next to its `Color32` one (one traversal, two value spaces), and the asymmetry (wrapper:
+   inner only; mesh/text: their own values) is stated and tested.
+3. **The twin projection was not total** (§8.5). It divided by `a` and took `max` over possibly
+   negative components: `a == 0` (every feather vertex) produced NaN, and an all-negative
+   (odd-symmetric, legal) value produced a negative scale and inverted the colour. Both are now
+   guards, with the mixed-sign rule stated.
+4. **`tessellate_text` has more than glyphs** (§8.6). The underline is emitted by a
+   `tessellate_line_segment` call into the same `out`, and galley meshes can carry non-glyph
+   vertices; a sidecar written only for "emitted glyph vertices" breaks `hdr_colors.len() ==
+   vertices.len()` and would blank the underline on wgpu. The rule is now: every emitted vertex gets
+   a sidecar entry, glyph-range ones HDR, the rest the SDR lift. The glyph mask is the *vertex* alpha
+   (which is what the selection-clear path writes), while glyph coverage is the atlas texel.
+5. **`impl From<Rgba> for HdrVertexColor` "in egui" does not compile** (§8.1). Both `From` and `Rgba`
+   are foreign to `egui`; the impl moved to epaint, next to `impl From<Color32>`.
+6. **§11 and §13 contradicted each other on pipeline count** (§11, §13). §11 had `ensure_pipeline`
+   create both tiers for every `(format, encoding)`, while §13 promised the SDR pipeline count was
+   unchanged and the non-negotiable is that the SDR path pays nothing. `update_buffers` already has
+   the paint jobs, so the pipeline is now created per tier present in the frame; an SDR frame creates
+   exactly what it creates today.
+7. **`Shape::Hdr` over `Shape::Callback` would panic** (§8.4). `tessellate_shape` cannot emit a
+   `Primitive::Callback` (that is its documented panic), and C.3's pass-through-in-the-arm was
+   therefore unimplementable for a directly-constructed variant. The interception moved to
+   `tessellate_clipped_shape`, next to the existing callback fast path.
+8. **Anchors and housekeeping.** `egui/src/visuals.rs` does not exist (the override mechanism is
+   `TextShape::override_text_color`); the `shape_size` guard is `shapes/shape.rs:61-72`, not
+   `:80-91`; the glow fragment shader's multiply is `:46-57`, not `:56-70` and the file is 58 lines;
+   bare `painter.rs` anchors are now qualified; `Vertex` literal sites are 13, not 12;
+   `TextShape` is serde-derived so its new field needs the gated `serde(default)`;
+   `append_ref` takes `&Self`, so "promote the SDR side" had to be split per entry point; and the
+   wrapper's `Arc<Shape>` is mandatory rather than an optional 16 B saving.
+
+Two claims were re-checked and deliberately kept, so the next reviewer does not re-open them:
+`HdrColorMode` as a sibling of `ColorMode` (measured 16 B; generalising buys nothing, C.3's argument
+holds), and the `Shape::Hdr` wrapper as the path for path colour (the measured `ColorMode` growth is
+disqualifying, and the wrapper is the same mechanism every other shape uses — §8's storage/operator
+table is the layering answer, not a second convention).
