@@ -669,8 +669,9 @@ impl Renderer {
     ///
     /// # Panic
     /// Panics if [`Renderer::update_buffers`] has never been called with this
-    /// `target_format` under the currently active surface color space (the
-    /// cache key is (format, derived encoding))!
+    /// `target_format` under the currently active surface color space and a
+    /// mesh of the same vertex-color tier (the cache key is
+    /// `(format, encoding, tier)`)!
     pub fn render(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
@@ -1317,9 +1318,10 @@ impl Renderer {
     ///
     /// `target_format` is the format of the color attachment the upcoming render
     /// pass draws into; the pipeline for it is created here if this is its
-    /// first use **under the currently active surface color space** (the cache
-    /// key is (format, derived encoding) — one format can host both
-    /// encodings across viewports).
+    /// first use **under the currently active surface color space and
+    /// vertex-color tier** (the cache key is `(format, encoding, tier)` — one
+    /// format can host both encodings across viewports, and one encoding both
+    /// tiers).
     ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
     pub fn update_buffers(
@@ -2240,10 +2242,11 @@ mod tests {
             .expect("GPU poll failed while waiting for the pipeline cache test frame");
     }
 
-    /// The pipeline cache is keyed by (target format, derived encoding):
-    /// repeated renders under one key reuse one pipeline, a second format (or
-    /// encoding) gets its own entry, and no device error surfaces along the
-    /// way (plan §8, row 1; plan §3's encoding-keyed cache).
+    /// The pipeline cache is keyed by (target format, derived encoding,
+    /// vertex-color tier): repeated renders under one key reuse one pipeline,
+    /// a second format (or encoding) gets its own entry, and no device error
+    /// surfaces along the way (plan §8, row 1; plan §3's encoding- and
+    /// tier-keyed cache).
     ///
     /// Adapter-requiring: this is egui-wgpu's first runtime test. Machines
     /// without any wgpu adapter skip with a message; CI and normal dev
@@ -2530,6 +2533,76 @@ mod tests {
             "an HDR-only frame must not compile the SDR variant"
         );
         assert!(pipelines.contains_key(&(target_format, encoding, VertexColorTier::Hdr)));
+    }
+
+    /// §13: an SDR-only frame stages exactly the bytes and the slice count it
+    /// staged before the sidecar existed — one 20-byte-per-vertex slice per
+    /// mesh, one *empty* sidecar slice per mesh, and no sidecar staging at all.
+    #[test]
+    fn sdr_frame_stages_unchanged_bytes_and_slices() {
+        let Some((device, queue)) = test_device("sdr_frame_stages_unchanged_bytes_and_slices")
+        else {
+            return;
+        };
+        // Reading back the staging slices needs no draw, so the format only
+        // has to be one egui supports.
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+
+        let rect_a = epaint::Rect::from_min_max(epaint::pos2(0.0, 0.0), epaint::pos2(32.0, 32.0));
+        let rect_b = epaint::Rect::from_min_max(epaint::pos2(32.0, 32.0), epaint::pos2(64.0, 64.0));
+
+        let mut mesh_a = epaint::Mesh::default();
+        mesh_a.add_colored_rect(rect_a, epaint::Color32::WHITE);
+        let mut mesh_b = epaint::Mesh::default();
+        mesh_b.add_colored_rect(rect_b, epaint::Color32::from_gray(128));
+
+        let (vertices_a, vertices_b) = (mesh_a.vertices.len(), mesh_b.vertices.len());
+        assert!(vertices_a > 0 && vertices_b > 0);
+
+        let paint_jobs = [
+            epaint::ClippedPrimitive {
+                clip_rect: epaint::Rect::EVERYTHING,
+                primitive: Primitive::Mesh(mesh_a),
+            },
+            epaint::ClippedPrimitive {
+                clip_rect: epaint::Rect::EVERYTHING,
+                primitive: Primitive::Mesh(mesh_b),
+            },
+        ];
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        let sidecar_capacity_before = renderer.hdr_color_buffer.capacity;
+        render_offscreen_with(&device, &queue, &mut renderer, target_format, &paint_jobs);
+
+        let stride = core::mem::size_of::<Vertex>();
+        assert_eq!(stride, 20, "the SDR vertex is still 20 B");
+        assert_eq!(
+            renderer.vertex_buffer.slices,
+            std::vec![
+                0..vertices_a * stride,
+                vertices_a * stride..(vertices_a + vertices_b) * stride
+            ],
+            "the SDR staging is one 20 B/vertex slice per mesh, unchanged"
+        );
+
+        assert_eq!(
+            renderer.hdr_color_buffer.slices.len(),
+            renderer.vertex_buffer.slices.len(),
+            "lockstep: every mesh gets a sidecar slice, SDR included"
+        );
+        assert!(
+            renderer
+                .hdr_color_buffer
+                .slices
+                .iter()
+                .all(|slice| slice.is_empty()),
+            "an SDR frame stages no sidecar bytes"
+        );
+        assert_eq!(
+            renderer.hdr_color_buffer.capacity, sidecar_capacity_before,
+            "no sidecar staging buffer is even created for SDR-only content"
+        );
     }
 
     /// Guards the module split against drift at the name level.

@@ -715,3 +715,215 @@ fn tint_hdr_towards(color: &mut HdrVertexColor, target: Color32) {
     };
     *color = HdrVertexColor::from_rgba_premultiplied([r, g, b, a]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epaint::{
+        Mesh, TessellationOptions, Tessellator, TextShape,
+        text::{FontDefinitions, TextOptions},
+    };
+
+    fn four() -> HdrVertexColor {
+        HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0])
+    }
+
+    fn new_painter() -> Painter {
+        Painter::new(Context::default(), LayerId::background(), Rect::EVERYTHING)
+    }
+
+    /// The single shape a painter recorded, read back after `transform_shape`
+    /// has run — exactly what the tessellator would receive.
+    fn one_shape(painter: &Painter) -> Shape {
+        let mut recorded = Vec::new();
+        painter.for_each_shape(|clipped| recorded.push(clipped.shape.clone()));
+        let mut shapes = recorded.into_iter();
+        let shape = shapes.next().expect("expected one shape");
+        assert!(shapes.next().is_none(), "expected exactly one shape");
+        shape
+    }
+
+    /// `a8 >= 170`: only rgb moves, alpha is untouched.
+    #[test]
+    fn tint_hdr_towards_keeps_alpha_above_the_threshold() {
+        let target = Color32::from_rgb(255, 0, 0);
+        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 1.0]);
+        tint_hdr_towards(&mut color, target);
+        let [r, g, b, a] = color.to_array();
+        assert_eq!(a, 1.0, "a8 = 255 is the `a8 >= 170` branch");
+        let toward = |component: u8| f32::from(component) / 255.0;
+        assert!((r - (0.25 + toward(127))).abs() < 1e-3, "r = {r}");
+        assert!((g - 0.25).abs() < 1e-3, "g = {g}");
+        assert!((b - 0.25).abs() < 1e-3, "b = {b}");
+    }
+
+    /// `a8 < 170`: the middle branch halves alpha and pulls by the *integer*
+    /// `2 * 255 / a8` divisor (3 at a8 = 128, not the float `2 / a`'s 4).
+    #[test]
+    fn tint_hdr_towards_uses_the_integer_divisor_below_the_threshold() {
+        let target = Color32::from_rgb(255, 0, 0);
+        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 0.5]);
+        assert_eq!((0.5_f32 * 255.0 + 0.5) as u8, 128, "a8 = 128");
+        tint_hdr_towards(&mut color, target);
+        let [r, g, b, a] = color.to_array();
+        assert!((a - 0.25).abs() < 1e-3, "alpha halves: {a}");
+        // 255 / 3 / 255 = 1/3, where a float `2 / a` divisor would give 1/4.
+        assert!((r - (0.25 + 1.0 / 3.0)).abs() < 1e-3, "r = {r}");
+        assert!((g - 0.25).abs() < 1e-3, "g = {g}");
+        assert!((b - 0.25).abs() < 1e-3, "b = {b}");
+    }
+
+    /// `a8 == 0`: rgb halves and alpha stays zero, so a transparent value
+    /// cannot acquire coverage on a fade.
+    #[test]
+    fn tint_hdr_towards_leaves_zero_alpha_at_zero() {
+        let target = Color32::from_rgb(255, 0, 0);
+        let mut color = HdrVertexColor::from_rgba_premultiplied([0.5, 0.5, 0.5, 0.0]);
+        tint_hdr_towards(&mut color, target);
+        let [r, g, b, a] = color.to_array();
+        assert_eq!(a, 0.0);
+        assert!((r - 0.25).abs() < 1e-3);
+        assert!((g - 0.25).abs() < 1e-3);
+        assert!((b - 0.25).abs() < 1e-3);
+    }
+
+    /// A wrapped shape dims through its inner alpha only: dimming the mode as
+    /// well would apply the factor twice.
+    #[test]
+    fn opacity_dims_a_wrapped_shape_once() {
+        let mut painter = new_painter();
+        painter.multiply_opacity(0.5);
+        painter.add(Shape::hdr(
+            Shape::rect_filled(Rect::EVERYTHING, 0.0, Color32::WHITE),
+            four(),
+        ));
+
+        let Shape::Hdr { inner, color } = one_shape(&painter) else {
+            panic!("expected the wrapper");
+        };
+        assert_eq!(
+            color,
+            HdrColorMode::Solid(four()),
+            "the wrapper's mask must not be dimmed"
+        );
+        let Shape::Rect(rect_shape) = &*inner else {
+            panic!("expected the inner rect");
+        };
+        assert_eq!(
+            rect_shape.fill,
+            Color32::WHITE.gamma_multiply(0.5),
+            "the inner fill is the single dimming path"
+        );
+    }
+
+    /// A bare HDR mesh has no inner alpha to lean on, so `adjust_colors` dims
+    /// every sidecar entry — once.
+    #[test]
+    fn opacity_dims_a_bare_hdr_mesh_once() {
+        let mut painter = new_painter();
+        painter.multiply_opacity(0.5);
+
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect_hdr(Rect::EVERYTHING, four());
+        painter.add(Shape::Mesh(mesh.into()));
+
+        let Shape::Mesh(mesh) = one_shape(&painter) else {
+            panic!("expected the mesh");
+        };
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), 4);
+        for color in colors {
+            assert_eq!(
+                color.to_array(),
+                [2.0, 2.0, 2.0, 0.5],
+                "one halving, not two"
+            );
+        }
+    }
+
+    /// HDR text dims through the vertex alpha the `Color32` fold writes; the
+    /// field is untouched, so the derived sidecar lands on exactly one factor.
+    #[test]
+    fn opacity_dims_hdr_text_once() {
+        let mut fonts =
+            epaint::text::Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "A".to_owned(),
+            FontId::proportional(24.0),
+            Color32::WHITE,
+        );
+
+        let mut painter = new_painter();
+        painter.multiply_opacity(0.5);
+        painter.add(TextShape::new(Pos2::ZERO, galley, Color32::WHITE).with_hdr_color(four()));
+
+        let Shape::Text(text) = one_shape(&painter) else {
+            panic!("expected the text");
+        };
+        assert_eq!(
+            text.hdr_color,
+            Some(four()),
+            "the text field must not be dimmed; the vertex alpha is the single path"
+        );
+
+        // Tessellate what the painter recorded: the derived sidecar is the HDR
+        // value at the already-dimmed coverage.
+        let mut mesh = Mesh::default();
+        let options = TessellationOptions {
+            feathering: false,
+            ..Default::default()
+        };
+        Tessellator::new(1.0, options, [1024, 1024], vec![]).tessellate_text(&text, &mut mesh);
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), mesh.vertices.len());
+        let peak = colors
+            .iter()
+            .map(|color| color.to_array()[0])
+            .fold(0.0_f32, f32::max);
+        // 4.0 × 127/255 ≈ 1.99 for one halving; 4.0 × 0.25 would be a second.
+        assert!(
+            (1.9..=2.1).contains(&peak),
+            "the sidecar must be dimmed exactly once, peak was {peak}"
+        );
+    }
+
+    /// The fade path is the same traversal: a bare HDR mesh tints once, and
+    /// the wrapper is not tinted twice.
+    #[test]
+    fn fade_tints_each_hdr_level_once() {
+        let target = Color32::from_rgb(255, 0, 0);
+
+        let mut painter = new_painter();
+        painter.fade_to_color = Some(target);
+
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect_hdr(Rect::EVERYTHING, four());
+        painter.add(Shape::Mesh(mesh.into()));
+        painter.add(Shape::hdr(
+            Shape::rect_filled(Rect::EVERYTHING, 0.0, Color32::WHITE),
+            four(),
+        ));
+
+        let mut recorded = Vec::new();
+        painter.for_each_shape(|clipped| recorded.push(clipped.shape.clone()));
+        assert_eq!(recorded.len(), 2);
+
+        let Shape::Mesh(mesh) = &recorded[0] else {
+            panic!("expected the mesh first");
+        };
+        let mut wanted = four();
+        tint_hdr_towards(&mut wanted, target);
+        for color in mesh.hdr_colors.as_ref().expect("sidecar") {
+            assert_eq!(*color, wanted, "the bare mesh's sidecar is tinted once");
+        }
+
+        let Shape::Hdr { color, .. } = &recorded[1] else {
+            panic!("expected the wrapper second");
+        };
+        assert_eq!(
+            *color,
+            HdrColorMode::Solid(four()),
+            "the wrapper's mask must not be tinted"
+        );
+    }
+}

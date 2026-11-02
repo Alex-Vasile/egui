@@ -27,18 +27,33 @@ use egui_wgpu::wgpu;
 const SIZE: u32 = 64;
 
 /// Render one egui frame into a fresh `Rgba16Float` offscreen target and read
-/// every texel back losslessly.
+/// every texel back losslessly, with no surface color space set (the
+/// `GammaEncoded` default).
 ///
 /// `msaa` is baked into the pipeline, so it must match `RendererOptions`'
 /// sample count; with more than one sample the pass renders into a
 /// multi-sampled intermediate that resolves into the read-back target.
-fn render_float(msaa: u32, mut ui_fn: impl FnMut(&mut Ui)) -> Vec<[f32; 4]> {
+fn render_float(msaa: u32, ui_fn: impl FnMut(&mut Ui)) -> Vec<[f32; 4]> {
+    render_float_on(None, msaa, ui_fn)
+}
+
+/// [`render_float`] with an explicit granted surface color space, which is
+/// what selects the fragment entry point (`OutputEncoding::of`).
+fn render_float_on(
+    surface_color_space: Option<wgpu::SurfaceColorSpace>,
+    msaa: u32,
+    mut ui_fn: impl FnMut(&mut Ui),
+) -> Vec<[f32; 4]> {
     let options = egui_wgpu::RendererOptions {
         msaa_samples: msaa,
         ..egui_wgpu::RendererOptions::PREDICTABLE
     };
     let render_state =
         egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), options);
+    render_state
+        .renderer
+        .write()
+        .set_active_surface_color_space(surface_color_space);
 
     // Any device error (validation or otherwise) fails the test: the tier
     // switches pipeline and vertex-buffer bindings, and those are exactly the
@@ -218,6 +233,20 @@ fn assert_rgba(actual: [f32; 4], expected: [f32; 4], what: &str) {
         assert!(
             (actual[channel] - expected[channel]).abs() <= 1.0 / 512.0,
             "{what}: channel {channel} was {}, expected {} (full texel {actual:?})",
+            actual[channel],
+            expected[channel],
+        );
+    }
+}
+
+/// [`assert_rgba`] with a caller-supplied absolute tolerance, for values whose
+/// magnitude makes binary16's own rounding the floor (the decoded linear
+/// path lands near 25.3 for an encoded 4.0).
+fn assert_rgba_within(actual: [f32; 4], expected: [f32; 4], tolerance: f32, what: &str) {
+    for channel in 0..4 {
+        assert!(
+            (actual[channel] - expected[channel]).abs() <= tolerance,
+            "{what}: channel {channel} was {}, expected {} ± {tolerance} (full texel {actual:?})",
             actual[channel],
             expected[channel],
         );
@@ -409,6 +438,190 @@ fn hdr_line_segment_draws_above_white() {
     assert_eq!(texel(&texels, SIZE / 2, 2), [0.0, 0.0, 0.0, 0.0]);
 }
 
+/// §12: every numeric row must ride **both** fragment entry points. `Srgb`
+/// selects `fs_main_gamma_framebuffer`, the scRGB space
+/// `fs_main_linear_framebuffer`; the physical colour is identical, so the
+/// linear read-back is the gamma-domain value decoded once. The expectation is
+/// derived from [`OutputEncoding`], never hard-coded, so a table change moves
+/// the test with it.
+#[test]
+fn both_fragment_entry_points_show_the_same_physical_color() {
+    use egui_wgpu::OutputEncoding;
+
+    let format = wgpu::TextureFormat::Rgba16Float;
+    let gamma_space = wgpu::SurfaceColorSpace::Srgb;
+    let linear_space = wgpu::SurfaceColorSpace::ExtendedSrgbLinear;
+    assert_eq!(
+        OutputEncoding::of(format, gamma_space),
+        OutputEncoding::GammaEncoded,
+        "the gamma entry point is the one the other rows already ride"
+    );
+    assert_eq!(
+        OutputEncoding::of(format, linear_space),
+        OutputEncoding::Linear,
+        "and this space is what exercises the linear entry point"
+    );
+
+    // What the framebuffer stores for a gamma-domain value on `space`.
+    let stored =
+        |space: wgpu::SurfaceColorSpace, gamma: f32| match OutputEncoding::of(format, space) {
+            OutputEncoding::GammaEncoded => gamma,
+            OutputEncoding::Linear => egui::ecolor::linear_from_gamma(gamma),
+        };
+
+    for space in [gamma_space, linear_space] {
+        // A 4.0 vertex.
+        let hdr = HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0]);
+        let texels = render_float_on(Some(space), 1, |ui| {
+            ui.painter().add(full_screen_hdr_mesh(hdr));
+        });
+        let expected = stored(space, 4.0);
+        assert_rgba_within(
+            texel(&texels, SIZE / 2, SIZE / 2),
+            [expected, expected, expected, 1.0],
+            (expected * 1e-3).max(1.0 / 512.0),
+            &format!("4.0 vertex on {space:?}"),
+        );
+
+        // The odd-symmetric negative: it must stay negative on both paths.
+        let hdr = HdrVertexColor::from_rgba_premultiplied([-2.0, -2.0, -2.0, 1.0]);
+        let texels = render_float_on(Some(space), 1, |ui| {
+            ui.painter().add(full_screen_hdr_mesh(hdr));
+        });
+        let expected = stored(space, -2.0);
+        assert_rgba_within(
+            texel(&texels, SIZE / 2, SIZE / 2),
+            [expected, expected, expected, 1.0],
+            (expected.abs() * 1e-3).max(1.0 / 512.0),
+            &format!("-2.0 vertex on {space:?}"),
+        );
+
+        // The ramp midpoint: interpolated above white, then encoded.
+        let texels = render_float_on(Some(space), 1, |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(SIZE as f32));
+            ui.painter().add_hdr_uv(
+                Shape::rect_filled(rect, 0.0, Color32::WHITE),
+                |_bounds, pos| {
+                    let value = 1.0 + 5.0 * (pos.x / SIZE as f32);
+                    HdrVertexColor::from_rgba_premultiplied([value, value, value, 1.0])
+                },
+            );
+        });
+        let midpoint = 1.0 + 5.0 * ((SIZE / 2) as f32 + 0.5) / SIZE as f32;
+        let expected = stored(space, midpoint);
+        assert_rgba_within(
+            texel(&texels, SIZE / 2, SIZE / 2),
+            [expected, expected, expected, 1.0],
+            (expected.abs() * 1e-3).max(1.0 / 512.0),
+            &format!("1.0→6.0 ramp midpoint on {space:?}"),
+        );
+    }
+
+    // And the two paths really do differ: the linear one is the decoded value,
+    // not a second gamma write.
+    let gamma = stored(gamma_space, 4.0);
+    let linear = stored(linear_space, 4.0);
+    assert!(
+        (gamma - linear).abs() > 1.0,
+        "the entry points must not coincide: gamma {gamma}, linear {linear}"
+    );
+}
+
+/// §12 GPU numeric + §14 6b "feathering through the mask": the wrapper scales
+/// the coverage the tessellator produced, so the antialiased ring is a value
+/// strictly between zero and the interior — a real midpoint, not a clamped
+/// mask. Both the plain and the MSAA-4× resolve path.
+///
+/// A circle rather than a rect: `rect_filled` snaps integer-aligned edges to
+/// the pixel grid, which leaves no partial pixel at all. A radius of 15.5 puts
+/// the left boundary at x = 16.5, putting the 1-px AA ramp (`±0.5 px` around
+/// the path) symmetrically across the boundary, so the pixel centred at 16.5
+/// is half covered by construction rather than by luck.
+#[test]
+fn hdr_feathered_edge_midpoint_is_between_zero_and_the_interior() {
+    for msaa in [1, 4] {
+        let hdr = HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0]);
+        let texels = render_float_on(None, msaa, |ui| {
+            ui.painter().add_hdr(
+                Shape::circle_filled(pos2(32.0, 32.0), 15.5, Color32::WHITE),
+                hdr,
+            );
+        });
+
+        let interior = texel(&texels, 32, 32);
+        assert_rgba(
+            interior,
+            [4.0, 4.0, 4.0, 1.0],
+            &format!("the interior at MSAA {msaa}×"),
+        );
+
+        let edge = texel(&texels, 16, 32);
+        assert!(
+            edge[0] > 0.05 && edge[0] < interior[0] - 0.05,
+            "the antialiased edge must fade in HDR at MSAA {msaa}×: edge {edge:?}, \
+             interior {interior:?}"
+        );
+        assert!(
+            (edge[0] - 2.0).abs() < 0.6,
+            "half coverage of a 4.0 value is ~2.0 at MSAA {msaa}×, was {}",
+            edge[0]
+        );
+        // The alpha channel feathers with it: coverage, not a colour clamp.
+        assert!(
+            edge[3] > 0.2 && edge[3] < 0.8,
+            "the edge's alpha is partial coverage at MSAA {msaa}×, was {}",
+            edge[3]
+        );
+        // Outside the ring is transparent: the geometry did not spread.
+        assert_eq!(
+            texel(&texels, 8, 32)[3],
+            0.0,
+            "nothing outside the feathered edge at MSAA {msaa}×"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots: the u8 proof of the twin
+// ---------------------------------------------------------------------------
+
+/// §12's Snapshot row. A u8 PNG cannot show above 1.0 by definition, so this
+/// pins the *other* half of the contract: the HDR gradient draws its SDR twin,
+/// range-reduced uniformly (hue preserved, not per-channel clamped).
+#[cfg(feature = "snapshot")]
+#[test]
+fn hdr_gradient_snapshot() {
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(Vec2::splat(64.0))
+        .build_ui(|ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(64.0));
+            ui.painter().add_hdr_uv(
+                Shape::rect_filled(rect, 0.0, Color32::WHITE),
+                |_bounds, pos| {
+                    // 6.0 → 0.5 in red, with green/blue ratios that survive
+                    // the range reduction.
+                    let t = pos.x / 64.0;
+                    HdrVertexColor::from_linear([0.5 + 5.5 * t, 1.0, 2.0 - 1.5 * t, 1.0])
+                },
+            );
+        });
+    harness.snapshot("hdr_gradient");
+}
+
+/// §12's Snapshot row for text: the glyphs' twin, so an SDR-only backend's
+/// HDR label is visibly the range-reduced colour rather than SDR white.
+#[cfg(feature = "snapshot")]
+#[test]
+fn hdr_label_snapshot() {
+    let hdr = HdrVertexColor::from_linear([4.0, 2.0, 0.5, 1.0]);
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(Vec2::new(120.0, 48.0))
+        .build_ui(move |ui| {
+            ui.hdr_label(hdr, RichText::new("HDR").size(32.0));
+        });
+    harness.snapshot("hdr_label");
+}
+
 // ---------------------------------------------------------------------------
 // Public-API CPU rows (the unit-level rows live beside the code)
 // ---------------------------------------------------------------------------
@@ -416,7 +629,7 @@ fn hdr_line_segment_draws_above_white() {
 #[test]
 fn projection_is_legal_and_preserves_ratios() {
     let color = HdrVertexColor::from_linear([4.0, 2.0, 0.5, 1.0]);
-    let twin = color.projected_color32(1.0);
+    let twin = color.projected_color32();
     let [r, g, b, a] = twin.to_array();
     assert!(r <= a && g <= a && b <= a);
     assert_eq!((r, g, b, a), (255, twin.g(), twin.b(), 255));

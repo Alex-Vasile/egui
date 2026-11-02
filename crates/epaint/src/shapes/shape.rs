@@ -433,10 +433,10 @@ impl Shape {
         Self::from(Mesh {
             indices: vec![0, 1, 2, 2, 1, 3],
             vertices: vec![
-                Vertex::untextured(rect.left_top(), left_top.projected_color32(1.0)),
-                Vertex::untextured(rect.right_top(), right_top.projected_color32(1.0)),
-                Vertex::untextured(rect.left_bottom(), left_bottom.projected_color32(1.0)),
-                Vertex::untextured(rect.right_bottom(), right_bottom.projected_color32(1.0)),
+                Vertex::untextured(rect.left_top(), left_top.projected_color32()),
+                Vertex::untextured(rect.right_top(), right_top.projected_color32()),
+                Vertex::untextured(rect.left_bottom(), left_bottom.projected_color32()),
+                Vertex::untextured(rect.right_bottom(), right_bottom.projected_color32()),
             ],
             texture_id: Default::default(),
             hdr_colors: Some(vec![left_top, right_top, left_bottom, right_bottom]),

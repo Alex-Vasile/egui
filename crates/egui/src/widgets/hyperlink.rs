@@ -37,9 +37,6 @@ impl Link {
 impl Widget for Link {
     fn ui(self, ui: &mut Ui) -> Response {
         let Self { text } = self;
-        // Links keep their own colour, so an HDR text override is not read
-        // here; `Link` has not opted into the tier.
-        let hdr_color = None;
         let label = Label::new(text).sense(Sense::click());
 
         let (galley_pos, galley, response) = label.layout_in_ui(ui);
@@ -57,8 +54,10 @@ impl Widget for Link {
 
             let selectable = ui.style().interaction.selectable_labels;
             if selectable {
+                // Links keep their own colour and `Link` has not opted into
+                // the HDR tier, so the text is painted SDR.
                 LabelSelectionState::label_text_selection(
-                    ui, &response, galley_pos, galley, color, underline, hdr_color,
+                    ui, &response, galley_pos, galley, color, underline, None,
                 );
             } else {
                 ui.painter().add(

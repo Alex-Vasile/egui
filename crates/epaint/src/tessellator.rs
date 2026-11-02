@@ -1756,7 +1756,7 @@ impl Tessellator {
                     *sidecar = hdr;
                     // The glow/SDR twin is the legal projection of the same
                     // value, so the two backends agree on hue.
-                    vertex.color = hdr.projected_color32(1.0);
+                    vertex.color = hdr.projected_color32();
                 }
             }
             Shape::Callback(_) => {
@@ -2558,6 +2558,27 @@ impl Tessellator {
                             .iter()
                             .map(|vertex| HdrVertexColor::from(vertex.color)),
                     );
+                }
+            }
+
+            if hdr_color.is_some() {
+                // The twin, for every vertex this row emitted (glyphs,
+                // backgrounds, underline). It is the projection of the sidecar
+                // and nothing else — the SDR-only backends draw only this
+                // value, so leaving it at the galley colour would make HDR text
+                // on those backends show no HDR hue at all.
+                let Mesh {
+                    vertices,
+                    hdr_colors,
+                    ..
+                } = out;
+                let sidecar = hdr_colors.as_mut().expect("promoted above");
+                debug_assert_eq!(sidecar.len(), vertices.len(), "length invariant");
+                for (vertex, &hdr) in vertices[vertex_start..]
+                    .iter_mut()
+                    .zip(&sidecar[vertex_start..])
+                {
+                    vertex.color = hdr.projected_color32();
                 }
             }
         }
@@ -3484,6 +3505,151 @@ mod hdr_tests {
             underline_values > 0,
             "the underline must be lifted, not dropped"
         );
+    }
+
+    #[test]
+    fn text_twin_is_the_projection_of_the_sidecar() {
+        use crate::text::{FontDefinitions, Fonts, TextOptions};
+
+        // A chromatic, above-white value: the projection is *not* white, so a
+        // twin left at the galley colour (white) is a visible discrepancy.
+        let hdr_color = HdrVertexColor::from_rgba_premultiplied([8.0, 1.0, 0.5, 1.0]);
+        assert_ne!(hdr_color.projected_color32(), Color32::WHITE);
+
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "Ag".to_owned(),
+            FontId::proportional(24.0),
+            Color32::WHITE,
+        );
+
+        let underline = Stroke::new(1.0, Color32::from_rgb(10, 20, 30));
+        let text_shape = TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE)
+            .with_hdr_color(hdr_color)
+            .with_underline(underline);
+
+        let primitives = tessellate(text_shape.into());
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), mesh.vertices.len());
+
+        for (i, (vertex, &hdr)) in core::iter::zip(&mesh.vertices, colors).enumerate() {
+            assert_eq!(
+                vertex.color,
+                hdr.projected_color32(),
+                "vertex {i}: the twin must be the sidecar's projection, not the galley colour"
+            );
+        }
+
+        // The glyphs really did carry the HDR value, so the check above is not
+        // vacuously "everything is the SDR lift".
+        assert!(colors.contains(&hdr_color));
+        assert!(
+            mesh.vertices
+                .iter()
+                .any(|vertex| vertex.color == hdr_color.projected_color32()),
+            "a glyph vertex must draw the HDR projection"
+        );
+    }
+
+    #[test]
+    fn text_background_run_keeps_its_sdr_colour() {
+        use crate::text::{FontDefinitions, Fonts, LayoutJob, TextFormat, TextOptions};
+
+        const BACKGROUND: Color32 = Color32::from_rgb(10, 20, 30);
+
+        let mut job = LayoutJob::default();
+        job.append(
+            "A",
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(24.0),
+                color: Color32::WHITE,
+                background: BACKGROUND,
+                ..Default::default()
+            },
+        );
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_job(job);
+        let text_shape =
+            TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE).with_hdr_color(four());
+
+        let primitives = tessellate(text_shape.into());
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+
+        // Background vertices are outside the glyph range, so they take the
+        // exact SDR lift: the HDR tier recolours glyphs, never the run's
+        // background.
+        let expected = HdrVertexColor::from(BACKGROUND);
+        assert!(
+            colors.contains(&expected),
+            "the background must stay at its own colour"
+        );
+        assert!(
+            mesh.vertices.iter().any(|vertex| {
+                let [r, g, b, a] = vertex.color.to_array();
+                let [er, eg, eb, ea] = BACKGROUND.to_array();
+                r.abs_diff(er) <= 1
+                    && g.abs_diff(eg) <= 1
+                    && b.abs_diff(eb) <= 1
+                    && a.abs_diff(ea) <= 1
+            }),
+            "and the drawn background stays SDR"
+        );
+    }
+
+    #[test]
+    fn text_color_glyph_keeps_its_pixels() {
+        use crate::text::{FontDefinitions, Fonts, TextOptions};
+
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "A".to_owned(),
+            FontId::proportional(24.0),
+            Color32::WHITE,
+        );
+
+        // Synthesize a colour glyph: layout does not change `is_color` after
+        // the fact, and the tessellator only reads it.
+        let mut galley = galley;
+        let glyph_vertex_range = {
+            let galley = Arc::make_mut(&mut galley);
+            let row = Arc::make_mut(&mut galley.rows[0].row);
+            for glyph in &mut row.glyphs {
+                glyph.is_color = true;
+            }
+            row.visuals.glyph_vertex_range.clone()
+        };
+        assert!(!glyph_vertex_range.is_empty());
+
+        let text_shape =
+            TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE).with_hdr_color(four());
+        let primitives = tessellate(text_shape.into());
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one message");
+        };
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+
+        // Colour glyphs must not be tinted: the sidecar is coverage-only
+        // white, so the shader's `color × texel` keeps the glyph's own pixels.
+        for index in glyph_vertex_range {
+            let coverage = f32::from(mesh.vertices[index].color.a()) / 255.0;
+            assert_eq!(
+                colors[index],
+                HdrVertexColor::from_white_alpha(coverage),
+                "colour glyph vertex {index} must be an alpha-only mask"
+            );
+            assert_eq!(
+                mesh.vertices[index].color,
+                colors[index].projected_color32(),
+                "and its twin is the alpha-only mask, not an opaque colour"
+            );
+        }
     }
 
     #[test]

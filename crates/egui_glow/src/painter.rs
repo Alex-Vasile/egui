@@ -21,6 +21,38 @@ pub use glow::Context;
 const VERT_SRC: &str = include_str!("shader/vertex.glsl");
 const FRAG_SRC: &str = include_str!("shader/fragment.glsl");
 
+/// The one warning a glow painter emits when it meets an HDR vertex-color
+/// mesh. It names the consequence (the range-reduced twin is drawn) and the
+/// escape hatch (the wgpu backend).
+const HDR_MESH_WARNING: &str = "egui_glow: this frame contains an HDR vertex-color mesh. \
+     The glow backend is SDR by design, so it draws the mesh's range-reduced SDR projection \
+     (a uniform linear-light scale that preserves hue) instead of true HDR values. Use the \
+     wgpu backend for the extended range, or gate the feature on `Frame::wgpu_render_state()`.";
+
+/// The warn-once state machine for HDR meshes.
+///
+/// Extracted from [`Painter::paint_mesh`] so the "one warning per painter,
+/// none for an SDR-only frame" rule is testable without a GL context.
+#[derive(Clone, Copy, Debug, Default)]
+struct HdrMeshWarning {
+    /// Set by the first HDR mesh this painter sees.
+    warned: bool,
+}
+
+impl HdrMeshWarning {
+    /// Emit [`HDR_MESH_WARNING`] if `mesh` needs one and this painter has not
+    /// warned yet. Returns whether a warning was emitted.
+    fn warn_once(&mut self, mesh: &Mesh) -> bool {
+        if mesh.is_hdr() && !self.warned {
+            self.warned = true;
+            log::warn!("{HDR_MESH_WARNING}");
+            true
+        } else {
+            false
+        }
+    }
+}
+
 trait TextureFilterExt {
     fn glow_code(&self, mipmap: Option<egui::TextureFilter>) -> u32;
 }
@@ -104,7 +136,7 @@ pub struct Painter {
     ///
     /// Unlike textures, a mesh has no id to key on (it is per-frame), so this
     /// is a single flag: one line per painter, no per-frame spam.
-    hdr_mesh_warned: bool,
+    hdr_mesh_warning: HdrMeshWarning,
 
     next_native_tex_id: u64,
 
@@ -276,7 +308,7 @@ impl Painter {
                 element_array_buffer,
                 textures: Default::default(),
                 float_content_warned: HashSet::new(),
-                hdr_mesh_warned: false,
+                hdr_mesh_warning: HdrMeshWarning::default(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
                 destroyed: false,
@@ -483,16 +515,7 @@ impl Painter {
     fn paint_mesh(&mut self, mesh: &Mesh) {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
 
-        if mesh.is_hdr() && !self.hdr_mesh_warned {
-            self.hdr_mesh_warned = true;
-            log::warn!(
-                "egui_glow: this frame contains an HDR vertex-color mesh. The glow backend is \
-                 SDR by design, so it draws the mesh's range-reduced SDR projection (a uniform \
-                 linear-light scale that preserves hue) instead of true HDR values. Use the \
-                 wgpu backend for the extended range, or gate the feature on \
-                 `Frame::wgpu_render_state()`."
-            );
-        }
+        self.hdr_mesh_warning.warn_once(mesh);
 
         if let Some(texture) = self.texture(mesh.texture_id) {
             unsafe {
@@ -822,5 +845,182 @@ fn set_clip_rect(
             clip_max_x - clip_min_x,
             clip_max_y - clip_min_y,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Once, OnceLock};
+
+    use egui::{
+        Color32,
+        emath::{pos2, vec2},
+        epaint::HdrVertexColor,
+        epaint::mutex::{Mutex, MutexGuard},
+    };
+
+    fn sdr_mesh() -> Mesh {
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect(
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)),
+            Color32::from_rgb(10, 20, 30),
+        );
+        mesh
+    }
+
+    fn hdr_mesh() -> Mesh {
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect_hdr(
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)),
+            HdrVertexColor::from_rgba_premultiplied([8.0, 1.0, 0.5, 1.0]),
+        );
+        mesh
+    }
+
+    /// Decode the colour the GL attribute would read for vertex `index`,
+    /// through the exact byte layout `Painter::new` declares to the VAO.
+    fn drawn_color(uploaded: &[u8], index: usize) -> Color32 {
+        let at = index * core::mem::size_of::<Vertex>() + offset_of!(Vertex, color);
+        Color32::from_rgba_premultiplied(
+            uploaded[at],
+            uploaded[at + 1],
+            uploaded[at + 2],
+            uploaded[at + 3],
+        )
+    }
+
+    /// A `log` recorder that keeps every warning, so the warn-once rule is
+    /// asserted on the emitted line itself rather than on the flag.
+    struct CaptureLogger;
+
+    static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static INSTALL: Once = Once::new();
+
+    fn lines() -> &'static Mutex<Vec<String>> {
+        LINES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Serializes the tests that read the shared capture, so a sibling's
+    /// warning cannot be counted.
+    fn capture_lock() -> MutexGuard<'static, ()> {
+        LOG_LOCK.get_or_init(|| Mutex::new(())).lock()
+    }
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                lines().lock().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_logger() {
+        INSTALL.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    /// Exactly one warning per painter, and none at all for an SDR-only frame.
+    #[test]
+    fn hdr_meshes_warn_once_and_sdr_never_does() {
+        install_logger();
+        let _guard = capture_lock();
+        lines().lock().clear();
+
+        let mut state = HdrMeshWarning::default();
+        let sdr = sdr_mesh();
+        assert!(!state.warn_once(&sdr), "an SDR mesh must not warn");
+        assert!(!state.warn_once(&sdr));
+
+        let hdr = hdr_mesh();
+        assert!(state.warn_once(&hdr), "the first HDR mesh warns");
+        assert!(!state.warn_once(&hdr), "and never twice per painter");
+        assert!(!state.warn_once(&sdr), "an SDR mesh afterwards stays quiet");
+
+        let captured = lines().lock().clone();
+        assert_eq!(captured.len(), 1, "exactly one warning, got {captured:?}");
+        assert!(
+            captured[0].contains("HDR vertex-color mesh"),
+            "the warning names the cause: {captured:?}"
+        );
+        assert!(
+            captured[0].contains("range-reduced SDR projection"),
+            "and the consequence: {captured:?}"
+        );
+        assert!(
+            captured[0].contains("wgpu") && captured[0].contains("wgpu_render_state"),
+            "and the escape hatch: {captured:?}"
+        );
+    }
+
+    /// A fresh painter is a fresh warning budget: the flag lives on the
+    /// painter, not in a global.
+    #[test]
+    fn the_warning_budget_is_per_painter() {
+        install_logger();
+        let _guard = capture_lock();
+        let hdr = hdr_mesh();
+
+        let mut first = HdrMeshWarning::default();
+        assert!(first.warn_once(&hdr));
+
+        let mut second = HdrMeshWarning::default();
+        assert!(
+            second.warn_once(&hdr),
+            "a new painter warns again — no global one-shot"
+        );
+    }
+
+    /// The glow painter uploads `&mesh.vertices` verbatim and the VAO reads
+    /// the colour at `offset_of!(Vertex, color)` with stride
+    /// `size_of::<Vertex>()`. Pin that layout, and assert that what lands at
+    /// that offset for an HDR mesh is the sidecar's projection — the twin glow
+    /// draws — and that an SDR mesh is untouched.
+    #[test]
+    fn glow_draws_the_hdr_twin_and_leaves_sdr_bytes_alone() {
+        let stride = core::mem::size_of::<Vertex>();
+        assert_eq!(stride, 20, "glow uploads a 20-byte stride");
+        assert_eq!(
+            offset_of!(Vertex, color),
+            16,
+            "the attribute offset `Painter::new` declares"
+        );
+
+        let hdr = hdr_mesh();
+        assert!(hdr.is_hdr());
+        let uploaded: &[u8] = bytemuck::cast_slice(&hdr.vertices);
+        assert_eq!(uploaded.len(), stride * hdr.vertices.len());
+        let sidecar = hdr.hdr_colors.as_ref().expect("sidecar");
+        for (index, hdr_color) in sidecar.iter().enumerate() {
+            assert_eq!(
+                drawn_color(uploaded, index),
+                hdr_color.projected_color32(),
+                "vertex {index}: glow must draw the twin"
+            );
+        }
+        // The twin is not the galley/SDR white: this is a real range reduction.
+        assert_ne!(sidecar[0].projected_color32(), Color32::WHITE);
+
+        let sdr = sdr_mesh();
+        assert!(!sdr.is_hdr());
+        assert!(sdr.hdr_colors.is_none(), "no sidecar is staged for SDR");
+        let uploaded: &[u8] = bytemuck::cast_slice(&sdr.vertices);
+        assert_eq!(uploaded.len(), stride * sdr.vertices.len());
+        for index in 0..sdr.vertices.len() {
+            assert_eq!(
+                drawn_color(uploaded, index),
+                sdr.vertices[index].color,
+                "vertex {index}: the SDR path is byte-identical"
+            );
+        }
     }
 }

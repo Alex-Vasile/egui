@@ -105,13 +105,6 @@ impl HdrVertexColor {
         self.bits.map(|bits| half::f16::from_bits(bits).to_f32())
     }
 
-    /// The stored coverage (`0..=1` for content produced by this crate).
-    #[inline]
-    #[must_use]
-    pub fn alpha(&self) -> f32 {
-        self.to_array()[3]
-    }
-
     /// White with the given coverage, `(a, a, a, a)`.
     ///
     /// The HDR counterpart of [`Color32::from_white_alpha`]: useful as an
@@ -135,9 +128,9 @@ impl HdrVertexColor {
         Self::from_rgba_premultiplied([r * factor, g * factor, b * factor, a * factor])
     }
 
-    /// The legal, premultiplied-`Color32` projection of `self × coverage` —
-    /// the SDR twin an HDR mesh's [`Vertex::color`](crate::Vertex::color)
-    /// carries, and the value the GL backend draws.
+    /// The legal, premultiplied-`Color32` projection of `self` — the SDR twin
+    /// an HDR mesh's [`Vertex::color`](crate::Vertex::color) carries, and the
+    /// value the GL backend draws. A pure function of the stored bits.
     ///
     /// The projection is a **uniform scale in linear light**, never a
     /// per-channel clamp: every inter-channel ratio among the positive
@@ -156,23 +149,19 @@ impl HdrVertexColor {
     ///   at the incoming alpha — "as dark as SDR goes", still occluding an
     ///   opaque one.
     /// - Mixed-sign values are scaled by the positive peak and their negative
-    ///   components drop to zero; there is no positive scale that fits them
-    ///   all.
+    ///   components drop to zero: no uniform positive scale can put a negative
+    ///   component in `0..=1`.
     /// - Non-finite input cannot reach the quantizer: an `inf` peak makes the
     ///   scale `0`, and a `NaN` component is ignored by the `max` fold.
     ///
-    /// `coverage` multiplies all four stored components before the reduction
-    /// (pass `1.0` for the value as stored); because the reduction divides by
-    /// the alpha, scaling the value and scaling the alpha are equivalent.
+    /// To project a *feathered* value, [`scaled`](Self::scaled) it first: the
+    /// reduction divides by the alpha, so scaling the value and scaling the
+    /// alpha are equivalent (`x.scaled(c).projected_color32()`).
     #[must_use]
-    pub fn projected_color32(&self, coverage: f32) -> Color32 {
+    pub fn projected_color32(&self) -> Color32 {
         use ecolor::linear_from_gamma;
 
         let [r, g, b, a] = self.to_array();
-        let r = r * coverage;
-        let g = g * coverage;
-        let b = b * coverage;
-        let a = a * coverage;
 
         if a <= 0.0 {
             return Color32::TRANSPARENT;
@@ -296,26 +285,21 @@ mod tests {
 
     #[test]
     fn color32_lift_error_is_under_half_an_8_bit_step() {
-        for r in (0..=255u8).step_by(3) {
-            for g in (0..=255u8).step_by(5) {
-                for b in [0u8, 1, 17, 128, 254, 255] {
-                    for a in [0u8, 1, 64, 128, 254, 255] {
-                        let color = Color32::from_rgba_premultiplied(r, g, b, a);
-                        let lifted = HdrVertexColor::from(color).to_array();
-                        let expected = [
-                            f32::from(r) / 255.0,
-                            f32::from(g) / 255.0,
-                            f32::from(b) / 255.0,
-                            f32::from(a) / 255.0,
-                        ];
-                        for (got, want) in core::iter::zip(lifted, expected) {
-                            assert!(
-                                (got - want).abs() < HALF_U8_STEP,
-                                "{color:?}: lifted {got} vs {want}"
-                            );
-                        }
-                    }
-                }
+        // Every value of every component, one channel at a time with the
+        // others off their endpoints: the contract is "all 256 values per
+        // component", so a `step_by` sample would not test it.
+        const OTHERS: [u8; 4] = [37, 201, 128, 255];
+        for value in 0..=255u8 {
+            for channel in 0..4 {
+                let mut rgba = OTHERS;
+                rgba[channel] = value;
+                let color = Color32::from_rgba_premultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+                let got = HdrVertexColor::from(color).to_array()[channel];
+                let want = f32::from(value) / 255.0;
+                assert!(
+                    (got - want).abs() < HALF_U8_STEP,
+                    "{color:?} channel {channel}: lifted {got} vs {want}"
+                );
             }
         }
     }
@@ -332,7 +316,7 @@ mod tests {
         ]);
         assert_eq!(linear, expected);
         // The alpha is coverage, not encoded.
-        assert_eq!(linear.alpha(), a);
+        assert_eq!(linear.to_array()[3], a);
         // The photometric misreading — encoding the product — differs.
         let photometric = gamma_from_linear(a * r);
         assert!((linear.to_array()[0] - photometric).abs() > 0.05);
@@ -383,8 +367,8 @@ mod tests {
         }
         // The ratios are untouched, so the feather's twin is the same hue at
         // half the coverage: a uniform linear-light scale in both cases.
-        let feathered_twin = feather.projected_color32(1.0);
-        let reference_twin = color.projected_color32(1.0);
+        let feathered_twin = feather.projected_color32();
+        let reference_twin = color.projected_color32();
         let [fr, fg, fb, fa] = feathered_twin.to_array();
         let [rr, rg, rb, ra] = reference_twin.to_array();
         assert_eq!(fa, ra / 2, "alpha halves");
@@ -410,23 +394,23 @@ mod tests {
     #[test]
     fn projection_zero_alpha_is_transparent() {
         let color = HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 0.0]);
-        assert_eq!(color.projected_color32(1.0), Color32::TRANSPARENT);
-        // Also when the coverage argument is what zeroes it.
+        assert_eq!(color.projected_color32(), Color32::TRANSPARENT);
+        // Scaling to zero coverage lands in the same guard.
         let opaque = HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0]);
-        assert_eq!(opaque.projected_color32(0.0), Color32::TRANSPARENT);
+        assert_eq!(opaque.scaled(0.0).projected_color32(), Color32::TRANSPARENT);
     }
 
     #[test]
     fn projection_all_negative_is_black_at_its_alpha() {
         let color = HdrVertexColor::from_rgba_premultiplied([-4.0, -1.0, -0.5, 1.0]);
         assert_eq!(
-            color.projected_color32(1.0),
+            color.projected_color32(),
             Color32::from_rgba_premultiplied(0, 0, 0, 255)
         );
 
         // An opaque one must still occlude, so not TRANSPARENT.
         let translucent = HdrVertexColor::from_rgba_premultiplied([-4.0, -1.0, -0.5, 0.5]);
-        let twin = translucent.projected_color32(1.0);
+        let twin = translucent.projected_color32();
         assert_eq!(twin.to_array()[0..3], [0, 0, 0]);
         assert_eq!(twin.a(), 128);
     }
@@ -434,7 +418,7 @@ mod tests {
     #[test]
     fn projection_exact_black_keeps_its_alpha() {
         let color = HdrVertexColor::from_rgba_premultiplied([0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(color.projected_color32(1.0), Color32::BLACK);
+        assert_eq!(color.projected_color32(), Color32::BLACK);
     }
 
     #[test]
@@ -445,7 +429,7 @@ mod tests {
         let linear = [4.0, 2.0, 0.5];
         let color =
             HdrVertexColor::from_rgba_premultiplied(linear.map(gamma_from_linear).map_alpha(1.0));
-        let twin = color.projected_color32(1.0);
+        let twin = color.projected_color32();
         let [r, g, b, a] = twin.to_array();
         assert_eq!(a, 255);
         assert_eq!(r, 255);
@@ -468,7 +452,7 @@ mod tests {
                     rgb[2] * a,
                     a,
                 ]);
-                let twin = color.projected_color32(1.0);
+                let twin = color.projected_color32();
                 let [r, g, b, alpha] = twin.to_array();
                 assert!(r <= alpha && g <= alpha && b <= alpha, "{twin:?} at a={a}");
             }
@@ -478,7 +462,7 @@ mod tests {
     #[test]
     fn projection_mixed_sign_drops_negatives() {
         let color = HdrVertexColor::from_rgba_premultiplied([4.0, -1.0, 0.2, 1.0]);
-        let twin = color.projected_color32(1.0);
+        let twin = color.projected_color32();
         let [r, g, b, _] = twin.to_array();
         assert_eq!(r, 255, "positive peak maps to white");
         assert_eq!(g, 0, "unrepresentable negative drops to black");
@@ -493,7 +477,7 @@ mod tests {
         // sub-white values not brighten on the SDR twin.
         let color = Color32::from_rgba_unmultiplied(200, 100, 50, 128);
         let lifted = HdrVertexColor::from(color);
-        let projected = lifted.projected_color32(1.0);
+        let projected = lifted.projected_color32();
         let [r, g, b, a] = projected.to_array();
         for (got, want) in [
             (r, color.r()),
@@ -510,10 +494,10 @@ mod tests {
 
     #[test]
     fn projection_of_white_is_white() {
-        assert_eq!(HdrVertexColor::WHITE.projected_color32(1.0), Color32::WHITE);
+        assert_eq!(HdrVertexColor::WHITE.projected_color32(), Color32::WHITE);
         // A mid-gray SDR value must not brighten.
         let gray = Color32::from_gray(128);
-        assert_eq!(HdrVertexColor::from(gray).projected_color32(1.0), gray);
+        assert_eq!(HdrVertexColor::from(gray).projected_color32(), gray);
     }
 
     #[cfg(feature = "serde")]

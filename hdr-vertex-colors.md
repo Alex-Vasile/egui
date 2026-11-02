@@ -613,6 +613,13 @@ Constructors/accessors follow `ecolor`'s value-type naming, not a private dialec
 - `projected_color32(&self) -> Color32` — the SDR twin: the legal-premultiplied range reduction the
   GL backend draws and the HDR mesh's unused `Vertex::color` carries (§8.5). Total on every input,
   including transparent and negative values.
+- `scaled(self, factor: f32) -> Self` — all four stored components times `factor`, the operation
+  feathering and `Painter`'s `multiply_opacity` apply. Public because `egui` (a separate crate)
+  dims sidecars with it; multiplying a premultiplied value by a coverage factor keeps
+  premultiplication intact at any magnitude, and `factor == 1.0` is an exact no-op. It replaces the
+  `coverage` argument the round-1 `projected_color32` took: because the projection divides by the
+  alpha, `x.scaled(c).projected_color32()` and a `projected_color32(c)` are the same value, and one
+  of the two had to go to keep the projection "a pure function of the stored bits".
 - `from_linear([f32; 4]) -> Self` — the ergonomic constructor. Input is **straight (unmultiplied)**
   linear RGBA: each component is encoded with `ecolor::gamma_from_linear` (odd-symmetric since PR 2a)
   and then premultiplied, `stored = a × enc(L)`; `a` is the coverage and is not encoded. Say so in
@@ -633,7 +640,11 @@ Constructors/accessors follow `ecolor`'s value-type naming, not a private dialec
 - `impl From<Rgba> for HdrVertexColor` lives in **epaint**, next to `impl From<Color32>`: both
   `From` and `Rgba` are foreign to `egui`, so an impl there would violate the orphan rule and not
   compile. (Rgba's components are linear *and* premultiplied — `Rgba::from_rgba_premultiplied`'s
-  convention — so the impl encodes in place, unlike `from_linear`.)
+  convention — so the impl unmultiplies the coverage, encodes each straight component, then
+  premultiplies again: `stored = a × enc(rgb / a)`. That is the same order as
+  `impl From<Rgba> for Color32` (`ecolor/src/lib.rs:75-90`), and the test pins agreement with it.
+  Encoding the premultiplied value in place would store `enc(a × L)`, a different photometric
+  reading for every translucent colour.)
 
 There is deliberately no way to detect "is this `HdrVertexColor` also a `Color32`": the tier is a
 property of the *mesh*, never of a value, which is what keeps the SDR path free.
@@ -837,16 +848,31 @@ that both the tessellator (§9) and any test can call:
 ```rust
 let [r, g, b, a] = self.to_array();          // stored, encoded, premultiplied
 if a <= 0.0 { return Color32::TRANSPARENT; } // feather rings and cleared text land here
-let lin = [r / a, g / a, b / a];             // straight light, or alpha contaminates the maximum
+// Un-premultiply the *encoded* components, then decode: the reduction has to happen in linear
+// light, because scaling encoded values is not a luminance change and compounds with the
+// transfer curve. (Dividing the encoded components first is not a second encoding — the
+// components were already encoded on the way in.)
+let lin = [
+    linear_from_gamma(r / a),
+    linear_from_gamma(g / a),
+    linear_from_gamma(b / a),
+];
 let peak = lin.iter().fold(0.0_f32, |m, c| m.max(*c));   // ignore negatives: SDR cannot show them
 if peak <= 0.0 {                             // all-negative or exact black: black, not invisible
     return Color32::from_rgba_premultiplied(0, 0, 0, linear_u8_from_linear_f32(a));
 }
-let k = 1.0 / peak;
+let k = 1.0 / peak.max(1.0);                 // the floor: sub-white values never brighten
 let scaled = lin.map(|c| (c * k).max(0.0));  // uniform scale, then drop unrepresentable negatives
-// encode each straight component, *then* multiply by `a` (alpha is unencoded coverage) and
+// Encode each straight component, *then* multiply by `a` (alpha is unencoded coverage) and
 // quantize — the order `Color32`'s own conversion uses (`ecolor/src/color32.rs:147-151`), which is
-// exactly what keeps `rgb <= a`
+// exactly what keeps `rgb <= a`.
+let quantize = |c: f32| ((gamma_u8_from_linear_f32(c) as f32 * a) + 0.5) as u8;
+Color32::from_rgba_premultiplied(
+    quantize(scaled[0]),
+    quantize(scaled[1]),
+    quantize(scaled[2]),
+    linear_u8_from_linear_f32(a),
+)
 ```
 
 Three guards, each with a reason, and each is a test (§12):
@@ -865,10 +891,11 @@ Three guards, each with a reason, and each is a test (§12):
   SDR goes", and an opaque one must still occlude. `TRANSPARENT` here — the round-2 draft — made
   such geometry vanish on the GL backend instead, contradicting §11's "the geometry is still in
   place" (§8.5's own "would display as … black" already said what the intent was).
-- **`.max(0.0)` after the scale** — mixed-sign values (`[+4.0, −1.0, 0.2]`) have *no* positive `k`
-  that puts every component in `0..=1`; the uniform scale is applied to the positives (their ratios
-  are preserved exactly, which is the property that matters) and negative components drop to black
-  rather than being folded in.
+- **`.max(0.0)` after the scale** — the peak is taken over the positives only, so mixed-sign values
+  (`[+4.0, −1.0, 0.2]`) scale by `1 / max(peak, 1.0)` and their negative components drop to black
+  rather than being folded in. This is a separate concern from the sign flip above: with the
+  `max(peak, 1.0)` floor `k` is always positive and bounded by `1.0`, so no input can turn the
+  scale into a brightening or a mirror; the guard is only about components SDR cannot represent.
 
 A uniform scale of the positive tristimulus *is* a luminance change — every inter-channel ratio among
 the positive components is preserved, so hue and saturation are untouched by construction.
@@ -950,7 +977,12 @@ Measured (§5): `Option<HdrVertexColor>` is 10 B and fits `TextShape`'s trailing
 with N bespoke methods would be bad design — and impossible for anything taking `Stroke`, which is
 8 B and cannot grow (§5). So parity is satisfied twice over: one generic mechanism that covers every
 shape (`add_hdr`, §8.4), plus bespoke mirrors only where the existing API is a *builder taking
-colors positionally* (so the call reads like the SDR one).
+colors positionally* (so the call reads like the SDR one). `line_segment` is the boundary case and
+gets the mirror: its colour is a positional argument, so `line_segment_hdr(points, stroke, color)`
+reads like `rect_filled_hdr`, and the method is a one-line `add_hdr` call rather than a second
+implementation. `hline`/`vline` take their colour inside the `Stroke` and stay generic — the same
+distinction, applied consistently. Everything in this table that has no bespoke method is reachable
+through `add_hdr`; nothing is unreachable.
 
 | SDR entry point | HDR counterpart | PR |
 |---|---|---|
@@ -960,9 +992,10 @@ colors positionally* (so the call reads like the SDR one).
 | `Painter::image` / `Shape::image(texture, rect, uv, tint)` | `add_hdr(Shape::image(…, Color32::WHITE), color)` — an HDR **tint**: the texels keep multiplying underneath (`in.color * tex_gamma`), so this is tinting, not flat recolouring | 6a |
 | `PathStroke` / `ColorMode::Solid` | `add_hdr(Shape::line(points, stroke), color)` — `ColorMode` untouched (§8.3) | 6a |
 | `ColorMode::UV` (ramp along a path) | `add_hdr_uv(Shape::line(points, stroke), \|rect, pos\| …)` (`HdrColorMode::UV`) | 6b |
-| `Painter::line_segment` / `hline` / `vline` | `add_hdr(Shape::line_segment(points, stroke), color)` — no bespoke method; `Stroke` cannot grow | 6a |
+| `Painter::line_segment` | `Painter::line_segment_hdr(points, stroke, color)` — the builder mirror (colour positional, like its SDR twin), a thin `add_hdr` call; `add_hdr(Shape::line_segment(points, stroke), color)` says the same thing without the convenience | 6a |
+| `Painter::hline` / `vline` | `add_hdr(Shape::hline(x, y, stroke), color)` / `add_hdr(Shape::vline(x, y, stroke), color)` — no bespoke methods (their colour is inside the `Stroke`) | 6a |
 | `RichText::color`, `ui.label` | `RichText::color_hdr`, `ui.hdr_label` | 6c |
-| `circle_*`, `ellipse`, `rect_stroke`, polygon fills, band fills, `hline`/`vline` | `Painter::add_hdr(shape, color)` — construct the shape yourself with a white color; §8.4 | 6a |
+| `circle_*`, `ellipse`, `rect_stroke`, polygon fills, band fills | `Painter::add_hdr(shape, color)` — construct the shape yourself with a white color; §8.4 | 6a |
 | `Painter::arrow` | **not** wrap-able: it is a procedure emitting three `line_segment` calls (`painter.rs:417-430`), not a builder. Needs `arrow_hdr` (a body copy over `add_hdr` + `line_segment`) or stays SDR | 6b |
 
 Two classes of API, and only one is generic: **builders** return a `Shape` that `add_hdr` can wrap;
@@ -1002,11 +1035,17 @@ After the tier:
   four-vertex bilinear interpolation of either is visibly wrong. `FloatImage::exposure_ramp` stays.
 - **Curved HDR gradients** (a future OkLCh wheel above 1.0) ride the wrapper's `HdrColorMode::UV` —
   per-position HDR values with arbitrary curves, no texture.
-- The comments in `color_picker.rs` that cite the main plan's §6 are superseded, in 6d, by the above
-  split — the inline note ("the float-texture path is the one §6-compliant way to show the true
-  color") and `HdrColor`'s own rustdoc claim that "vertex colors cap at 1.0 (plan §6 — stroked shapes
-  and text cannot be HDR)" (`color_picker.rs:847-849`). Both are now false statements about the
-  shipped tree and must go in the same PR that makes them false.
+- The comments in `color_picker.rs` that cite the main plan's §6 are superseded by the above split,
+  and they are rewritten **in 6d, with the picker rewire** — the inline note ("the float-texture
+  path is the one §6-compliant way to show the true color") and `HdrColor`'s own rustdoc claim that
+  "vertex colors cap at 1.0 (plan §6 — stroked shapes and text cannot be HDR)"
+  (`color_picker.rs:847-849`, `:1175`). Both become false the moment 6a lands, but they are
+  scheduled here rather than fixed early: they describe code 6d deletes or replaces
+  (`paint_hdr_swatch`'s texture path, `HdrColor`'s rationale), and rewriting a comment to describe a
+  mechanism the function still does not use would be the less honest artifact. This entry *is* the
+  tracking; the tree carries no `TODO` for it. 6c's rule is narrower: a doc comment that describes
+  code *this* stack already ships must be true when the code lands (which is why the `egui-wgpu`
+  cache-key docs are fixed in 6a/6c, not deferred).
 
 ---
 

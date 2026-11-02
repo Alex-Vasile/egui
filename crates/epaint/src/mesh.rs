@@ -334,7 +334,7 @@ impl Mesh {
         );
         self.promote_to_hdr().push(color);
         self.vertices
-            .push(Vertex::untextured(pos, color.projected_color32(1.0)));
+            .push(Vertex::untextured(pos, color.projected_color32()));
     }
 
     /// Rectangle with a texture and an HDR color.
@@ -346,7 +346,7 @@ impl Mesh {
         #![expect(clippy::identity_op)]
         self.promote_to_hdr().extend([color; 4]);
 
-        let twin = color.projected_color32(1.0);
+        let twin = color.projected_color32();
         let idx = self.vertices.len() as u32;
         self.indices
             .extend_from_slice(&[idx + 0, idx + 1, idx + 2, idx + 2, idx + 1, idx + 3]);
@@ -639,6 +639,23 @@ mod tests {
         assert_eq!(
             hdr.bytes_used() - sdr.bytes_used(),
             4 * core::mem::size_of::<HdrVertexColor>()
+        );
+    }
+
+    /// §5 consequence 6: the sidecar may add a field but must not push either
+    /// mesh over `PathShape`'s 56 B plus the shared `Mesh` header — the
+    /// measured 88 B is the ceiling.
+    #[test]
+    fn mesh_size_is_unchanged() {
+        assert_eq!(
+            core::mem::size_of::<Mesh>(),
+            88,
+            "Mesh grew: the sidecar is the only added field, and it is an Option<Vec<_>>"
+        );
+        assert_eq!(
+            core::mem::size_of::<Mesh16>(),
+            88,
+            "Mesh16 must stay the same size as Mesh"
         );
     }
 
