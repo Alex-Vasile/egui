@@ -609,6 +609,7 @@ impl<'atom> SizedContainerAtom<'atom> {
                             galley,
                             fallback_text_color,
                             Stroke::NONE,
+                            None,
                         );
                     } else {
                         ui.painter()

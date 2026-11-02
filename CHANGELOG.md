@@ -17,6 +17,12 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 ## Unreleased
 
 ### ⭐ Added
+* HDR painting: `Painter::add_hdr(shape, color)` / `add_hdr_uv(shape, callback)` wrap any shape in `epaint::Shape::Hdr` and recolour it by coverage, so strokes, polylines, polygon fills, images and every future shape can be painted above SDR white; `rect_filled_hdr`, `line_segment_hdr` and `arrow_hdr` are the positional-colour mirrors of the SDR builders
+* `RichText::color_hdr` + `Ui::hdr_label`: HDR glyph color, read by `Label` before the layout job consumes the text (the layout road is `Color32`-bound). `From<HdrColor> for HdrVertexColor` makes an HDR picker value usable directly as a painting color
+* HDR values participate in `Ui::multiply_opacity` and `fade_to_color`: the painter's colour fold now carries an encoded-space HDR mirror of `tint_color_towards` (same three branches and integer divisor), so an HDR mesh does not diverge from its `Color32` twin on the GL backend
+
+### ⚠️ Breaking changes
+* `text_selection::LabelSelectionState::label_text_selection` takes the label's `Option<epaint::HdrVertexColor>` as a new final argument
 * `ViewportInfo::hdr_headroom: Option<f32>`: the display headroom (tone-map multiplier above SDR white) the viewport's surface is presenting with, polled per frame by wgpu-based backends. `None` means unknown (non-wgpu backend, no surface, or a platform that reports nothing — e.g. iOS); `Some(1.0)` is a valid no-headroom steady state. The value also shows in the `ViewportInfo` debug grid.
 * `ViewportInfo::surface_status` and `ViewportInfo::surface_target`: wgpu-based backends now surface each viewport's rendering-surface decision (whether the app's surface preference was granted, and the configured format + color space, e.g. `"Bgra8Unorm + DisplayP3"`). Backends that don't track this (glow, web) leave both fields `None`. Comes with the new mirror enums `egui::SurfaceStatus` and `egui::FallbackReason`.
 * Tagged float content: `egui::FloatImage` and `egui::Primaries` are re-exported, and `ImageData::Float` makes wide-gamut (and later HDR) *images* possible. Float images display through the plain `ui.image()`; the wgpu backend pairs the content's primaries with the granted surface color space (native or loud reject with a warning and the placeholder), and the glow backend skips float content with a warning. Note: `ImageData`/`ImageDelta`/`TexturesDelta` no longer implement `Eq` (float content is `PartialEq`-only), and the closed serde enum gained a variant.

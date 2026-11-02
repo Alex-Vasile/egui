@@ -1,14 +1,33 @@
 use alloc::sync::Arc;
 
 use crate::{
-    BandShape, CircleShape, Color32, ColorMode, CubicBezierShape, EllipseShape, Mesh, PathShape,
-    QuadraticBezierShape, RectShape, Shape, TextShape, color,
+    BandShape, CircleShape, Color32, ColorMode, CubicBezierShape, EllipseShape, HdrVertexColor,
+    Mesh, PathShape, QuadraticBezierShape, RectShape, Shape, TextShape, color,
 };
 
 /// Remember to handle [`Color32::PLACEHOLDER`] specially!
+///
+/// `adjust_color` folds the SDR values (vertex colours, fills, strokes, galley
+/// colours) and `adjust_hdr` folds the HDR values
+/// ([`Mesh::hdr_colors`](crate::Mesh::hdr_colors)). One traversal, two value
+/// spaces — the two are separate because an HDR value is not a `Color32` and a
+/// conversion would lose the tier.
+///
+/// The three HDR levels dim differently, and the asymmetry is deliberate:
+///
+/// - [`Shape::Hdr`]: recurse into `inner` only. The wrapper's mask *is* the
+///   inner alpha, so dimming the mode as well applies the factor twice.
+/// - [`Shape::Mesh`]: apply `adjust_hdr` to every sidecar entry. Otherwise a
+///   directly-built HDR mesh would ignore `multiply_opacity`/`fade_to_color`
+///   on wgpu, where only the (SDR-twin) `Color32` fold is otherwise reached.
+/// - [`Shape::Text`]: **do not** apply `adjust_hdr` to
+///   [`TextShape::hdr_color`]. The text sidecar is derived as
+///   `hdr_color × vertex alpha` at tessellation, and that alpha is exactly what
+///   the `Color32` fold writes; dimming the field too would double-dim.
 pub fn adjust_colors(
     shape: &mut Shape,
     adjust_color: impl Fn(&mut Color32) + Send + Sync + Copy + 'static,
+    adjust_hdr: impl Fn(&mut HdrVertexColor) + Send + Sync + Copy + 'static,
 ) {
     #![expect(clippy::match_same_arms)]
     match shape {
@@ -16,8 +35,14 @@ pub fn adjust_colors(
 
         Shape::Vec(shapes) => {
             for shape in shapes {
-                adjust_colors(shape, adjust_color);
+                adjust_colors(shape, adjust_color, adjust_hdr);
             }
+        }
+
+        Shape::Hdr { inner, color: _ } => {
+            // The HDR mode is not dimmed: the inner alpha is the single dimming
+            // path for a wrapped shape.
+            adjust_colors(Arc::make_mut(inner), adjust_color, adjust_hdr);
         }
 
         Shape::LineSegment { stroke, points: _ } => {
@@ -93,6 +118,10 @@ pub fn adjust_colors(
             override_text_color,
             opacity_factor: _,
             angle: _,
+            // Deliberately not dimmed here: the derived sidecar follows the
+            // vertex alpha this fold writes, so dimming the field would apply
+            // the factor twice.
+            hdr_color: _,
         }) => {
             adjust_color(&mut underline.color);
             adjust_color(fallback_color);
@@ -116,10 +145,16 @@ pub fn adjust_colors(
                 indices: _,
                 vertices,
                 texture_id: _,
+                hdr_colors,
             } = Arc::make_mut(mesh);
 
             for v in vertices {
                 adjust_color(&mut v.color);
+            }
+            if let Some(hdr_colors) = hdr_colors {
+                for color in hdr_colors {
+                    adjust_hdr(color);
+                }
             }
         }
 

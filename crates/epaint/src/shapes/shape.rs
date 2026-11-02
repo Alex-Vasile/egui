@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 use emath::{Align2, Pos2, Rangef, Rect, Rot2, TSTransform, Vec2, pos2};
 
 use crate::{
-    Color32, CornerRadius, Direction, Mesh, Stroke, StrokeKind, TextureId, Vertex,
+    Color32, CornerRadius, Direction, HdrColorMode, HdrVertexColor, Mesh, Stroke, StrokeKind,
+    TextureId, Vertex,
     stroke::PathStroke,
     text::{FontId, FontsView, Galley},
 };
@@ -67,6 +68,28 @@ pub enum Shape {
     /// Wrapped in an [`Arc`] to minimize the size of [`Shape`].
     Mesh(Arc<Mesh>),
 
+    /// Paint an already-tessellated shape in an HDR color, using its
+    /// **coverage** (alpha) as the mask.
+    ///
+    /// This is the operator that lets any shape — strokes, polylines, fills,
+    /// images — be colored above SDR white without a per-shape field. The
+    /// inner shape supplies the geometry and the alpha; the mode supplies the
+    /// color. Build it with [`Shape::hdr`].
+    ///
+    /// **Uniform recolour.** A shape's fill and stroke collapse to one value,
+    /// and an inner [`ColorMode::UV`](crate::ColorMode::UV) ramp is lost — use
+    /// [`HdrColorMode::UV`](crate::HdrColorMode::UV),
+    /// [`Shape::gradient_rect_hdr`], or a hand-built mesh with
+    /// [`Mesh::hdr_colors`] for per-vertex variation. For textured content the
+    /// wrapper is a tint: the texels keep multiplying underneath.
+    Hdr {
+        /// The shape whose coverage is recoloured.
+        inner: Arc<Self>,
+
+        /// How the color is evaluated per vertex.
+        color: HdrColorMode,
+    },
+
     /// A quadratic [Bézier Curve](https://en.wikipedia.org/wiki/B%C3%A9zier_curve).
     QuadraticBezier(QuadraticBezierShape),
 
@@ -88,6 +111,46 @@ fn shape_size() {
         core::mem::size_of::<Shape>() <= 64,
         "Shape is getting way too big!"
     );
+
+    // The HDR tier's payloads must stay under `PathShape`'s 56 B ceiling, or
+    // `Shape` grows. These are the measured numbers the design rests on.
+    assert_eq!(
+        core::mem::size_of::<HdrColorMode>(),
+        16,
+        "HdrColorMode is a two-variant fat-pointer niche layout; a third variant would be 24 B"
+    );
+    assert_eq!(
+        core::mem::size_of::<(Arc<Shape>, HdrColorMode)>(),
+        24,
+        "the Shape::Hdr payload must stay at 24 B"
+    );
+    assert_eq!(
+        core::mem::size_of::<crate::ColorMode>(),
+        16,
+        "ColorMode must not grow: it feeds PathStroke > PathShape > Shape"
+    );
+    assert_eq!(
+        core::mem::size_of::<crate::Stroke>(),
+        8,
+        "Stroke must not grow: it feeds Shape::LineSegment"
+    );
+    assert_eq!(
+        core::mem::size_of::<TextShape>(),
+        56,
+        "TextShape has room for exactly one Option<HdrVertexColor>"
+    );
+    assert_eq!(
+        core::mem::size_of::<crate::Vertex>(),
+        20,
+        "Vertex must not grow: the sidecar is where HDR color lives"
+    );
+    assert_eq!(
+        core::mem::size_of::<crate::PathStroke>(),
+        24,
+        "PathStroke must not grow: it feeds PathShape"
+    );
+    assert_eq!(core::mem::size_of::<crate::PathShape>(), 56);
+    assert_eq!(core::mem::size_of::<crate::RectShape>(), 56);
 }
 
 // Compile-time check that `Shape` is `Send + Sync` on every target.
@@ -343,7 +406,102 @@ impl Shape {
                 Vertex::untextured(rect.right_bottom(), right_bottom),
             ],
             texture_id: Default::default(),
+            hdr_colors: None,
         })
+    }
+
+    /// Paints a gradient rectangle whose colors are not capped at SDR white.
+    ///
+    /// The HDR mirror of [`Self::gradient_rect`]: same direction semantics,
+    /// same corner assignment, plus the per-vertex sidecar. The four
+    /// [`Vertex::color`] twins are the legal SDR projections
+    /// ([`HdrVertexColor::projected_color32`]), so an SDR-only backend draws
+    /// the range-reduced hue instead of discarding the rectangle.
+    #[inline]
+    pub fn gradient_rect_hdr(
+        rect: Rect,
+        direction: Direction,
+        [from, to]: [HdrVertexColor; 2],
+    ) -> Self {
+        let (left_top, right_top, left_bottom, right_bottom) = match direction {
+            Direction::TopDown => (from, from, to, to),
+            Direction::BottomUp => (to, to, from, from),
+            Direction::LeftToRight => (from, to, from, to),
+            Direction::RightToLeft => (to, from, to, from),
+        };
+
+        Self::from(Mesh {
+            indices: vec![0, 1, 2, 2, 1, 3],
+            vertices: vec![
+                Vertex::untextured(rect.left_top(), left_top.projected_color32(1.0)),
+                Vertex::untextured(rect.right_top(), right_top.projected_color32(1.0)),
+                Vertex::untextured(rect.left_bottom(), left_bottom.projected_color32(1.0)),
+                Vertex::untextured(rect.right_bottom(), right_bottom.projected_color32(1.0)),
+            ],
+            texture_id: Default::default(),
+            hdr_colors: Some(vec![left_top, right_top, left_bottom, right_bottom]),
+        })
+    }
+
+    /// Paint `shape` in the given HDR color, using its coverage (alpha) as the
+    /// mask.
+    ///
+    /// This is the generic HDR painting mechanism: every shape — a stroke, a
+    /// polyline, a fill, an image — can be coloured above SDR white without a
+    /// per-shape field, because the geometry and the alpha already exist and
+    /// only the colour is replaced. See [`Shape::Hdr`] for the guarantees and
+    /// limitations.
+    ///
+    /// `Shape::Vec` is flattened recursively, so each child keeps its own
+    /// primitive split and its own tier decision, and a `Shape::Callback`
+    /// passes through **uncoloured** (a callback owns its pipeline; there is
+    /// nothing to recolour). Constructing a wrapper around an existing wrapper
+    /// collapses to the outer colour.
+    pub fn hdr(shape: impl Into<Self>, color: impl Into<HdrColorMode>) -> Self {
+        let mut out = Vec::new();
+        Self::wrap_into(shape.into(), color.into(), &mut out);
+        if out.len() == 1 {
+            out.pop().unwrap_or(Self::Noop)
+        } else {
+            Self::Vec(out)
+        }
+    }
+
+    fn wrap_into(shape: Self, color: HdrColorMode, out: &mut Vec<Self>) {
+        match shape {
+            Self::Vec(shapes) => {
+                for shape in shapes {
+                    Self::wrap_into(shape, color.clone(), out);
+                }
+            }
+            // A callback owns its pipeline: nothing to recolour, so it passes
+            // through uncoloured (deliberately not a debug assertion).
+            Self::Callback(callback) => out.push(Self::Callback(callback)),
+            // The inner wrapper's colours are already baked into its alpha
+            // mask, so a second wrapper collapses to the outer colour.
+            Self::Hdr { inner, color: _ } => out.push(Self::Hdr { inner, color }),
+            other => out.push(Self::Hdr {
+                inner: Arc::new(other),
+                color,
+            }),
+        }
+    }
+
+    /// Does this shape carry the HDR vertex-color tier?
+    ///
+    /// Total over the three producers: the [`Self::Hdr`] operator, the
+    /// [`TextShape::hdr_color`] field, and a hand-built [`Mesh`] with a
+    /// sidecar. The tessellator's mesh-grouping key uses this to keep HDR and
+    /// SDR content in separate primitives, so this method has to be complete —
+    /// a missed arm silently promotes the neighbouring SDR geometry.
+    #[must_use]
+    pub fn is_hdr(&self) -> bool {
+        match self {
+            Self::Hdr { .. } => true,
+            Self::Text(text) => text.hdr_color.is_some(),
+            Self::Mesh(mesh) => mesh.is_hdr(),
+            _ => false,
+        }
     }
 
     #[expect(clippy::needless_pass_by_value)]
@@ -424,6 +582,8 @@ impl Shape {
             Self::Rect(rect_shape) => rect_shape.visual_bounding_rect(),
             Self::Text(text_shape) => text_shape.visual_bounding_rect(),
             Self::Mesh(mesh) => mesh.calc_bounds(),
+            // The wrapper changes colour only; the geometry is the inner shape's.
+            Self::Hdr { inner, color: _ } => inner.visual_bounding_rect(),
             Self::QuadraticBezier(bezier) => bezier.visual_bounding_rect(),
             Self::CubicBezier(bezier) => bezier.visual_bounding_rect(),
             Self::Callback(custom) => custom.rect,
@@ -439,6 +599,11 @@ impl Shape {
             mesh.texture_id
         } else if let Self::Rect(rect_shape) = self {
             rect_shape.fill_texture_id()
+        } else if let Self::Hdr { inner, color: _ } = self {
+            // Delegation is mandatory: the tessellator's mesh-grouping key
+            // reads this, and a wrapper over a textured mesh must start its own
+            // primitive rather than be appended across textures.
+            inner.texture_id()
         } else {
             crate::TextureId::default()
         }
@@ -506,6 +671,12 @@ impl Shape {
             }
             Self::Mesh(mesh) => {
                 Arc::make_mut(mesh).transform(transform);
+            }
+            Self::Hdr { inner, color: _ } => {
+                // Like `ColorMode::UV`, the colour source is defined against
+                // the shape's recomputed bounds, so a ramp moves with the shape
+                // instead of shearing. The sidecar holds colours only.
+                Arc::make_mut(inner).transform(transform);
             }
             Self::QuadraticBezier(bezier) => {
                 for p in &mut bezier.points {
@@ -599,5 +770,158 @@ fn dashes_from_line(
         }
 
         position_on_segment -= segment_length;
+    }
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+    use crate::{HdrColorMode, HdrVertexColor};
+    use emath::pos2;
+
+    fn callback_shape() -> Shape {
+        Shape::Callback(PaintCallback {
+            rect: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            callback: Arc::new(()),
+        })
+    }
+
+    fn wrap(shape: Shape, color: HdrVertexColor) -> Shape {
+        Shape::hdr(shape, color)
+    }
+
+    fn solid(color: HdrVertexColor) -> HdrColorMode {
+        HdrColorMode::Solid(color)
+    }
+
+    fn rect() -> Rect {
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0))
+    }
+
+    #[test]
+    fn hdr_wrapper_flattens_vec_and_passes_callbacks_through() {
+        let color = HdrVertexColor::WHITE;
+        let shape = wrap(
+            Shape::Vec(vec![
+                Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+                callback_shape(),
+                Shape::Vec(vec![Shape::circle_filled(
+                    pos2(5.0, 5.0),
+                    3.0,
+                    Color32::WHITE,
+                )]),
+            ]),
+            color,
+        );
+
+        // One wrapper per non-callback child, nested `Vec`s flattened, and the
+        // callback straight through (uncoloured).
+        let Shape::Vec(children) = shape else {
+            panic!("expected a Vec");
+        };
+        assert_eq!(children.len(), 3, "the callback is kept uncoloured");
+        assert!(matches!(children[0], Shape::Hdr { .. }));
+        assert!(matches!(children[1], Shape::Callback(_)));
+        assert!(matches!(children[2], Shape::Hdr { .. }));
+    }
+
+    #[test]
+    fn hdr_wrapper_collapses_to_the_outer_color() {
+        let color = HdrVertexColor::WHITE;
+        let inner = wrap(
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            HdrVertexColor::TRANSPARENT,
+        );
+        let Shape::Hdr { inner, color: _ } = wrap(inner, color) else {
+            panic!("expected a wrapper");
+        };
+        // The inner wrapper is gone: one layer, the outer colour.
+        assert!(matches!(*inner, Shape::Rect(_)));
+    }
+
+    #[test]
+    fn hdr_wrapper_delegates_texture_id() {
+        let texture_id = TextureId::User(7);
+        let mut mesh = Mesh::with_texture(texture_id);
+        mesh.add_rect_with_uv(
+            rect(),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let shape = wrap(Shape::mesh(mesh), HdrVertexColor::WHITE);
+        assert_eq!(shape.texture_id(), texture_id);
+        assert!(shape.is_hdr());
+    }
+
+    #[test]
+    fn is_hdr_is_complete() {
+        assert!(!Shape::Noop.is_hdr());
+        assert!(!Shape::rect_filled(rect(), 0.0, Color32::WHITE).is_hdr());
+        assert!(wrap(Shape::Noop, HdrVertexColor::WHITE).is_hdr());
+
+        // A hand-built mesh with a sidecar is HDR without any wrapper.
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect_hdr(rect(), HdrVertexColor::WHITE);
+        assert!(Shape::mesh(mesh.clone()).is_hdr());
+
+        // `Shape::Hdr` transforms and bounds delegate to the inner shape.
+        let mut shape = wrap(
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            HdrVertexColor::WHITE,
+        );
+        assert!(shape.visual_bounding_rect().is_positive());
+        shape.translate(Vec2::splat(3.0));
+        assert_eq!(
+            shape.visual_bounding_rect(),
+            rect().translate(Vec2::splat(3.0))
+        );
+    }
+
+    #[test]
+    fn gradient_rect_hdr_mirrors_gradient_rect() {
+        let colors = [
+            Color32::from_rgba_unmultiplied(200, 100, 50, 200),
+            Color32::from_rgba_unmultiplied(10, 20, 30, 100),
+        ];
+        for direction in [
+            Direction::TopDown,
+            Direction::BottomUp,
+            Direction::LeftToRight,
+            Direction::RightToLeft,
+        ] {
+            let sdr = Shape::gradient_rect(rect(), direction, colors);
+            let hdr = Shape::gradient_rect_hdr(rect(), direction, colors.map(HdrVertexColor::from));
+
+            let Shape::Mesh(sdr_mesh) = sdr else {
+                panic!("gradient_rect must be a mesh");
+            };
+            let Shape::Mesh(hdr_mesh) = hdr else {
+                panic!("gradient_rect_hdr must be a mesh");
+            };
+            assert_eq!(sdr_mesh.indices, hdr_mesh.indices);
+            assert_eq!(sdr_mesh.texture_id, hdr_mesh.texture_id);
+            assert_eq!(sdr_mesh.vertices.len(), hdr_mesh.vertices.len());
+            assert!(hdr_mesh.hdr_colors.is_some());
+            assert!(hdr_mesh.is_valid());
+
+            for (sdr_vertex, hdr_vertex) in core::iter::zip(&sdr_mesh.vertices, &hdr_mesh.vertices)
+            {
+                assert_eq!(sdr_vertex.pos, hdr_vertex.pos);
+                assert_eq!(sdr_vertex.uv, hdr_vertex.uv);
+                for channel in 0..4 {
+                    assert!(
+                        sdr_vertex.color[channel].abs_diff(hdr_vertex.color[channel]) <= 1,
+                        "SDR twin must match the SDR gradient: {sdr_vertex:?} vs {hdr_vertex:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_color_mode_is_solid_from_a_value() {
+        let mode: HdrColorMode = HdrVertexColor::WHITE.into();
+        assert!(matches!(mode, HdrColorMode::Solid(_)));
+        assert_eq!(mode, solid(HdrVertexColor::WHITE));
     }
 }

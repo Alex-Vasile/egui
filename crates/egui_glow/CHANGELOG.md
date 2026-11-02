@@ -8,6 +8,7 @@ Changes since the last release can be found at <https://github.com/emilk/egui/co
 
 ## Unreleased
 * Compile-only support for the new `ImageData::Float` content type: the glow painter stays SDR by design (no wide-gamut/HDR runtime claims), so float-content uploads are skipped with a warning (once per texture id) and the standard missing-texture behavior renders instead
+* HDR vertex-color meshes (`Mesh::hdr_colors`) render through their legal SDR projection — the per-vertex `Color32` twin is already in the vertex buffer the existing attribute path reads, so no shader, VAO or stride change is needed. The tier is degraded (range-reduced by a uniform linear-light scale that preserves hue and saturation), not dropped, and the painter warns once about it and names the escape hatch (use the wgpu backend, or gate the feature on `Frame::wgpu_render_state()`)
 
 
 ## 0.37.0 - 2026-10-15

@@ -5,6 +5,8 @@
 
 #![expect(clippy::identity_op)]
 
+use alloc::sync::Arc;
+
 use emath::{
     GuiRounding as _, NumExt as _, Pos2, Rangef, Rect, Rot2, TSTransform, Vec2, fast_midpoint,
     pos2, remap, vec2,
@@ -12,9 +14,9 @@ use emath::{
 
 use crate::{
     BandPoint, BandShape, CircleShape, ClippedPrimitive, ClippedShape, Color32, CornerRadiusF32,
-    CubicBezierShape, EllipseShape, Mesh, PathShape, Primitive, QuadraticBezierShape, RectShape,
-    RoundedRect, Shape, Stroke, StrokeKind, TextShape, TextureId, Vertex, color::ColorMode, emath,
-    stroke::PathStroke, texture_atlas::PreparedDisc,
+    CubicBezierShape, EllipseShape, HdrColorMode, HdrVertexColor, Mesh, PathShape, Primitive,
+    QuadraticBezierShape, RectShape, RoundedRect, Shape, Stroke, StrokeKind, TextShape, TextureId,
+    Vertex, color::ColorMode, emath, stroke::PathStroke, texture_atlas::PreparedDisc,
 };
 
 // ----------------------------------------------------------------------------
@@ -1480,7 +1482,7 @@ impl Tessellator {
     ) {
         let ClippedShape {
             clip_rect,
-            shape,
+            mut shape,
             transform_after_tessellation: transform,
         } = clipped_shape;
 
@@ -1515,6 +1517,60 @@ impl Tessellator {
             return;
         }
 
+        // `Shape::Hdr` is an operator over already-tessellated geometry, but
+        // two kinds of inner shape cannot be recoloured here:
+        //
+        // - a `Callback` owns its pipeline, so there is nothing to recolour and
+        //   `tessellate_shape` cannot emit a `Primitive::Callback` at all;
+        // - a `Vec` would be merged into one mesh by `tessellate_shape`, which
+        //   trips the texture accumulator's assert the moment two children use
+        //   different textures.
+        //
+        // Both are split here, next to the callback fast path, rather than in
+        // the arm — and both halves are needed, or an `Hdr`-over-`Vec` would
+        // re-wrap a callback child in `Hdr` and walk into the panic.
+        if let Shape::Hdr { inner, color } = shape {
+            if matches!(inner.as_ref(), Shape::Callback(_)) {
+                // Pass through uncoloured: the honest fallback for opaque
+                // user code, and deliberately not a `debug_assert!(false)`.
+                let Shape::Callback(mut callback) = Arc::unwrap_or_clone(inner) else {
+                    unreachable!()
+                };
+                callback.rect = transform * callback.rect;
+                out_primitives.push(ClippedPrimitive {
+                    clip_rect,
+                    primitive: Primitive::Callback(callback),
+                });
+                return;
+            }
+
+            if matches!(inner.as_ref(), Shape::Vec(_)) {
+                let Shape::Vec(shapes) = Arc::unwrap_or_clone(inner) else {
+                    unreachable!()
+                };
+                for shape in shapes {
+                    self.tessellate_clipped_shape(
+                        ClippedShape {
+                            clip_rect,
+                            shape: Shape::Hdr {
+                                inner: Arc::new(shape),
+                                color: color.clone(),
+                            },
+                            transform_after_tessellation: transform,
+                        },
+                        out_primitives,
+                    );
+                }
+                return;
+            }
+
+            shape = Shape::Hdr { inner, color };
+        }
+
+        // One mesh per (texture, tier). The tier half is what keeps sparse HDR
+        // content from promoting its SDR neighbours: without it, an HDR shape
+        // appended after SDR ones would promote the whole contiguous run.
+        let shape_is_hdr = shape.is_hdr();
         let start_new_mesh = match out_primitives.last() {
             None => true,
             Some(output_clipped_primitive) => {
@@ -1522,6 +1578,7 @@ impl Tessellator {
                     || match &output_clipped_primitive.primitive {
                         Primitive::Mesh(output_mesh) => {
                             output_mesh.texture_id != shape.texture_id()
+                                || output_mesh.is_hdr() != shape_is_hdr
                         }
                         Primitive::Callback(_) => true,
                     }
@@ -1622,6 +1679,86 @@ impl Tessellator {
                 self.tessellate_quadratic_bezier(&quadratic_shape, out);
             }
             Shape::CubicBezier(cubic_shape) => self.tessellate_cubic_bezier(&cubic_shape, out),
+            Shape::Hdr { inner, color } => {
+                // The operator: tessellate the inner shape, then recolour the
+                // vertices it just emitted by their own coverage.
+                //
+                // `filter` is the bounding box the positional mode sees: the
+                // inner shape's visual bounds expanded by the tessellator's
+                // feathering, the same construction `ColorMode::UV` gets.
+                let rect = inner.visual_bounding_rect().expand(self.feathering);
+                let color_at = |pos: Pos2| match &color {
+                    HdrColorMode::Solid(color) => *color,
+                    HdrColorMode::UV(callback) => callback(rect, pos),
+                };
+
+                let first = out.vertices.len();
+                match Arc::unwrap_or_clone(inner) {
+                    Shape::Vec(children) => {
+                        // A `Vec` that reaches this arm is mapped to one `Hdr`
+                        // per non-Callback child rather than tessellated into
+                        // `out`; the callback interception in
+                        // `tessellate_clipped_shape` is the path that paints a
+                        // callback.
+                        for child in children {
+                            if matches!(child, Shape::Callback(_)) {
+                                debug_assert!(
+                                    false,
+                                    "Shape::Callback cannot be tessellated by `tessellate_shape`; \
+                                     use `tessellate_clipped_shape`"
+                                );
+                                continue;
+                            }
+                            self.tessellate_shape(
+                                Shape::Hdr {
+                                    inner: Arc::new(child),
+                                    color: color.clone(),
+                                },
+                                out,
+                            );
+                        }
+                        return;
+                    }
+                    Shape::Callback(_) => {
+                        debug_assert!(
+                            false,
+                            "Shape::Callback cannot be tessellated by `tessellate_shape`; \
+                             use `tessellate_clipped_shape`"
+                        );
+                        return;
+                    }
+                    inner => self.tessellate_shape(inner, out),
+                }
+
+                // Normally `out` is empty here (the tier split gives the
+                // wrapper a fresh mesh); a direct `tessellate_shape` caller — or
+                // a rayon run of two wrapped shapes — can reach it with a
+                // non-empty mesh of the same tier. Promotion is idempotent, so
+                // the vertices that already existed keep their colours.
+                out.promote_to_hdr();
+
+                let Mesh {
+                    vertices,
+                    hdr_colors,
+                    ..
+                } = out;
+                let hdr_colors = hdr_colors.as_mut().expect("just promoted");
+                // The inner shape may have pushed raw vertices (its own arm
+                // does not know it is running for an HDR mesh). Every one of
+                // them is overwritten just below, so the padding value is only
+                // a length placeholder — never displayed.
+                hdr_colors.resize(vertices.len(), HdrVertexColor::TRANSPARENT);
+                for (sidecar, vertex) in
+                    core::iter::zip(hdr_colors[first..].iter_mut(), vertices[first..].iter_mut())
+                {
+                    let coverage = f32::from(vertex.color.a()) / 255.0;
+                    let hdr = color_at(vertex.pos).scaled(coverage);
+                    *sidecar = hdr;
+                    // The glow/SDR twin is the legal projection of the same
+                    // value, so the two backends agree on hue.
+                    vertex.color = hdr.projected_color32(1.0);
+                }
+            }
             Shape::Callback(_) => {
                 panic!("Shape::Callback passed to Tessellator");
             }
@@ -2234,6 +2371,7 @@ impl Tessellator {
             fallback_color,
             opacity_factor,
             angle,
+            hdr_color,
         } = text_shape;
 
         if galley.is_empty() {
@@ -2242,6 +2380,14 @@ impl Tessellator {
 
         if *opacity_factor <= 0.0 {
             return;
+        }
+
+        // The tier boundary for text. Promote first: a wholesale `Vec` caller
+        // (the rayon pass, or a direct `tessellate_shape`) can hand this arm a
+        // mesh that already holds SDR vertices, and every emitted vertex needs
+        // a sidecar entry.
+        if hdr_color.is_some() {
+            out.promote_to_hdr();
         }
 
         if galley.pixels_per_point != self.pixels_per_point {
@@ -2318,6 +2464,7 @@ impl Tessellator {
                     .map(|index| index + index_offset),
             );
 
+            let vertex_start = out.vertices.len();
             out.vertices.extend(
                 row.visuals
                     .mesh
@@ -2361,12 +2508,57 @@ impl Tessellator {
                     }),
             );
 
+            if let Some(hdr_color) = hdr_color {
+                // Every emitted vertex gets a sidecar entry, not only the
+                // glyphs: the tier is a property of the mesh and `is_valid`
+                // demands a length match. Glyph vertices are the HDR value at
+                // their own (post-fold) coverage — the vertex alpha carries
+                // `opacity_factor`, the galley's alpha and the selection-clear
+                // write, so hiding a vertex also hides its HDR value. Everything
+                // else (row backgrounds, galley-underlined/struck vertices) is
+                // the exact SDR lift, so it still draws at its own colour.
+                let Mesh {
+                    vertices,
+                    hdr_colors,
+                    ..
+                } = out;
+                let sidecar = hdr_colors.as_mut().expect("promoted above");
+                sidecar.extend((vertex_start..vertices.len()).map(|global| {
+                    let local = global - vertex_start;
+                    let color = vertices[global].color;
+                    let alpha = f32::from(color.a()) / 255.0;
+                    if is_color_glyph_vertex(local) {
+                        // Colour glyphs keep their own pixels; only their
+                        // coverage drives the HDR tint.
+                        HdrVertexColor::from_white_alpha(alpha)
+                    } else if row.visuals.glyph_vertex_range.contains(&local) {
+                        hdr_color.scaled(alpha)
+                    } else {
+                        HdrVertexColor::from(color)
+                    }
+                }));
+            }
+
             if *underline != Stroke::NONE {
+                let underline_start = out.vertices.len();
                 self.tessellate_line_segment(
                     [row_rect.left_bottom(), row_rect.right_bottom()],
                     *underline,
                     out,
                 );
+
+                if hdr_color.is_some() {
+                    let Mesh {
+                        vertices,
+                        hdr_colors,
+                        ..
+                    } = out;
+                    hdr_colors.as_mut().expect("promoted above").extend(
+                        vertices[underline_start..]
+                            .iter()
+                            .map(|vertex| HdrVertexColor::from(vertex.color)),
+                    );
+                }
             }
         }
     }
@@ -2524,23 +2716,40 @@ impl Tessellator {
     /// Find large shapes and throw them on the rayon thread pool,
     /// then replace the original shape with their tessellated meshes.
     #[cfg(feature = "rayon")]
-    fn parallel_tessellation_of_large_shapes(&self, shapes: &mut [ClippedShape]) {
+    fn parallel_tessellation_of_large_shapes(&self, shapes: &mut Vec<ClippedShape>) {
         profiling::function_scope!();
 
         use rayon::prelude::*;
 
+        // `tessellate_shape` has no representation for a paint callback (its
+        // own arm panics, and the wrapper's arm can only skip one), so any
+        // sub-tree carrying a callback must go to the serial path, where
+        // `tessellate_clipped_shape`'s interception paints it.
+        fn contains_callback(shape: &Shape) -> bool {
+            match shape {
+                Shape::Callback(_) => true,
+                Shape::Vec(shapes) => shapes.iter().any(contains_callback),
+                Shape::Hdr { inner, .. } => contains_callback(inner),
+                _ => false,
+            }
+        }
+
         // We only parallelize large/slow stuff, because each tessellation job
         // will allocate a new Mesh, and so it creates a lot of extra memory fragmentation
         // and allocations that is only worth it for large shapes.
-        fn should_parallelize(shape: &Shape) -> bool {
+        fn should_parallelize_by_size(shape: &Shape) -> bool {
             match shape {
-                Shape::Vec(shapes) => 4 < shapes.len() || shapes.iter().any(should_parallelize),
+                Shape::Vec(shapes) => {
+                    4 < shapes.len() || shapes.iter().any(should_parallelize_by_size)
+                }
 
                 Shape::Path(path_shape) => 32 < path_shape.points.len(),
 
                 Shape::Band(band_shape) => 32 < band_shape.points.len(),
 
                 Shape::QuadraticBezier(_) | Shape::CubicBezier(_) | Shape::Ellipse(_) => true,
+
+                Shape::Hdr { inner, .. } => should_parallelize_by_size(inner),
 
                 Shape::Noop
                 | Shape::Text(_)
@@ -2552,9 +2761,92 @@ impl Tessellator {
             }
         }
 
+        fn should_parallelize(shape: &Shape) -> bool {
+            !contains_callback(shape) && should_parallelize_by_size(shape)
+        }
+
+        // The tier boundary sits above `tessellate_shape`, which takes one
+        // `&mut Mesh` and cannot split. This pass is the last caller that
+        // could otherwise collapse a tier-mixed `Shape::Vec` into a single
+        // mesh — so it splits first, into contiguous same-tier runs.
+        //
+        // Runs are contiguous, not grouped by tier: primitive order is paint
+        // order, so `[SDR, HDR, SDR]` must stay three primitives.
+        fn flatten_into(shape: &Shape, out: &mut Vec<Shape>) {
+            match shape {
+                Shape::Vec(children) => {
+                    for child in children {
+                        flatten_into(child, out);
+                    }
+                }
+                other => out.push(other.clone()),
+            }
+        }
+
+        fn tier_runs(shape: &Shape) -> Option<Vec<Shape>> {
+            let mut flat = Vec::new();
+            flatten_into(shape, &mut flat);
+            let mut tier = flat.first()?.is_hdr();
+            let mut mixed = false;
+            for shape in &flat {
+                if shape.is_hdr() != tier {
+                    mixed = true;
+                    break;
+                }
+            }
+            if !mixed {
+                return None;
+            }
+
+            let mut runs = Vec::new();
+            let mut run = Vec::new();
+            for shape in flat {
+                let shape_tier = shape.is_hdr();
+                if shape_tier != tier {
+                    runs.push(Shape::Vec(core::mem::take(&mut run)));
+                    tier = shape_tier;
+                }
+                run.push(shape);
+            }
+            if !run.is_empty() {
+                runs.push(Shape::Vec(run));
+            }
+            Some(runs)
+        }
+
+        // Allocation-free for uniform frames: the replacement `Vec` is only
+        // built once a split is actually emitted.
+        let mut replaced: Option<Vec<ClippedShape>> = None;
+        for (index, clipped_shape) in shapes.iter().enumerate() {
+            let runs = should_parallelize(&clipped_shape.shape)
+                .then(|| tier_runs(&clipped_shape.shape))
+                .flatten();
+            if let Some(runs) = runs {
+                let out = replaced.get_or_insert_with(|| {
+                    let mut out = Vec::with_capacity(shapes.len() + runs.len());
+                    out.extend(shapes[..index].iter().cloned());
+                    out
+                });
+                for run in runs {
+                    out.push(ClippedShape {
+                        clip_rect: clipped_shape.clip_rect,
+                        shape: run,
+                        transform_after_tessellation: clipped_shape.transform_after_tessellation,
+                    });
+                }
+            } else if let Some(out) = &mut replaced {
+                out.push(clipped_shape.clone());
+            }
+        }
+        if let Some(replaced) = replaced {
+            *shapes = replaced;
+        }
+
         let tessellated: Vec<(usize, Mesh)> = shapes
             .par_iter()
             .enumerate()
+            // Each run re-enters the same test, so a split cannot smuggle a
+            // small run into a job that would not have taken it.
             .filter(|(_, clipped_shape)| should_parallelize(&clipped_shape.shape))
             .map(|(index, clipped_shape)| {
                 profiling::scope!("tessellate_big_shape");
@@ -2947,4 +3239,487 @@ fn tessellate_band_stroke_kind() {
         tessellate(StrokeKind::Outside).calc_bounds().y_range(),
         -2.0..=12.0
     );
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+    use crate::PaintCallback;
+    use crate::text::FontId;
+
+    fn rect() -> Rect {
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0))
+    }
+
+    fn tessellate(shape: Shape) -> Vec<ClippedPrimitive> {
+        let options = TessellationOptions {
+            feathering: false,
+            ..Default::default()
+        };
+        Tessellator::new(1.0, options, [1024, 1024], vec![])
+            .tessellate_shapes(vec![ClippedShape::new(Rect::EVERYTHING, shape)])
+    }
+
+    fn meshes(primitives: &[ClippedPrimitive]) -> Vec<&Mesh> {
+        primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(mesh),
+                Primitive::Callback(_) => None,
+            })
+            .collect()
+    }
+
+    fn four() -> HdrVertexColor {
+        HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0])
+    }
+
+    #[test]
+    fn hdr_shape_starts_its_own_primitive() {
+        let primitives = tessellate(Shape::Vec(vec![
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            Shape::hdr(Shape::rect_filled(rect(), 0.0, Color32::WHITE), four()),
+        ]));
+
+        let meshes = meshes(&primitives);
+        assert_eq!(meshes.len(), 2, "the tier is part of the batching key");
+        assert!(!meshes[0].is_hdr(), "the SDR neighbour must stay SDR");
+        assert!(meshes[1].is_hdr());
+        for mesh in meshes {
+            assert!(mesh.is_valid());
+            if mesh.is_hdr() {
+                assert_eq!(
+                    mesh.hdr_colors.as_ref().map(Vec::len),
+                    Some(mesh.vertices.len())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_shape_recolors_by_coverage() {
+        let primitives = tessellate(Shape::hdr(
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            four(),
+        ));
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        assert!(mesh.is_hdr());
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), mesh.vertices.len());
+
+        let mut saw_opaque_four = false;
+        for (color, vertex) in core::iter::zip(colors, &mesh.vertices) {
+            if vertex.color.a() == 255 {
+                // Interior: the value exactly, and the twin is the legal
+                // projection (opaque white for 4.0).
+                assert_eq!(color.to_array(), [4.0, 4.0, 4.0, 1.0]);
+                assert_eq!(vertex.color, Color32::WHITE);
+                saw_opaque_four = true;
+            } else {
+                // Feather vertices: fully transparent coverage writes a
+                // transparent sidecar, which the projection maps to
+                // TRANSPARENT instead of dividing by zero.
+                assert_eq!(vertex.color.a(), 0);
+                assert_eq!(*color, HdrVertexColor::TRANSPARENT);
+            }
+        }
+        assert!(saw_opaque_four);
+    }
+
+    #[test]
+    fn hdr_uv_evaluates_per_position() {
+        let source = Arc::new(|_rect: Rect, pos: Pos2| {
+            HdrVertexColor::from_rgba_premultiplied([pos.x, 0.0, 0.0, 1.0])
+        });
+        let shape = Shape::hdr(
+            Shape::line(
+                vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0)],
+                PathStroke::new(2.0, Color32::WHITE),
+            ),
+            HdrColorMode::UV(source),
+        );
+        let primitives = tessellate(shape);
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        assert!(mesh.is_hdr());
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        let mut saw_positional = false;
+        for (color, vertex) in core::iter::zip(colors, &mesh.vertices) {
+            if vertex.color.a() == 255 {
+                assert_eq!(color.to_array()[0], vertex.pos.x);
+                saw_positional = true;
+            }
+        }
+        assert!(saw_positional, "the ramp must reach the interior vertices");
+    }
+
+    #[test]
+    fn hand_built_hdr_mesh_starts_its_own_primitive() {
+        // The low-level path: a mesh built with the sidecar, no wrapper in
+        // sight. `Shape::is_hdr`'s `Mesh` arm is the only thing standing
+        // between "sparse HDR" and promoting every SDR vertex.
+        let mut hdr_mesh = Mesh::default();
+        hdr_mesh.add_colored_rect_hdr(rect(), four());
+
+        let primitives = tessellate(Shape::Vec(vec![
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            Shape::mesh(hdr_mesh),
+        ]));
+        let meshes = meshes(&primitives);
+        assert_eq!(meshes.len(), 2);
+        assert!(!meshes[0].is_hdr(), "the SDR mesh must keep 20 B/vertex");
+        assert!(meshes[1].is_hdr());
+        assert!(meshes[1].is_valid());
+    }
+
+    #[test]
+    fn hdr_over_textured_mesh_does_not_panic_and_splits() {
+        let texture = crate::TextureId::User(3);
+        let mut mesh = Mesh::with_texture(texture);
+        mesh.add_rect_with_uv(
+            rect(),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+
+        let primitives = tessellate(Shape::Vec(vec![
+            Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+            Shape::hdr(Shape::mesh(mesh), four()),
+        ]));
+        let meshes = meshes(&primitives);
+        assert_eq!(meshes.len(), 2);
+        assert_eq!(meshes[1].texture_id, texture);
+        assert!(meshes[1].is_hdr());
+        assert!(meshes[1].is_valid());
+    }
+
+    #[test]
+    fn hdr_over_callback_passes_through_uncoloured() {
+        let callback = Shape::Callback(PaintCallback {
+            rect: rect(),
+            callback: Arc::new(()),
+        });
+        // Directly constructed, not through the constructor: this is the
+        // interception's contract.
+        let shape = Shape::Hdr {
+            inner: Arc::new(callback),
+            color: HdrColorMode::Solid(four()),
+        };
+        let primitives = tessellate(shape);
+        assert_eq!(primitives.len(), 1);
+        assert!(matches!(primitives[0].primitive, Primitive::Callback(_)));
+    }
+
+    #[test]
+    fn hdr_over_vec_splits_children_and_keeps_callbacks() {
+        let callback = Shape::Callback(PaintCallback {
+            rect: rect(),
+            callback: Arc::new(()),
+        });
+        let shape = Shape::Hdr {
+            inner: Arc::new(Shape::Vec(vec![
+                Shape::rect_filled(rect(), 0.0, Color32::WHITE),
+                callback,
+                Shape::circle_filled(pos2(5.0, 5.0), 3.0, Color32::WHITE),
+            ])),
+            color: HdrColorMode::Solid(four()),
+        };
+        let primitives = tessellate(shape);
+        assert_eq!(
+            primitives.len(),
+            3,
+            "two meshes around the callback: the callback separates primitives"
+        );
+        assert!(matches!(primitives[1].primitive, Primitive::Callback(_)));
+        assert_eq!(primitives[1].clip_rect, Rect::EVERYTHING);
+        let meshes = meshes(&primitives);
+        assert_eq!(meshes.len(), 2);
+        for mesh in meshes {
+            assert!(mesh.is_hdr());
+            assert!(mesh.is_valid());
+            assert_eq!(
+                mesh.hdr_colors.as_ref().map(Vec::len),
+                Some(mesh.vertices.len())
+            );
+        }
+    }
+
+    #[test]
+    fn text_sidecar_covers_every_emitted_vertex() {
+        use crate::text::{FontDefinitions, Fonts, TextOptions};
+
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "Ag".to_owned(),
+            FontId::proportional(24.0),
+            Color32::WHITE,
+        );
+
+        let underline = Stroke::new(1.0, Color32::from_rgb(10, 20, 30));
+        let text_shape = TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE)
+            .with_hdr_color(four())
+            .with_underline(underline);
+
+        let primitives = tessellate(text_shape.into());
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        assert!(mesh.is_hdr());
+        assert!(mesh.is_valid(), "the sidecar must cover every vertex");
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), mesh.vertices.len());
+
+        // Glyph vertices take the HDR value; the underline is the SDR lift of
+        // its own stroke colour, so it still draws.
+        let glyph_values = colors.iter().filter(|c| **c == four()).count();
+        let underline_values = colors
+            .iter()
+            .filter(|c| **c == HdrVertexColor::from(underline.color))
+            .count();
+        assert!(glyph_values > 0, "glyph vertices must take the HDR value");
+        assert!(
+            underline_values > 0,
+            "the underline must be lifted, not dropped"
+        );
+    }
+
+    #[test]
+    fn text_sidecar_follows_a_cleared_vertex() {
+        use crate::text::{FontDefinitions, Fonts, TextOptions};
+
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "A".to_owned(),
+            FontId::proportional(24.0),
+            Color32::WHITE,
+        );
+
+        // The selection path zeroes a galley vertex before tessellation; its
+        // HDR value must vanish with it.
+        let mut galley = galley;
+        {
+            let galley = Arc::make_mut(&mut galley);
+            let row = Arc::make_mut(&mut galley.rows[0].row);
+            row.visuals.mesh.vertices[0].color = Color32::TRANSPARENT;
+        }
+
+        let text_shape =
+            TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE).with_hdr_color(four());
+        let primitives = tessellate(text_shape.into());
+        let [mesh] = meshes(&primitives)[..] else {
+            panic!("expected one mesh");
+        };
+        let colors = mesh.hdr_colors.as_ref().expect("sidecar");
+        assert_eq!(colors.len(), mesh.vertices.len());
+        assert!(
+            colors.contains(&HdrVertexColor::TRANSPARENT),
+            "a cleared glyph vertex must produce a zero sidecar"
+        );
+    }
+
+    #[test]
+    fn opacity_dims_each_hdr_level_exactly_once() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        // A `static` (not a captured `Arc`) keeps the adjuster `Copy`, which
+        // `adjust_colors` requires.
+        static HDR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        // (a) The wrapper: recurse into the inner shape only. The mode is not
+        // dimmed — the inner alpha is the single dimming path.
+        let mut wrapper = Shape::hdr(Shape::rect_filled(rect(), 0.0, Color32::WHITE), four());
+        HDR_CALLS.store(0, Ordering::Relaxed);
+        crate::shape_transform::adjust_colors(
+            &mut wrapper,
+            |_| {},
+            |_| {
+                HDR_CALLS.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(
+            HDR_CALLS.load(Ordering::Relaxed),
+            0,
+            "the wrapper's mode must not be dimmed"
+        );
+        let Shape::Hdr { color, .. } = wrapper else {
+            unreachable!()
+        };
+        assert_eq!(color, HdrColorMode::Solid(four()));
+
+        // (b) A bare HDR mesh: every sidecar entry is dimmed.
+        let mut mesh = Mesh::default();
+        mesh.add_colored_rect_hdr(rect(), four());
+        let mut shape = Shape::Mesh(mesh.into());
+        HDR_CALLS.store(0, Ordering::Relaxed);
+        crate::shape_transform::adjust_colors(
+            &mut shape,
+            |_| {},
+            |color| {
+                HDR_CALLS.fetch_add(1, Ordering::Relaxed);
+                *color = color.scaled(0.5);
+            },
+        );
+        assert_eq!(HDR_CALLS.load(Ordering::Relaxed), 4);
+        let Shape::Mesh(mesh) = shape else {
+            unreachable!()
+        };
+        for color in mesh.hdr_colors.as_ref().unwrap() {
+            assert_eq!(color.to_array(), [2.0, 2.0, 2.0, 0.5]);
+        }
+
+        // (c) HDR text: the field is *not* dimmed here. The derived sidecar
+        // multiplies in the vertex alpha the `Color32` fold writes, so dimming
+        // the field too would apply the factor twice.
+        let mut fonts = crate::text::Fonts::new(
+            crate::text::TextOptions::default(),
+            crate::text::FontDefinitions::default(),
+        );
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "A".to_owned(),
+            crate::text::FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        let mut shape: Shape = TextShape::new(pos2(0.0, 0.0), galley, Color32::WHITE)
+            .with_hdr_color(four())
+            .into();
+        HDR_CALLS.store(0, Ordering::Relaxed);
+        crate::shape_transform::adjust_colors(
+            &mut shape,
+            |_| {},
+            |_| {
+                HDR_CALLS.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(
+            HDR_CALLS.load(Ordering::Relaxed),
+            0,
+            "the text field must not be dimmed; the vertex alpha is the single path"
+        );
+        let Shape::Text(text) = shape else {
+            unreachable!()
+        };
+        assert_eq!(text.hdr_color, Some(four()));
+    }
+}
+
+/// The rayon tier pre-split and the callback decline.
+///
+/// Gated on the feature: without `rayon` the serial path satisfies the same
+/// assertions on its own (the grouping key emits the per-run primitives and the
+/// interception paints the callback), so an ungated test would pass for the
+/// wrong reason.
+#[cfg(all(test, feature = "rayon"))]
+mod rayon_hdr_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0))
+    }
+
+    fn four() -> HdrVertexColor {
+        HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0])
+    }
+
+    fn sdr() -> Shape {
+        Shape::rect_filled(rect(), 0.0, Color32::WHITE)
+    }
+
+    fn hdr() -> Shape {
+        Shape::hdr(Shape::rect_filled(rect(), 0.0, Color32::WHITE), four())
+    }
+
+    fn tessellate(shape: Shape) -> Vec<ClippedPrimitive> {
+        let options = TessellationOptions {
+            feathering: false,
+            parallel_tessellation: true,
+            ..Default::default()
+        };
+        Tessellator::new(1.0, options, [1024, 1024], vec![])
+            .tessellate_shapes(vec![ClippedShape::new(Rect::EVERYTHING, shape)])
+    }
+
+    fn tiers(primitives: &[ClippedPrimitive]) -> Vec<bool> {
+        primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(mesh.is_hdr()),
+                Primitive::Callback(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_tier_vec_splits_into_contiguous_runs() {
+        // Alternating: no two neighbours share a tier, so paint order forces
+        // five primitives.
+        let primitives = tessellate(Shape::Vec(vec![hdr(), sdr(), hdr(), sdr(), hdr()]));
+        assert_eq!(primitives.len(), 5);
+        assert_eq!(tiers(&primitives), [true, false, true, false, true]);
+        for primitive in &primitives {
+            if let Primitive::Mesh(mesh) = &primitive.primitive {
+                assert!(mesh.is_valid(), "every run must be a valid mesh");
+                if mesh.is_hdr() {
+                    assert_eq!(
+                        mesh.hdr_colors.as_ref().map(Vec::len),
+                        Some(mesh.vertices.len())
+                    );
+                }
+            }
+        }
+
+        // Contiguous runs stay merged: merging the two SDR spans across the
+        // middle HDR one would paint over it.
+        let primitives = tessellate(Shape::Vec(vec![hdr(), hdr(), sdr(), sdr(), hdr()]));
+        assert_eq!(primitives.len(), 3);
+        assert_eq!(tiers(&primitives), [true, false, true]);
+    }
+
+    #[test]
+    fn callback_subtree_is_declined_not_tessellated_wholesale() {
+        let callback = Shape::Callback(crate::PaintCallback {
+            rect: rect(),
+            callback: Arc::new(()),
+        });
+        let primitives = tessellate(Shape::Vec(vec![hdr(), sdr(), callback, sdr(), hdr()]));
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_))),
+            "the callback must be painted, not dropped by a wholesale tessellation"
+        );
+        for primitive in &primitives {
+            if let Primitive::Mesh(mesh) = &primitive.primitive {
+                assert!(mesh.is_valid());
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_wrapped_vec_with_callback_is_declined() {
+        let callback = Shape::Callback(crate::PaintCallback {
+            rect: rect(),
+            callback: Arc::new(()),
+        });
+        // `should_parallelize` recurses into `Hdr` and accepts the five-child
+        // `Vec`; the callback decline is what keeps it out of the wholesale
+        // path (where `tessellate_shape` cannot represent a callback).
+        let primitives = tessellate(Shape::Hdr {
+            inner: Arc::new(Shape::Vec(vec![sdr(), sdr(), callback, sdr(), sdr()])),
+            color: HdrColorMode::Solid(four()),
+        });
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_))),
+            "a wrapped callback must still be painted"
+        );
+        for primitive in &primitives {
+            if let Primitive::Mesh(mesh) = &primitive.primitive {
+                assert!(mesh.is_valid());
+            }
+        }
+    }
 }

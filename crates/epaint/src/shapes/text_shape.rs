@@ -39,6 +39,26 @@ pub struct TextShape {
     /// Rotate text by this many radians clockwise.
     /// The pivot is `pos` (the upper left corner of the text).
     pub angle: f32,
+
+    /// If set, the glyphs are painted in this HDR color instead of their
+    /// galley colors.
+    ///
+    /// The same scope as [`Self::override_text_color`]: only vertices inside
+    /// the row's glyph range take the value. Backgrounds, underlines and
+    /// strikethroughs keep their own colours — which is exactly why HDR text is
+    /// this field rather than a [`Shape::Hdr`](crate::Shape::Hdr) wrapper (the
+    /// wrapper's alpha mask would recolour a text background too).
+    ///
+    /// **Uniform per shape:** a galley with several runs in different colours
+    /// (syntax highlighting, links, mixed `RichText`) loses that variation
+    /// while this is set, because the HDR value lives on the shape. Use one
+    /// `Shape::Text` per colour run, or leave the text SDR.
+    ///
+    /// Dimming (`opacity_factor`, `Ui::multiply_opacity`) reaches the glyphs
+    /// through their vertex alpha, which the HDR sidecar multiplies in — never
+    /// by modifying this value (that would apply the factor twice).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hdr_color: Option<HdrVertexColor>,
 }
 
 impl TextShape {
@@ -55,6 +75,7 @@ impl TextShape {
             override_text_color: None,
             opacity_factor: 1.0,
             angle: 0.0,
+            hdr_color: None,
         }
     }
 
@@ -77,6 +98,16 @@ impl TextShape {
     #[inline]
     pub fn with_override_text_color(mut self, override_text_color: Color32) -> Self {
         self.override_text_color = Some(override_text_color);
+        self
+    }
+
+    /// Paint the glyphs in the given HDR color.
+    ///
+    /// Only the glyphs are recoloured (see [`Self::hdr_color`]); the
+    /// background, underline and strikethrough keep their own colors.
+    #[inline]
+    pub fn with_hdr_color(mut self, hdr_color: impl Into<HdrVertexColor>) -> Self {
+        self.hdr_color = Some(hdr_color.into());
         self
     }
 
@@ -116,6 +147,7 @@ impl TextShape {
             override_text_color: _,
             opacity_factor: _,
             angle: _,
+            hdr_color: _,
         } = self;
 
         *pos = transform * *pos;
@@ -209,5 +241,44 @@ mod tests {
         // make sure the box is actually rotated
         assert!(almost_equal(size_orig.x, size_rot.y, 1e-4));
         assert!(almost_equal(size_orig.y, size_rot.x, 1e-4));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn hdr_color_serde_round_trip_and_old_payloads() {
+        let mut fonts = Fonts::new(TextOptions::default(), FontDefinitions::default());
+        let mut galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            "Ag".to_owned(),
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        // `serde_json` writes non-finite floats as `null`, which does not
+        // deserialize into an `f32`; `layout_no_wrap` leaves `max_width`
+        // infinite. Pin a finite width so the payload is round-trippable.
+        Arc::make_mut(&mut Arc::make_mut(&mut galley).job)
+            .wrap
+            .max_width = 1000.0;
+        let shape = TextShape::new(Pos2::ZERO, galley, Color32::WHITE);
+
+        let json = serde_json::to_string(&shape).expect("serialize");
+        let back: TextShape = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.hdr_color, None);
+        assert_eq!(back, shape);
+
+        // An old payload without the field loads as SDR text.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let object = value.as_object_mut().expect("text shape is an object");
+        object.remove("hdr_color");
+        let old: TextShape = serde_json::from_value(value).expect("old payload must load");
+        assert_eq!(old.hdr_color, None);
+
+        // And the field survives with a value.
+        let hdr = shape.with_hdr_color(HdrVertexColor::from_rgba_premultiplied([
+            4.0, 2.0, 0.5, 1.0,
+        ]));
+        let json = serde_json::to_string(&hdr).expect("serialize HDR text");
+        let back: TextShape = serde_json::from_str(&json).expect("deserialize HDR text");
+        assert_eq!(back.hdr_color, hdr.hdr_color);
+        assert_eq!(back, hdr);
     }
 }

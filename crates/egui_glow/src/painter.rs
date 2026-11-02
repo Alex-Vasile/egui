@@ -100,6 +100,12 @@ pub struct Painter {
     /// (warn once per texture id; glow stays SDR by design — plan §9).
     float_content_warned: HashSet<egui::TextureId>,
 
+    /// Whether an HDR vertex-color mesh was already warned about.
+    ///
+    /// Unlike textures, a mesh has no id to key on (it is per-frame), so this
+    /// is a single flag: one line per painter, no per-frame spam.
+    hdr_mesh_warned: bool,
+
     next_native_tex_id: u64,
 
     /// Stores outdated OpenGL textures that are yet to be deleted
@@ -270,6 +276,7 @@ impl Painter {
                 element_array_buffer,
                 textures: Default::default(),
                 float_content_warned: HashSet::new(),
+                hdr_mesh_warned: false,
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
                 destroyed: false,
@@ -475,6 +482,18 @@ impl Painter {
     #[inline(never)] // Easier profiling
     fn paint_mesh(&mut self, mesh: &Mesh) {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
+
+        if mesh.is_hdr() && !self.hdr_mesh_warned {
+            self.hdr_mesh_warned = true;
+            log::warn!(
+                "egui_glow: this frame contains an HDR vertex-color mesh. The glow backend is \
+                 SDR by design, so it draws the mesh's range-reduced SDR projection (a uniform \
+                 linear-light scale that preserves hue) instead of true HDR values. Use the \
+                 wgpu backend for the extended range, or gate the feature on \
+                 `Frame::wgpu_render_state()`."
+            );
+        }
+
         if let Some(texture) = self.texture(mesh.texture_id) {
             unsafe {
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));

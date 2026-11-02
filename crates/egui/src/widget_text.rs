@@ -1,6 +1,9 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::fmt::Formatter;
-use epaint::text::{IntoTag, TextFormat, VariationCoords};
+use epaint::{
+    HdrVertexColor,
+    text::{IntoTag, TextFormat, VariationCoords},
+};
 
 use crate::{
     Align, Color32, FontFamily, FontSelection, Galley, Style, TextStyle, TextWrapMode, Ui, Visuals,
@@ -33,6 +36,10 @@ pub struct RichText {
     background_color: Color32,
     expand_bg: f32,
     text_color: Option<Color32>,
+
+    /// If set, the glyphs are painted in this HDR color instead of
+    /// [`Self::text_color`]. See [`Self::color_hdr`].
+    hdr_color: Option<HdrVertexColor>,
     coords: VariationCoords,
     code: bool,
     strong: bool,
@@ -55,6 +62,7 @@ impl Default for RichText {
             background_color: Default::default(),
             expand_bg: 1.0,
             text_color: Default::default(),
+            hdr_color: Default::default(),
             coords: Default::default(),
             code: Default::default(),
             strong: Default::default(),
@@ -342,6 +350,31 @@ impl RichText {
         self.text_color
     }
 
+    /// Override the text color with an HDR value — a color that is not capped
+    /// at SDR white.
+    ///
+    /// The mirror of [`Self::color`] for content above 1.0. The value reaches
+    /// the glyphs through [`epaint::TextShape::hdr_color`], not through
+    /// `self.text_color`'s layout-job road: a [`LayoutJob`]'s
+    /// [`TextFormat::color`] is [`Color32`]-bound. If both are set,
+    /// `color_hdr` wins for the glyphs.
+    ///
+    /// Currently only [`crate::Label`] (and therefore [`Ui::label`],
+    /// [`Ui::hdr_label`] and [`Ui::colored_label`]) reads this field;
+    /// `Button`, `Heading`, `SelectableLabel` and `TextEdit` keep SDR text
+    /// until they opt in.
+    #[inline]
+    pub fn color_hdr(mut self, color: impl Into<HdrVertexColor>) -> Self {
+        self.hdr_color = Some(color.into());
+        self
+    }
+
+    /// The explicit HDR text color set by [`Self::color_hdr`], if any.
+    #[inline]
+    pub fn hdr_color_override(&self) -> Option<HdrVertexColor> {
+        self.hdr_color
+    }
+
     /// Read the font height of the selected text style.
     ///
     /// Returns a value rounded to [`emath::GUI_ROUNDING`].
@@ -429,6 +462,7 @@ impl RichText {
             background_color,
             expand_bg,
             text_color: _, // already used by `get_text_color`
+            hdr_color: _,  // read by `Label` before the job is built
             coords,
             code,
             strong: _, // already used by `get_text_color`
@@ -658,6 +692,19 @@ impl WidgetText {
             Self::RichText(text) => text.text(),
             Self::LayoutJob(job) => &job.text,
             Self::Galley(galley) => galley.text(),
+        }
+    }
+
+    /// The HDR text color set on the [`RichText`], if any.
+    ///
+    /// Widgets that paint text have to read this *before* consuming the
+    /// [`WidgetText`] into a [`LayoutJob`] (the layout road is
+    /// [`Color32`]-bound) and apply it to the [`epaint::TextShape`] they build.
+    #[inline]
+    pub fn hdr_color(&self) -> Option<HdrVertexColor> {
+        match self {
+            Self::RichText(text) => text.hdr_color_override(),
+            Self::Text(_) | Self::LayoutJob(_) | Self::Galley(_) => None,
         }
     }
 

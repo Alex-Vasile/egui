@@ -31,6 +31,7 @@ pub mod color;
 mod corner_radius;
 mod corner_radius_f32;
 mod direction;
+mod hdr_color;
 pub mod image;
 mod margin;
 mod margin_f32;
@@ -52,10 +53,11 @@ mod viewport;
 
 pub use self::{
     brush::Brush,
-    color::ColorMode,
+    color::{ColorMode, HdrColorMode},
     corner_radius::CornerRadius,
     corner_radius_f32::CornerRadiusF32,
     direction::Direction,
+    hdr_color::HdrVertexColor,
     image::{ColorImage, FloatImage, FontColorTransferFunction, ImageData, ImageDelta, Primaries},
     margin::Margin,
     margin_f32::*,

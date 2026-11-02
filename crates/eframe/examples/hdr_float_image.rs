@@ -175,30 +175,37 @@ impl eframe::App for FloatImageApp {
             ui.add_space(8.0);
 
             ui.label(
-                "sRGB-tagged gradient — linear light 0..4, native on every granted space \
-                 (tick = SDR reference white):",
+                "Same ramp, two representations — left: sRGB-tagged float texture; right: one \
+                 HDR mesh with per-vertex colors (tick = SDR reference white):",
             );
-            bordered_slot(ui, [512.0, 24.0], |ui| {
-                if let Some(texture) = self.srgb_gradient.as_ref() {
-                    let response = ui.image(texture);
-                    let rect = response.rect;
-                    // linear 1.0 sits at exactly one quarter of the ramp:
-                    // past the tick the gradient is brightness above SDR
-                    // white on an extended surface, flat white on an SDR
-                    // one.
-                    let x = rect.left() + rect.width() * 0.25;
-                    ui.painter().line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        (1.0, egui::Color32::BLACK),
-                    );
-                    ui.painter().text(
-                        egui::pos2(x + 4.0, rect.top() + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        "1.0 = SDR white",
-                        egui::FontId::proportional(10.0),
-                        egui::Color32::BLACK,
-                    );
-                }
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label("float texture");
+                    bordered_slot(ui, [248.0, 24.0], |ui| {
+                        if let Some(texture) = self.srgb_gradient.as_ref() {
+                            let response = ui.image(texture);
+                            paint_sdr_white_tick(ui, response.rect);
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label("HDR mesh (gradient_rect_hdr)");
+                    bordered_slot(ui, [248.0, 24.0], |ui| {
+                        let rect = ui
+                            .allocate_exact_size(egui::vec2(248.0, 24.0), egui::Sense::hover())
+                            .0;
+                        // The same linear-light values as the texture above,
+                        // carried per vertex instead of per texel. Both are
+                        // stored encoded and premultiplied, so the two strips
+                        // must agree at every point (up to interpolation
+                        // granularity) — on an extended surface the right
+                        // part is brightness above SDR white, on an SDR
+                        // surface both clamp identically.
+                        ui.painter().add(hdr_mesh_gradient(rect));
+                        paint_sdr_white_tick(ui, rect);
+                    });
+                });
             });
             ui.add_space(8.0);
 
@@ -306,6 +313,55 @@ impl StripOutcome {
             _ => Self::Unrecognized,
         }
     }
+}
+
+/// One HDR mesh gradient with the same linear-light values as
+/// [`FloatImageApp::load_srgb_gradient`]'s texture: every column boundary is a
+/// pair of vertices carrying `from_linear(linear)` for `linear = 4·x/(n−1)`, so
+/// the strip demonstrates per-vertex HDR color across a shape (no texture
+/// upload, no per-frame conversion).
+fn hdr_mesh_gradient(rect: egui::Rect) -> egui::Shape {
+    const COLUMNS: usize = 64;
+    let mut mesh = egui::epaint::Mesh::default();
+    // One pair of vertices per column boundary, sharing the column's HDR
+    // value; the strip interpolates per-vertex between them, exactly like the
+    // texture interpolates between texels.
+    for column in 0..COLUMNS {
+        let linear = 4.0 * column as f32 / (COLUMNS - 1) as f32;
+        let color = egui::epaint::HdrVertexColor::from_linear([linear, linear, linear, 1.0]);
+        let x = egui::lerp(
+            rect.left()..=rect.right(),
+            column as f32 / (COLUMNS - 1) as f32,
+        );
+        mesh.colored_vertex_hdr(egui::pos2(x, rect.top()), color);
+        mesh.colored_vertex_hdr(egui::pos2(x, rect.bottom()), color);
+    }
+    for column in 0..(COLUMNS - 1) {
+        let top_left = (2 * column) as u32;
+        let bottom_left = top_left + 1;
+        let top_right = top_left + 2;
+        let bottom_right = top_left + 3;
+        mesh.add_triangle(top_left, bottom_left, top_right);
+        mesh.add_triangle(top_right, bottom_left, bottom_right);
+    }
+    egui::Shape::mesh(mesh)
+}
+
+/// The tick at the quarter mark, where linear light 1.0 (SDR reference white)
+/// lands on a 0..4 ramp.
+fn paint_sdr_white_tick(ui: &egui::Ui, rect: egui::Rect) {
+    let x = rect.left() + rect.width() * 0.25;
+    ui.painter().line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        (1.0, egui::Color32::BLACK),
+    );
+    ui.painter().text(
+        egui::pos2(x + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "1.0",
+        egui::FontId::proportional(10.0),
+        egui::Color32::BLACK,
+    );
 }
 
 /// A fixed-size slot with a visible border, so a rejected upload renders as

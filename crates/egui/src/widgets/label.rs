@@ -277,6 +277,10 @@ impl Widget for Label {
         let selectable = self.selectable;
         let show_tooltip_when_elided = self.show_tooltip_when_elided;
 
+        // Read the HDR color before `layout_in_ui` consumes the `WidgetText`
+        // into a `LayoutJob` — that road is `Color32`-bound.
+        let hdr_color = self.text.hdr_color();
+
         let (galley_pos, galley, mut response) = self.layout_in_ui(ui);
         response.widget_info(|| WidgetInfo::labeled(Role::Label, ui.is_enabled(), galley.text()));
 
@@ -313,12 +317,15 @@ impl Widget for Label {
                     galley,
                     response_color,
                     underline,
+                    hdr_color,
                 );
             } else {
-                ui.painter().add(
-                    epaint::TextShape::new(galley_pos, galley, response_color)
-                        .with_underline(underline),
-                );
+                let mut text_shape = epaint::TextShape::new(galley_pos, galley, response_color)
+                    .with_underline(underline);
+                if let Some(hdr_color) = hdr_color {
+                    text_shape = text_shape.with_hdr_color(hdr_color);
+                }
+                ui.painter().add(text_shape);
             }
         }
 

@@ -91,7 +91,11 @@ impl AllocInfo {
     }
 
     pub fn from_mesh(mesh: &Mesh) -> Self {
-        Self::from_slice(&mesh.indices) + Self::from_slice(&mesh.vertices)
+        let sidecar = mesh
+            .hdr_colors
+            .as_ref()
+            .map_or_else(Self::default, |colors| Self::from_slice(colors));
+        Self::from_slice(&mesh.indices) + Self::from_slice(&mesh.vertices) + sidecar
     }
 
     pub fn from_slice<T>(slice: &[T]) -> Self {
@@ -222,6 +226,12 @@ impl PaintStats {
             }
             Shape::Mesh(mesh) => {
                 self.shape_mesh += AllocInfo::from_mesh(mesh);
+            }
+            Shape::Hdr { inner, color: _ } => {
+                // The wrapper itself allocates only the `Arc<Shape>`; its inner
+                // shape's allocations (including any sidecar) are counted once,
+                // by the arms above.
+                self.add(inner);
             }
             Shape::Callback(_) => {
                 self.num_callbacks += 1;

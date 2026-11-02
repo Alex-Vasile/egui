@@ -1833,6 +1833,28 @@ impl Ui {
         Label::new(text.into().color(color)).ui(self)
     }
 
+    /// Show text in an HDR color — a color not capped at SDR white.
+    ///
+    /// Shortcut for `ui.label(RichText::new(text).color_hdr(color))`. On an
+    /// extended-range surface the glyphs are brighter than SDR white; on an SDR
+    /// surface they clamp. Unlike [`Self::colored_label`], this recolours the
+    /// glyphs only: a text background or underline keeps its own colour.
+    ///
+    /// ```
+    /// # egui::__run_test_ui(|ui| {
+    /// use egui::{HdrColor, RichText};
+    /// let color = HdrColor::new([1.0, 0.5, 0.0], 2.0); // 4× SDR white
+    /// ui.hdr_label(color, RichText::new("bright"));
+    /// # });
+    /// ```
+    pub fn hdr_label(
+        &mut self,
+        color: impl Into<epaint::HdrVertexColor>,
+        text: impl Into<RichText>,
+    ) -> Response {
+        Label::new(text.into().color_hdr(color)).ui(self)
+    }
+
     /// Show large text.
     ///
     /// Shortcut for `ui.label(RichText::new(text).heading())`

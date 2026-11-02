@@ -914,6 +914,21 @@ impl Default for HdrColor {
     }
 }
 
+impl From<HdrColor> for epaint::HdrVertexColor {
+    /// The HDR color as a vertex-borne value: `effective_linear` (exposure
+    /// clamped to ±6 stops, `rgb` scaled, nothing per-channel clamped) fed
+    /// through [`epaint::HdrVertexColor::from_linear`] with alpha exactly 1 —
+    /// [`HdrColor`] is opaque by design.
+    ///
+    /// This is what makes `painter.rect_filled_hdr(rect, corner_radius,
+    /// hdr_color)` and [`Ui::hdr_label`](crate::Ui::hdr_label) take a picker
+    /// value without a hand-written conversion.
+    fn from(color: HdrColor) -> Self {
+        let [r, g, b] = color.effective_linear();
+        Self::from_linear([r, g, b, 1.0])
+    }
+}
+
 /// How many textures each HDR widget texture cache (the flat swatches and the
 /// exposure ramps) keeps before the whole cache is cleared — dropping the
 /// handles and with them the textures. There is no individual eviction; the

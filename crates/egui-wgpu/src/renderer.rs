@@ -299,10 +299,13 @@ pub struct Renderer {
     /// pipelines — an fp16 target reaches both encodings across viewports
     /// (`ExtendedDisplayP3` on macOS, `ExtendedSrgbLinear` on Windows/DX12).
     /// Created lazily on first use of each key, in [`Self::update_buffers`].
-    /// Only the target's format and derived encoding bake a pipeline: a
-    /// color-space change to a space with the same encoding reconfigures the
-    /// surface and reuses the pipeline.
-    pipelines: Mutex<HashMap<(wgpu::TextureFormat, OutputEncoding), Arc<wgpu::RenderPipeline>>>,
+    /// Only the target's format, derived encoding and vertex-color tier bake a
+    /// pipeline: a color-space change to a space with the same encoding
+    /// reconfigures the surface and reuses the pipeline, and an all-SDR frame
+    /// never creates the HDR variant.
+    pipelines: Mutex<
+        HashMap<(wgpu::TextureFormat, OutputEncoding, VertexColorTier), Arc<wgpu::RenderPipeline>>,
+    >,
 
     /// The egui shader module, from which all pipelines for 8-bit targets are
     /// built (dithering compiled in).
@@ -319,6 +322,14 @@ pub struct Renderer {
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
+
+    /// The per-vertex HDR color sidecar (`Mesh::hdr_colors`).
+    ///
+    /// Filled in lockstep with [`Self::vertex_buffer`] — one slice per mesh,
+    /// including the SDR meshes with an empty range — so the per-mesh iterators
+    /// in [`Self::render`] stay aligned. Only bound for meshes whose
+    /// [`VertexColorTier`] is `Hdr`.
+    hdr_color_buffer: SlicedBuffer,
 
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
@@ -551,6 +562,8 @@ impl Renderer {
             (core::mem::size_of::<Vertex>() * 1024) as _;
         const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (core::mem::size_of::<u32>() * 1024 * 3) as _;
+        const HDR_COLOR_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+            (core::mem::size_of::<epaint::HdrVertexColor>() * 1024) as _;
 
         Self {
             pipelines: Mutex::new(HashMap::default()),
@@ -566,6 +579,11 @@ impl Renderer {
                 buffer: create_index_buffer(device, INDEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
                 capacity: INDEX_BUFFER_START_CAPACITY,
+            },
+            hdr_color_buffer: SlicedBuffer {
+                buffer: create_hdr_color_buffer(device, HDR_COLOR_BUFFER_START_CAPACITY),
+                slices: Vec::with_capacity(64),
+                capacity: HDR_COLOR_BUFFER_START_CAPACITY,
             },
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
@@ -585,21 +603,33 @@ impl Renderer {
     }
 
     /// Creates (if needed) the render pipeline for `target_format` under the
-    /// active surface's derived [`OutputEncoding`].
+    /// active surface's derived [`OutputEncoding`] and the given
+    /// [`VertexColorTier`].
     ///
-    /// Exactly one pipeline is cached per (format, encoding) key; the cache is
-    /// shared by all viewports, so viewports rendering at different formats —
-    /// or at one format with both encodings — coexist.
+    /// Exactly one pipeline is cached per (format, encoding, tier) key; the
+    /// cache is shared by all viewports, so viewports rendering at different
+    /// formats — or at one format with both encodings and both tiers —
+    /// coexist.
+    ///
+    /// Called once per tier that actually occurs in the frame's `paint_jobs`
+    /// (see [`Self::update_buffers`]): an all-SDR frame compiles and caches
+    /// exactly the pipeline it always did, and the HDR variant costs a second
+    /// key lookup plus one creation only on the first frame that needs it.
     ///
     /// The pipeline is compiled outside the lock: pipeline creation is expensive
     /// and must not stall a concurrent `render` reading the cache. A racing
     /// double compile is benign — the first pipeline inserted wins.
-    fn ensure_pipeline(&self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+    fn ensure_pipeline(
+        &self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        tier: VertexColorTier,
+    ) {
         let encoding = self.active_output_encoding(target_format);
         if self
             .pipelines
             .lock()
-            .contains_key(&(target_format, encoding))
+            .contains_key(&(target_format, encoding, tier))
         {
             return;
         }
@@ -616,10 +646,11 @@ impl Renderer {
             &self.options,
             target_format,
             encoding,
+            tier,
         ));
         self.pipelines
             .lock()
-            .entry((target_format, encoding))
+            .entry((target_format, encoding, tier))
             .or_insert(pipeline);
     }
 
@@ -649,18 +680,30 @@ impl Renderer {
     ) {
         profiling::function_scope!();
 
-        let pipeline = {
+        let pixels_per_point = screen_descriptor.pixels_per_point;
+        let size_in_pixels = screen_descriptor.size_in_pixels;
+
+        // One resolved handle per tier, resolved on the first mesh of that
+        // tier. Neither handle can be resolved up front: an HDR-only frame has
+        // no SDR entry in the cache, so an `.expect(…)` for either tier before
+        // the loop would panic on exactly the frames the tier exists for.
+        // Resolution is total because `update_buffers` ensured every tier
+        // present in the same `paint_jobs`.
+        let mut pipelines: [Option<Arc<wgpu::RenderPipeline>>; 2] = [None, None];
+        let mut bound_tier: Option<VertexColorTier> = None;
+        let resolve_pipeline = |tier: VertexColorTier| -> Arc<wgpu::RenderPipeline> {
             let pipelines = self.pipelines.lock();
             pipelines
-                .get(&(target_format, self.active_output_encoding(target_format)))
+                .get(&(
+                    target_format,
+                    self.active_output_encoding(target_format),
+                    tier,
+                ))
                 .cloned()
                 .expect(
                     "You must call .update_buffers() with the same target format before .render()",
                 )
         };
-
-        let pixels_per_point = screen_descriptor.pixels_per_point;
-        let size_in_pixels = screen_descriptor.size_in_pixels;
 
         // Whether or not we need to reset the render pass because a paint callback has just
         // run.
@@ -668,6 +711,7 @@ impl Renderer {
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
+        let mut hdr_color_buffer_slices = self.hdr_color_buffer.slices.iter();
 
         for epaint::ClippedPrimitive {
             clip_rect,
@@ -683,7 +727,6 @@ impl Renderer {
                     0.0,
                     1.0,
                 );
-                render_pass.set_pipeline(&pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 needs_reset = false;
             }
@@ -694,11 +737,15 @@ impl Renderer {
                 if rect.width == 0 || rect.height == 0 {
                     // Skip rendering zero-sized clip areas.
                     if let Primitive::Mesh(_) = primitive {
-                        // If this is a mesh, we need to advance the index and vertex buffer iterators:
+                        // If this is a mesh, we need to advance the index, vertex and HDR color
+                        // buffer iterators:
                         index_buffer_slices
                             .next()
                             .expect("You must call .update_buffers() before .render()");
                         vertex_buffer_slices
+                            .next()
+                            .expect("You must call .update_buffers() before .render()");
+                        hdr_color_buffer_slices
                             .next()
                             .expect("You must call .update_buffers() before .render()");
                     }
@@ -716,6 +763,19 @@ impl Renderer {
                     let vertex_buffer_slice = vertex_buffer_slices
                         .next()
                         .expect("You must call .update_buffers() before .render()");
+                    let hdr_color_buffer_slice = hdr_color_buffer_slices
+                        .next()
+                        .expect("You must call .update_buffers() before .render()");
+
+                    let tier = VertexColorTier::of(mesh);
+                    if bound_tier != Some(tier) {
+                        // A state switch, never a reorder: primitive order is
+                        // paint order for translucent HDR content.
+                        let handle =
+                            pipelines[tier.index()].get_or_insert_with(|| resolve_pipeline(tier));
+                        render_pass.set_pipeline(handle);
+                        bound_tier = Some(tier);
+                    }
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
                         render_pass.set_bind_group(1, bind_group, &[]);
@@ -731,6 +791,17 @@ impl Renderer {
                                 vertex_buffer_slice.start as u64..vertex_buffer_slice.end as u64,
                             ),
                         );
+                        if tier == VertexColorTier::Hdr {
+                            // The SDR pipeline ignores the stale slot-1
+                            // binding, so no unbind is needed on a switch back.
+                            render_pass.set_vertex_buffer(
+                                1,
+                                self.hdr_color_buffer.buffer.slice(
+                                    hdr_color_buffer_slice.start as u64
+                                        ..hdr_color_buffer_slice.end as u64,
+                                ),
+                            );
+                        }
                         render_pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
                     } else {
                         log::warn!("Missing texture: {:?}", mesh.texture_id);
@@ -754,6 +825,9 @@ impl Renderer {
                         profiling::scope!("callback");
 
                         needs_reset = true;
+                        // A callback may bind its own pipeline, so the next
+                        // mesh must re-set ours even if its tier is unchanged.
+                        bound_tier = None;
 
                         // We're setting a default viewport for the render pass as a
                         // courtesy for the user, so that they don't have to think about
@@ -1259,8 +1333,6 @@ impl Renderer {
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
 
-        self.ensure_pipeline(device, target_format);
-
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
         let uniform_buffer_content = UniformBuffer {
@@ -1291,26 +1363,52 @@ impl Renderer {
             self.previous_uniform_buffer_content = uniform_buffer_content;
         }
 
-        // Determine how many vertices & indices need to be rendered, and gather prepare callbacks
+        // Determine how many vertices & indices need to be rendered, which
+        // vertex-color tiers occur, and gather prepare callbacks.
+        //
+        // The tier scan lives in this walk, and `ensure_pipeline` follows it:
+        // an all-SDR frame compiles exactly the pipeline it always did, and the
+        // HDR variant is only created on the first frame that contains HDR
+        // content. A frame with no meshes at all keeps the SDR pipeline (the
+        // degenerate all-SDR frame), so the cache never becomes empty for a
+        // format the caller asked for.
         let mut callbacks = Vec::new();
-        let (vertex_count, index_count) = {
+        let (vertex_count, index_count, hdr_color_count, has_sdr, has_hdr) = {
             profiling::scope!("count_vertices_indices");
-            paint_jobs.iter().fold((0, 0), |acc, clipped_primitive| {
-                match &clipped_primitive.primitive {
-                    Primitive::Mesh(mesh) => {
-                        (acc.0 + mesh.vertices.len(), acc.1 + mesh.indices.len())
-                    }
-                    Primitive::Callback(callback) => {
-                        if let Some(c) = callback.callback.downcast_ref::<Callback>() {
-                            callbacks.push(c.0.as_ref());
-                        } else {
-                            log::warn!("Unknown paint callback: expected `egui_wgpu::Callback`");
+            paint_jobs
+                .iter()
+                .fold((0, 0, 0, false, false), |mut acc, clipped_primitive| {
+                    match &clipped_primitive.primitive {
+                        Primitive::Mesh(mesh) => {
+                            acc.0 += mesh.vertices.len();
+                            acc.1 += mesh.indices.len();
+                            if let Some(colors) = &mesh.hdr_colors {
+                                acc.2 += colors.len();
+                                acc.4 = true;
+                            } else {
+                                acc.3 = true;
+                            }
                         }
-                        acc
+                        Primitive::Callback(callback) => {
+                            if let Some(c) = callback.callback.downcast_ref::<Callback>() {
+                                callbacks.push(c.0.as_ref());
+                            } else {
+                                log::warn!(
+                                    "Unknown paint callback: expected `egui_wgpu::Callback`"
+                                );
+                            }
+                        }
                     }
-                }
-            })
+                    acc
+                })
         };
+
+        if has_hdr {
+            self.ensure_pipeline(device, target_format, VertexColorTier::Hdr);
+        }
+        if has_sdr || !has_hdr {
+            self.ensure_pipeline(device, target_format, VertexColorTier::Sdr);
+        }
 
         if index_count > 0 {
             profiling::scope!("indices", index_count.to_string().as_str());
@@ -1400,6 +1498,76 @@ impl Renderer {
                     }
                     Primitive::Callback(_) => {}
                 }
+            }
+        }
+
+        if vertex_count > 0 {
+            profiling::scope!("hdr_colors", hdr_color_count.to_string().as_str());
+
+            self.hdr_color_buffer.slices.clear();
+
+            if hdr_color_count > 0 {
+                let required_hdr_color_buffer_size =
+                    (core::mem::size_of::<epaint::HdrVertexColor>() * hdr_color_count) as u64;
+                if self.hdr_color_buffer.capacity < required_hdr_color_buffer_size {
+                    // Resize the sidecar buffer if needed.
+                    self.hdr_color_buffer.capacity = (self.hdr_color_buffer.capacity * 2)
+                        .at_least(required_hdr_color_buffer_size);
+                    self.hdr_color_buffer.buffer =
+                        create_hdr_color_buffer(device, self.hdr_color_buffer.capacity);
+                }
+
+                let hdr_color_buffer_staging = queue.write_buffer_with(
+                    &self.hdr_color_buffer.buffer,
+                    0,
+                    #[expect(clippy::unwrap_used)] // Checked above
+                    NonZeroU64::new(required_hdr_color_buffer_size).unwrap(),
+                );
+
+                let Some(mut hdr_color_buffer_staging) = hdr_color_buffer_staging else {
+                    panic!(
+                        "Failed to create staging buffer for HDR color data. HDR color count: {hdr_color_count}. Required HDR color buffer size: {required_hdr_color_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                        self.hdr_color_buffer.buffer.size(),
+                        self.hdr_color_buffer.capacity
+                    );
+                };
+
+                // One slice per `Primitive::Mesh`, SDR meshes included with an
+                // empty range: the per-mesh iterator in `render` advances in
+                // lockstep with the vertex one.
+                let mut hdr_color_offset = 0;
+                for epaint::ClippedPrimitive { primitive, .. } in paint_jobs {
+                    if let Primitive::Mesh(mesh) = primitive {
+                        let size = mesh.hdr_colors.as_ref().map_or(0, |colors| {
+                            debug_assert_eq!(
+                                colors.len(),
+                                mesh.vertices.len(),
+                                "Mesh::hdr_colors must have one entry per vertex"
+                            );
+                            colors.len() * core::mem::size_of::<epaint::HdrVertexColor>()
+                        });
+                        let slice = hdr_color_offset..(size + hdr_color_offset);
+                        if let Some(colors) = &mesh.hdr_colors {
+                            hdr_color_buffer_staging
+                                .slice(slice.clone())
+                                .copy_from_slice(bytemuck::cast_slice(colors));
+                        }
+                        self.hdr_color_buffer.slices.push(slice);
+                        hdr_color_offset += size;
+                    }
+                }
+            } else {
+                // No HDR content this frame: still one (empty) slice per mesh,
+                // or every later mesh's colors would be offset.
+                self.hdr_color_buffer
+                    .slices
+                    .extend(paint_jobs.iter().filter_map(|clipped_primitive| {
+                        if let Primitive::Mesh(_) = &clipped_primitive.primitive {
+                            Some(0..0)
+                        } else {
+                            None
+                        }
+                    }));
             }
         }
 
@@ -1698,6 +1866,41 @@ impl OutputEncoding {
     }
 }
 
+/// Whether a mesh carries the HDR vertex-color tier.
+///
+/// A derived quantity, like [`OutputEncoding`]: computed from
+/// [`Mesh::hdr_colors`](epaint::Mesh::hdr_colors) wherever a pipeline is
+/// selected or the staging loop branches — never stored next to its input.
+///
+/// The tier changes the vertex *layout* (a used attribute must be backed by a
+/// bound buffer), so it is pipeline state and therefore part of the cache key,
+/// not a per-draw uniform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VertexColorTier {
+    /// `Mesh::hdr_colors.is_none()`: the classic 20 B vertex, `vs_main`.
+    Sdr,
+
+    /// `Mesh::hdr_colors.is_some()`: the sidecar as `@location(3) Float16x4`
+    /// (arriving in WGSL as `vec4<f32>`), `vs_main_hdr`.
+    Hdr,
+}
+
+impl VertexColorTier {
+    /// The tier of a mesh.
+    #[must_use]
+    pub fn of(mesh: &epaint::Mesh) -> Self {
+        if mesh.is_hdr() { Self::Hdr } else { Self::Sdr }
+    }
+
+    /// Index into the per-tier pipeline handle array.
+    fn index(self) -> usize {
+        match self {
+            Self::Sdr => 0,
+            Self::Hdr => 1,
+        }
+    }
+}
+
 fn create_sampler(
     options: epaint::textures::TextureOptions,
     device: &wgpu::Device,
@@ -1742,8 +1945,50 @@ fn create_pipeline(
     options: &RendererOptions,
     target_format: wgpu::TextureFormat,
     encoding: OutputEncoding,
+    tier: VertexColorTier,
 ) -> wgpu::RenderPipeline {
     profiling::scope!("create_render_pipeline");
+
+    // The tier selects the vertex entry point *and* the buffer layout. Both
+    // fragment entry points are value-transparent, so the fragment is shared.
+    let (vertex_entry_point, vertex_buffers) = match tier {
+        VertexColorTier::Sdr => (
+            "vs_main",
+            [
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 5 * 4,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    // 0: vec2 position
+                    // 1: vec2 texture coordinates
+                    // 2: uint color
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+                }),
+                None,
+            ],
+        ),
+        VertexColorTier::Hdr => (
+            "vs_main_hdr",
+            [
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 5 * 4,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    // 0: vec2 position
+                    // 1: vec2 texture coordinates
+                    // 2: uint color (unread on this tier; kept so slot 0 is
+                    //    the same layout for both pipelines)
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+                }),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 4 * 2,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    // 3: vec4<f32> — the sidecar's four binary16 values.
+                    // `Float16x4` arrives as `vec4<f32>` in WGSL, so no
+                    // `enable f16` and no `SHADER_F16` feature is needed.
+                    attributes: &wgpu::vertex_attr_array![3 => Float16x4],
+                }),
+            ],
+        ),
+    };
 
     let depth_stencil = options
         .depth_stencil_format
@@ -1759,16 +2004,9 @@ fn create_pipeline(
         label: Some("egui_pipeline"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
-            entry_point: Some("vs_main"),
+            entry_point: Some(vertex_entry_point),
             module,
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: 5 * 4,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                // 0: vec2 position
-                // 1: vec2 texture coordinates
-                // 2: uint color
-                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
-            })],
+            buffers: &vertex_buffers,
             compilation_options: wgpu::PipelineCompilationOptions::default()
         },
         primitive: wgpu::PrimitiveState {
@@ -1846,6 +2084,16 @@ fn create_index_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     })
 }
 
+fn create_hdr_color_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    profiling::function_scope!();
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("egui_hdr_color_buffer"),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        size,
+        mapped_at_creation: false,
+    })
+}
+
 /// A Rect in physical pixel space, used for setting clipping rectangles.
 struct ScissorRect {
     x: u32,
@@ -1913,6 +2161,18 @@ mod tests {
         renderer: &mut Renderer,
         target_format: wgpu::TextureFormat,
     ) {
+        render_offscreen_with(device, queue, renderer, target_format, &[]);
+    }
+
+    /// [`render_offscreen`] with real paint jobs, so the per-tier pipeline
+    /// creation can be asserted on the frames that produce tiers.
+    fn render_offscreen_with(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        target_format: wgpu::TextureFormat,
+        paint_jobs: &[epaint::ClippedPrimitive],
+    ) {
         const SIZE: u32 = 64;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1926,7 +2186,7 @@ mod tests {
             device,
             queue,
             &mut encoder,
-            &[],
+            paint_jobs,
             &screen_descriptor,
             target_format,
         );
@@ -1963,7 +2223,12 @@ mod tests {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            renderer.render(&mut render_pass, &[], &screen_descriptor, target_format);
+            renderer.render(
+                &mut render_pass,
+                paint_jobs,
+                &screen_descriptor,
+                target_format,
+            );
         }
 
         queue.submit([encoder.finish()]);
@@ -2039,6 +2304,7 @@ mod tests {
             .get(&(
                 wgpu::TextureFormat::Bgra8Unorm,
                 OutputEncoding::GammaEncoded,
+                VertexColorTier::Sdr,
             ))
             .cloned()
             .expect("the Bgra8Unorm pipeline must be cached after the first render");
@@ -2063,7 +2329,8 @@ mod tests {
                     pipelines
                         .get(&(
                             wgpu::TextureFormat::Bgra8Unorm,
-                            OutputEncoding::GammaEncoded
+                            OutputEncoding::GammaEncoded,
+                            VertexColorTier::Sdr,
                         ))
                         .expect("the Bgra8Unorm cache entry must survive")
                 ),
@@ -2090,7 +2357,8 @@ mod tests {
                 pipelines
                     .get(&(
                         wgpu::TextureFormat::Rgba8Unorm,
-                        OutputEncoding::GammaEncoded
+                        OutputEncoding::GammaEncoded,
+                        VertexColorTier::Sdr,
                     ))
                     .expect("the Rgba8Unorm pipeline must be cached"),
             ),
@@ -2142,12 +2410,17 @@ mod tests {
                     .get(&(
                         wgpu::TextureFormat::Rgba16Float,
                         OutputEncoding::GammaEncoded,
+                        VertexColorTier::Sdr,
                     ))
                     .expect("the GammaEncoded fp16 pipeline must be cached"),
             );
             let linear = Arc::clone(
                 pipelines
-                    .get(&(wgpu::TextureFormat::Rgba16Float, OutputEncoding::Linear))
+                    .get(&(
+                        wgpu::TextureFormat::Rgba16Float,
+                        OutputEncoding::Linear,
+                        VertexColorTier::Sdr,
+                    ))
                     .expect("the Linear fp16 pipeline must be cached"),
             );
             (gamma, linear)
@@ -2180,16 +2453,83 @@ mod tests {
             pipelines
                 .get(&(
                     wgpu::TextureFormat::Rgba16Float,
-                    OutputEncoding::GammaEncoded
+                    OutputEncoding::GammaEncoded,
+                    VertexColorTier::Sdr,
                 ))
                 .expect("the GammaEncoded entry must survive")
         ));
         assert!(Arc::ptr_eq(
             &linear,
             pipelines
-                .get(&(wgpu::TextureFormat::Rgba16Float, OutputEncoding::Linear))
+                .get(&(
+                    wgpu::TextureFormat::Rgba16Float,
+                    OutputEncoding::Linear,
+                    VertexColorTier::Sdr,
+                ))
                 .expect("the Linear entry must survive")
         ));
+    }
+
+    /// The tier is lazy: an SDR-only frame creates exactly the one pipeline it
+    /// always did and never the HDR variant, an HDR-only frame creates only
+    /// the HDR variant (its handles are resolved at the first mesh of the
+    /// tier, not up front), and both draw without a device error.
+    #[test]
+    fn pipeline_cache_is_lazy_per_tier() {
+        let Some((device, queue)) = test_device("pipeline_cache_is_lazy_per_tier") else {
+            return;
+        };
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let encoding = OutputEncoding::GammaEncoded;
+
+        let screen_rect = epaint::Rect::EVERYTHING;
+        let mut sdr_mesh = epaint::Mesh::default();
+        sdr_mesh.add_colored_rect(
+            epaint::Rect::from_min_max(epaint::pos2(0.0, 0.0), epaint::pos2(64.0, 64.0)),
+            epaint::Color32::WHITE,
+        );
+        let sdr_jobs = [epaint::ClippedPrimitive {
+            clip_rect: screen_rect,
+            primitive: Primitive::Mesh(sdr_mesh),
+        }];
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        render_offscreen_with(&device, &queue, &mut renderer, target_format, &sdr_jobs);
+        {
+            let pipelines = renderer.pipelines.lock();
+            assert_eq!(
+                pipelines.len(),
+                1,
+                "an SDR-only frame must create exactly one pipeline"
+            );
+            assert!(pipelines.contains_key(&(target_format, encoding, VertexColorTier::Sdr)));
+            assert!(
+                !pipelines.contains_key(&(target_format, encoding, VertexColorTier::Hdr)),
+                "the HDR variant must not be compiled for SDR content"
+            );
+        }
+
+        let mut hdr_mesh = epaint::Mesh::default();
+        hdr_mesh.add_colored_rect_hdr(
+            epaint::Rect::from_min_max(epaint::pos2(0.0, 0.0), epaint::pos2(64.0, 64.0)),
+            epaint::HdrVertexColor::from_rgba_premultiplied([4.0, 4.0, 4.0, 1.0]),
+        );
+        let hdr_jobs = [epaint::ClippedPrimitive {
+            clip_rect: screen_rect,
+            primitive: Primitive::Mesh(hdr_mesh),
+        }];
+
+        let mut renderer = Renderer::new(&device, RendererOptions::default());
+        renderer.set_active_surface_color_space(Some(wgpu::SurfaceColorSpace::Srgb));
+        render_offscreen_with(&device, &queue, &mut renderer, target_format, &hdr_jobs);
+        let pipelines = renderer.pipelines.lock();
+        assert_eq!(
+            pipelines.len(),
+            1,
+            "an HDR-only frame must not compile the SDR variant"
+        );
+        assert!(pipelines.contains_key(&(target_format, encoding, VertexColorTier::Hdr)));
     }
 
     /// Guards the module split against drift at the name level.
@@ -3340,6 +3680,7 @@ fn fs_test(in: TestVOut) -> TestFOut {
             indices: vec![0, 1, 2, 0, 2, 3],
             vertices: vertices.to_vec(),
             texture_id,
+            hdr_colors: None,
         }
     }
 

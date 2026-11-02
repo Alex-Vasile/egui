@@ -2,7 +2,10 @@
 
 struct VertexOutput {
     @location(0) tex_coord: vec2<f32>,
-    @location(1) color: vec4<f32>, // gamma 0-1
+    // Gamma-encoded, premultiplied. Unclamped: the HDR vertex-color tier
+    // reaches above 1.0 (and below 0.0 for the odd-symmetric negative
+    // extension); the SDR tier's values stay in 0-1 by construction.
+    @location(1) color: vec4<f32>,
     @builtin(position) position: vec4<f32>,
 };
 
@@ -84,6 +87,29 @@ fn vs_main(
     var out: VertexOutput;
     out.tex_coord = a_tex_coord;
     out.color = unpack_color(a_color);
+    out.position = position_from_screen(a_pos);
+    return out;
+}
+
+/// The HDR vertex-color tier: identical to `vs_main`, except the color comes
+/// from the per-vertex sidecar instead of the packed `Color32`.
+///
+/// `Float16x4` vertex attributes arrive in WGSL as `vec4<f32>` (the 16-bit
+/// storage is a fetch-time decoding detail), so this needs no `enable f16` and
+/// no `Features::SHADER_F16`. The fragment entry points are shared: the
+/// texel multiply and the odd-symmetric decode already do the right thing at
+/// any magnitude.
+@vertex
+fn vs_main_hdr(
+    @location(0) a_pos: vec2<f32>,
+    @location(1) a_tex_coord: vec2<f32>,
+    // Location 2 (`a_color`, the SDR twin) is declared by the pipeline's
+    // buffer layout but deliberately not read here.
+    @location(3) a_color: vec4<f32>,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.tex_coord = a_tex_coord;
+    out.color = a_color;
     out.position = position_from_screen(a_pos);
     return out;
 }

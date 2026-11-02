@@ -2,7 +2,8 @@ use alloc::sync::Arc;
 
 use emath::GuiRounding as _;
 use epaint::{
-    CircleShape, ClippedShape, CornerRadius, PathStroke, RectShape, Shape, Stroke, StrokeKind,
+    CircleShape, ClippedShape, CornerRadius, HdrColorMode, HdrVertexColor, PathStroke, RectShape,
+    Shape, Stroke, StrokeKind,
     text::{FontsView, Galley, LayoutJob},
 };
 
@@ -248,6 +249,43 @@ impl Painter {
         self.paint_list(|l| l.set(idx, self.clip_rect, shape));
     }
 
+    /// Add a shape painted in an HDR color, using its coverage (alpha) as the
+    /// mask.
+    ///
+    /// The generic escape hatch for painting anything above SDR white:
+    /// strokes, polylines, circles, images, polygon fills — construct the shape
+    /// exactly as the SDR API would (with any colour; only its alpha survives)
+    /// and let the wrapper recolour it. The alpha channel is the coverage
+    /// mask, so feathering, rounded corners and antialiasing keep working with
+    /// no new geometry code.
+    ///
+    /// Limitations, stated rather than implied: the recolour is **uniform** (a
+    /// shape with a differently-coloured fill and stroke collapses to one
+    /// colour), and the inner shape's own positional colours are discarded (a
+    /// [`ColorMode::UV`](epaint::ColorMode::UV) ramp is lost). Use
+    /// [`Self::add_hdr_uv`], [`Shape::gradient_rect_hdr`], or a hand-built
+    /// mesh with [`epaint::Mesh::hdr_colors`] for per-vertex variation.
+    ///
+    /// On a backend without HDR support (today: `egui_glow`) the shape still
+    /// draws, range-reduced into the legal SDR range.
+    pub fn add_hdr(&self, shape: impl Into<Shape>, color: impl Into<HdrColorMode>) -> ShapeIdx {
+        self.add(Shape::hdr(shape, color))
+    }
+
+    /// Add a shape painted in an HDR color that varies with position.
+    ///
+    /// The callback receives the shape's visual bounding box (expanded by the
+    /// tessellator's feathering) and a position, and returns the HDR value for
+    /// it. This is the per-position ramp for wrapped geometry; it is called
+    /// once per emitted vertex, so keep it cheap.
+    pub fn add_hdr_uv(
+        &self,
+        shape: impl Into<Shape>,
+        callback: impl Fn(Rect, Pos2) -> HdrVertexColor + Send + Sync + 'static,
+    ) -> ShapeIdx {
+        self.add(Shape::hdr(shape, HdrColorMode::UV(Arc::new(callback))))
+    }
+
     /// Access all shapes added this frame.
     pub fn for_each_shape(&self, mut reader: impl FnMut(&ClippedShape)) {
         self.ctx.graphics(|g| {
@@ -320,6 +358,19 @@ impl Painter {
             points,
             stroke: stroke.into(),
         })
+    }
+
+    /// Paints a line from the first point to the second, in an HDR color.
+    ///
+    /// [`Stroke`] is 8 bytes and cannot grow, so HDR segments go through the
+    /// [`Shape::Hdr`] wrapper (the stroke's own colour supplies coverage only).
+    pub fn line_segment_hdr(
+        &self,
+        points: [Pos2; 2],
+        stroke: impl Into<Stroke>,
+        color: impl Into<HdrVertexColor>,
+    ) -> ShapeIdx {
+        self.add_hdr(Shape::line_segment(points, stroke), color.into())
     }
 
     /// Paints a line connecting the points.
@@ -403,6 +454,25 @@ impl Painter {
         self.add(RectShape::filled(rect, corner_radius, fill_color))
     }
 
+    /// Paints a filled rectangle in an HDR color.
+    ///
+    /// The fill colour supplies coverage only: interior vertices are opaque and
+    /// take the HDR value, feather vertices are transparent and stay
+    /// transparent. This inherits rounded corners, stroke kinds, blur, brushes
+    /// and every future [`RectShape`] feature instead of duplicating corner
+    /// tessellation.
+    pub fn rect_filled_hdr(
+        &self,
+        rect: Rect,
+        corner_radius: impl Into<CornerRadius>,
+        color: impl Into<HdrVertexColor>,
+    ) -> ShapeIdx {
+        self.add_hdr(
+            RectShape::filled(rect, corner_radius, Color32::WHITE),
+            color.into(),
+        )
+    }
+
     pub fn rect_stroke(
         &self,
         rect: Rect,
@@ -424,6 +494,33 @@ impl Painter {
         self.line_segment([origin, tip], stroke);
         self.line_segment([tip, tip - tip_length * (rot * dir)], stroke);
         self.line_segment([tip, tip - tip_length * (rot.inverse() * dir)], stroke);
+    }
+
+    /// Show an arrow in an HDR color.
+    ///
+    /// [`Self::arrow`] is a procedure (three `line_segment` calls), not a
+    /// builder, so it cannot be wrapped after the fact — hence its own twin.
+    /// The three segments are built with the same geometry as [`Self::arrow`]
+    /// and flattened into the HDR wrapper together.
+    pub fn arrow_hdr(
+        &self,
+        origin: Pos2,
+        vec: Vec2,
+        stroke: impl Into<Stroke>,
+        color: impl Into<HdrVertexColor>,
+    ) {
+        use crate::emath::Rot2;
+        let rot = Rot2::from_angle(core::f32::consts::TAU / 10.0);
+        let tip_length = vec.length() * 0.25;
+        let tip = origin + vec;
+        let dir = vec.normalized();
+        let stroke = stroke.into();
+        let segments = Shape::Vec(vec![
+            Shape::line_segment([origin, tip], stroke),
+            Shape::line_segment([tip, tip - tip_length * (rot * dir)], stroke),
+            Shape::line_segment([tip, tip - tip_length * (rot.inverse() * dir)], stroke),
+        ]);
+        self.add_hdr(segments, color.into());
     }
 
     /// An image at the given position.
@@ -553,17 +650,68 @@ impl Painter {
 }
 
 fn tint_shape_towards(shape: &mut Shape, target: Color32) {
-    epaint::shape_transform::adjust_colors(shape, move |color| {
-        if *color != Color32::PLACEHOLDER {
-            *color = crate::ecolor::tint_color_towards(*color, target);
-        }
-    });
+    epaint::shape_transform::adjust_colors(
+        shape,
+        move |color| {
+            if *color != Color32::PLACEHOLDER {
+                *color = crate::ecolor::tint_color_towards(*color, target);
+            }
+        },
+        move |hdr| tint_hdr_towards(hdr, target),
+    );
 }
 
 fn multiply_opacity(shape: &mut Shape, opacity: f32) {
-    epaint::shape_transform::adjust_colors(shape, move |color| {
-        if *color != Color32::PLACEHOLDER {
-            *color = color.gamma_multiply(opacity);
-        }
-    });
+    epaint::shape_transform::adjust_colors(
+        shape,
+        move |color| {
+            if *color != Color32::PLACEHOLDER {
+                *color = color.gamma_multiply(opacity);
+            }
+        },
+        move |hdr| {
+            *hdr = hdr.scaled(opacity);
+        },
+    );
+}
+
+/// The encoded-space mirror of [`ecolor::tint_color_towards`] for a stored HDR
+/// value.
+///
+/// It reproduces the three branches of the `Color32` function exactly, on the
+/// sidecar's `0..=1` scale: the `a8 = round(a × 255)` threshold, the middle
+/// branch's *integer* `2·255/a8` divisor, and the `a == 0` branch that halves
+/// rgb without touching alpha. Reproducing them is what keeps an opaque HDR
+/// mesh and its `Color32` twin from diverging on a fade.
+///
+/// Above 1.0 there is no twin to agree with, and this mirror *is* the
+/// definition; below it, a twin-representable value lands on the same 8-bit
+/// result up to rounding.
+fn tint_hdr_towards(color: &mut HdrVertexColor, target: Color32) {
+    let [r, g, b, a] = color.to_array();
+    let a8 = (a * 255.0 + 0.5) as u8;
+    let toward = |component: u8| f32::from(component) / 255.0;
+
+    let [r, g, b, a] = if a8 == 0 {
+        [r / 2.0, g / 2.0, b / 2.0, a]
+    } else if a8 < 170 {
+        // Same integer divisor as the `Color32` path: at a8 = 128 the integer
+        // 510/128 = 3 pulls by a third, where a float `2/a` would pull by a
+        // quarter.
+        let div = (2 * 255 / i32::from(a8)) as u8;
+        [
+            r / 2.0 + toward(target.r() / div),
+            g / 2.0 + toward(target.g() / div),
+            b / 2.0 + toward(target.b() / div),
+            a / 2.0,
+        ]
+    } else {
+        [
+            r / 2.0 + toward(target.r() / 2),
+            g / 2.0 + toward(target.g() / 2),
+            b / 2.0 + toward(target.b() / 2),
+            a,
+        ]
+    };
+    *color = HdrVertexColor::from_rgba_premultiplied([r, g, b, a]);
 }

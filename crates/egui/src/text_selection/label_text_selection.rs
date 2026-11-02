@@ -204,6 +204,11 @@ impl LabelSelectionState {
 
     /// Handle text selection state for a label or similar widget.
     /// This also takes care of painting the galley.
+    /// Paint a label's galley with selection support.
+    ///
+    /// `hdr_color` is the label's [`epaint::TextShape::hdr_color`], if any;
+    /// selection clearing works the same way, because the HDR sidecar is
+    /// derived from the vertex alpha the selection path zeroes.
     pub fn label_text_selection(
         ui: &Ui,
         response: &Response,
@@ -211,15 +216,19 @@ impl LabelSelectionState {
         mut galley: Arc<Galley>,
         fallback_color: epaint::Color32,
         underline: epaint::Stroke,
+        hdr_color: Option<epaint::HdrVertexColor>,
     ) {
         let plugin = ui.ctx().plugin::<Self>();
         let mut plugin = plugin.lock();
         let state = plugin.states.entry(ui.ctx().viewport_id()).or_default();
         let new_vertex_indices = state.on_label(ui, response, galley_pos, &mut galley);
 
-        let shape_idx = ui.painter().add(
-            epaint::TextShape::new(galley_pos, galley, fallback_color).with_underline(underline),
-        );
+        let mut text_shape =
+            epaint::TextShape::new(galley_pos, galley, fallback_color).with_underline(underline);
+        if let Some(hdr_color) = hdr_color {
+            text_shape = text_shape.with_hdr_color(hdr_color);
+        }
+        let shape_idx = ui.painter().add(text_shape);
 
         if !new_vertex_indices.is_empty() {
             state
