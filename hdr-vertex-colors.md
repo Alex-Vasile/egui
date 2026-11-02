@@ -22,7 +22,12 @@ a third round of stale anchors; all fixed where they bite. A sixth pass (Appendi
 fixed-point check *of* C.6 — confirmed two of C.6's three mechanism fixes and tightened their wording,
 and **reversed** the third: the tail repair at the `tessellate_shape` boundary is replaced by a tier
 pre-split *above* that function, because a repair cannot be principled where the function has no way
-to split a mesh. Line numbers are as of this branch and were confirmed by reading, not by arithmetic.
+to split a mesh. A seventh pass (Appendix C.8) — the fixed-point check *of* C.7 — confirmed the
+pre-split's paint-order, allocation and precondition arguments, but found that its acceptance rule
+still admitted the one shape class `tessellate_shape` cannot emit (a callback under `Shape::Hdr`), and
+that the per-mesh pipeline switch had dropped the re-set after a paint callback; the fade mirror's
+comparison to a float divisor was also inverted. All three are fixed where they bite. Line numbers
+are as of this branch and were confirmed by reading, not by arithmetic.
 
 ---
 
@@ -797,7 +802,8 @@ pub enum HdrColorMode {
   single dimming path, §9), `visual_bounding_rect` (`shape.rs:403-431`, delegate to `inner`),
   `transform` (`:467`+, transform `inner`), `PaintStats::add` (`stats.rs:192-230`, delegate — the
   sidecar is counted once, by the mesh's `AllocInfo`), `tessellate_shape`
-  (`tessellator.rs:1568`+), `should_parallelize` (`:2535-2552`, recurse) — and a **delegating
+  (`tessellator.rs:1568`+), `should_parallelize` (`:2535-2552`, recurse, and `false` for any sub-tree
+  carrying a `Shape::Callback` — §9) — and a **delegating
   `texture_id()` arm** (`shape.rs:437-445`), which is *not* an exhaustive match and therefore will not
   be flagged by the compiler (§4).
 - **`Painter::add_hdr_uv(shape, callback)`** (6b) — `add_hdr(shape, HdrColorMode::UV(Arc::new(callback)))`,
@@ -1048,9 +1054,23 @@ producers and no colour threading (the text field is a source that feeds one of 
   over the HDR one. Each run then re-enters the same `should_parallelize` test, so the split cannot
   smuggle a small run into a job that would not have taken it.
 
+  `should_parallelize` also returns `false` for every shape whose sub-tree contains a
+  `Shape::Callback`. `tessellate_shape` cannot emit one (its own `Callback` arm panics, and the
+  wrapper's arm can only skip it with a `debug_assert!(false, …)`), and the rayon pass runs *before*
+  `tessellate_clipped_shape`'s interception — so `Hdr{inner: Vec([… Callback …])}` with more than
+  four children, or with one parallelizable child, would be tessellated wholesale and lose the
+  callback (a debug panic, a silent drop in release), contradicting §8.4's and §16 Q5's promise for
+  exactly the nesting C.5 item 4 fixed. Returning `false` hands the entry back to the serial path
+  unchanged, where the interception paints the callback; it also closes the pre-existing panic for a
+  plain `Shape::Vec` carrying a callback and more than four children. Declining it in the pre-pass
+  alone would not do: the entry would stay `should_parallelize`-accepted and be tessellated wholesale
+  anyway. The only cost is that such a `Vec` is no longer parallelized, which is correct:
+  `tessellate_shape` has no representation for a callback at all.
+
   Nothing is duplicated by this: the predicate is `Shape::is_hdr()`, the run rule is the grouping
   key's own rule (tier change ⇒ new mesh) applied one pass earlier, and a uniform shape comes back
-  untouched, with no allocation. The invariant then holds *by construction* on every path — serial
+  untouched, with no allocation (the temporary `Vec` of runs exists only when a split is actually
+  emitted). The invariant then holds *by construction* on every path — serial
   (grouping key), rayon (runs), wrapper (projection over its whole emitted range), text (every
   emitted vertex) — and needs no repair clause anywhere.
 
@@ -1093,8 +1113,10 @@ Consequences:
   it is there), `target` scaled into `0..=1`. So a stored value at `a8 >= 170` blends encoded RGB
   and keeps its alpha, and only below that threshold does alpha halve. The scale is part of the rule,
   not a detail: the stored alpha is `0..=1`, so a literal `a >= 170.0` is never true and would
-  reinstate the always-halve bug, and a float `2/a` divisor pulls toward the target by a third
-  where the `Color32` twin pulls by a quarter. Stated this way, a twin-representable value (every
+  reinstate the always-halve bug, and a float `2/a` divisor pulls toward the target by a quarter at
+  `a8 = 128` where the `Color32` twin's integer `510/a8 = 3` pulls by a third — the integer divisor
+  is the truncated float, so the float port under-weights the target, not over-weights it. Stated
+  this way, a twin-representable value (every
   component `<= 1`) lands on the same 8-bit result up to rounding; above 1.0 there is no twin to
   agree with, and the mirror *is* the definition. Reproducing the branches is not optional:
   "always halve alpha" would dim an opaque HDR mesh on wgpu while its `Color32` twin on glow stayed
@@ -1204,8 +1226,11 @@ Consequences:
 - **No batching layer exists to key on.** `render()` draws one `draw_indexed` per `Primitive::Mesh`
   in paint order (`:714-735`) and sets the pipeline exactly once per pass (`:686`), from a lookup
   performed up front (`:652-661`). So the tier is honoured the only way this renderer can honour any
-  state change: `render_pass.set_pipeline(..)` again when the tier differs from the previous mesh —
-  a state switch, **never a reorder**. Batching by tier would reorder egui's primitives, and
+  state change: `render_pass.set_pipeline(..)` at the first mesh of the pass, again when the tier
+  differs from the one currently bound, and again after a paint callback, which may have bound its
+  own — today's `needs_reset` (`:686`), and the per-pass note of which tier is bound has to be
+  cleared with the flag, or a callback followed by a same-tier mesh draws with the callback's
+  pipeline. A state switch, **never a reorder**. Batching by tier would reorder egui's primitives, and
   primitive order *is* paint order for translucent HDR content; that is a correctness regression, not
   an optimization. The cache key (`:305`) gains the tier component, so the up-front lookup can no
   longer resolve *one* handle — and it cannot resolve *either* handle up front: `render()` keeps an
@@ -1276,7 +1301,7 @@ scope" (Open Question 1): nothing here expands that scope.
 | CPU contract | `HdrVertexColor`: `From<Color32>` error `< 1/512`; `from_rgba_premultiplied` ↔ `to_array` round-trip **on f16-representable inputs** (arbitrary `f32` cannot round-trip through 11 bits, and a test that expects it to would encode a lie); negatives preserved; `>1.0` preserved; premultiplication invariant under feathering multiply; `from_linear` premultiplies after encoding | f16 rounding and odd-symmetry at the negative branch are exactly where PR 2a found a real bug, and "linear" without a premultiplication convention is where every translucent value goes wrong |
 | CPU structure | `size_of::<Shape>() == 64` still passes; `PathStroke`/`ColorMode`/`Vertex` asserted **unchanged** (24/16/20); new guards for `Shape::Hdr`'s payload and `TextShape` (56); the `hdr_colors.len()` invariant checked through `Mesh::is_valid`; `promote_to_hdr` idempotence; `split_to_u16` carries the tier | silent size regressions and forgotten mutation paths |
 | CPU projection | the u8 twin preserves chromaticity (positive channel ratios intact within quantization), never emits `rgb > a`, and `promote_to_hdr` ↔ twin is stable across a round-trip; **`a == 0` returns `TRANSPARENT`, while an all-negative or exact-black value returns premultiplied black at its own alpha** (so an opaque one still occludes — §8.5's guards; the feather ring evaluates the first on every antialiased edge) | per-channel clamping is the tempting wrong implementation, and it is silently plausible; the divide-by-zero and the sign flip are *not* plausible on inspection, which is why they are asserted |
-| CPU wrapper | `Shape::Hdr` around a textured mesh starts its own primitive (the `texture_id` delegation, §8.4) instead of panicking in `append_ref`; a wrapped `Shape::Vec` tessellates child-by-child; a wrapped `Shape::Callback` passes through uncoloured; a **directly constructed** `Hdr{inner: Callback}` also passes through (the `tessellate_clipped_shape` interception, §8.4) instead of hitting `tessellate_shape`'s panic, and so does a callback nested inside `Hdr{inner: Vec([…])}`; and a five-child `[Hdr{..}, circle_filled(..), …]` run through the rayon wholesale call splits by tier instead of promoting the SDR children | `Shape::texture_id()` is the one `Shape` site the compiler cannot point at (§4), and the callback path is the one the constructor hides |
+| CPU wrapper | `Shape::Hdr` around a textured mesh starts its own primitive (the `texture_id` delegation, §8.4) instead of panicking in `append_ref`; a wrapped `Shape::Vec` tessellates child-by-child; a wrapped `Shape::Callback` passes through uncoloured; a **directly constructed** `Hdr{inner: Callback}` also passes through (the `tessellate_clipped_shape` interception, §8.4) instead of hitting `tessellate_shape`'s panic, and so does a callback nested inside `Hdr{inner: Vec([…])}` — in particular a five-child one, which `should_parallelize`'s new `Hdr` recursion accepts and which the rayon pass must therefore decline rather than tessellate wholesale; and a five-child `[Hdr{..}, circle_filled(..), …]` run through the rayon wholesale call splits by tier instead of promoting the SDR children | `Shape::texture_id()` is the one `Shape` site the compiler cannot point at (§4), and the callback path is the one the constructor hides |
 | CPU batching | a hand-built HDR mesh appended after an SDR shape starts its own primitive: `Shape::is_hdr()` returns true for `Shape::Mesh` with a sidecar (§9), so the SDR mesh is not promoted and keeps 20 B/vertex | the predicate is the only thing standing between "sparse HDR" and "every SDR vertex becomes HDR" |
 | CPU opacity | `multiply_opacity` / `tint_shape_towards` over (a) a `Shape::Hdr` wrapper, (b) a bare HDR mesh, (c) HDR text: the wrapper dims once (inner alpha only, mode untouched), a bare HDR mesh dims its sidecar, and HDR text dims **not via `hdr_color`** but once through the galley vertex alpha the sidecar multiplies in (dimming both is the double-dim this row exists to catch) | §9's rule is asymmetric per level, so an implementation that "does the same thing everywhere" is wrong in one of the three cases |
 | CPU text | `TextShape::hdr_color` with an underline and with a background-coloured galley: sidecar length equals vertex count, the underline and the background still draw, only `glyph_vertex_range` vertices take the HDR value, and a vertex cleared to `TRANSPARENT` (the selection path, §4) yields a zero sidecar; **and a five-child `Shape::Vec` whose children alternate tiers, run through the rayon wholesale call, comes back as one primitive per contiguous run in the original order, each with `hdr_colors.len() == vertices.len()`** (the rayon tier pre-split, §9) | the underline is emitted by a *different* call inside the same `out`, and the wholesale path lets *other* shapes append after it — exactly what the invariant catches |
@@ -1717,8 +1742,9 @@ wording pinned; the third is reversed.
    still has to be right — the three branches do what C.6 says: alpha is preserved at the plateau and
    halved below it, and the `a == 0` branch halves rgb. What the text had not pinned is the *scale*:
    a stored alpha is `0..=1`, so the literal `a >= 170` reads only in the `Color32` path's 0..=255
-   units, and the middle branch's divisor is the integer `2·255/a8`, not `2/a` (a float port pulls
-   toward the target by a third where the twin pulls by a quarter). Pinned.
+   units, and the middle branch's divisor is the integer `2·255/a8`, not `2/a` (at `a8 = 128` a
+   float port gives `1/3.98` where the twin's integer `510/a8` gives `1/3` — the float *under*-weights
+   the target; C.8 corrects this pass's own inverted comparison). Pinned.
 3. **Per-tier handle resolution holds; its wording could still panic** (§11). "keeps one resolved
    pipeline per tier and looks the second one up" left the *first* handle resolved up front — and an
    HDR-only frame's first mesh is HDR, so that reading panics on exactly the frame C.6 item 3 set out
@@ -1731,3 +1757,64 @@ Re-read and unchanged in this pass: §0's table, §6.3/§6.7's pipeline argument
 SDR default path (20 B/vertex, one staging buffer, no per-frame CPU conversion, SDR pipeline count
 unchanged), `Shape` 64 B, no `unsafe`, no new mandatory dependency. Anchors were not re-swept this
 round; the four new ones in §9 were read.
+
+**C.8 — fixed-point check of C.7 (seventh pass, 2026-11-02).** C.7 was re-derived from the tree
+rather than read as an account of itself. The pre-split's paint-order argument, its allocation claim
+and its precondition all hold; the acceptance rule it plugs into does not, and the lazy-handle fix
+left one branch of the old behaviour behind.
+
+1. **The pre-split could not be total where `tessellate_shape` has no callback representation**
+   (§9). Checked the four constructions the fix must survive: nested `Vec`s and a `Vec` of `Vec`s with
+   alternating tiers flatten order-preservingly (the serial path recurses the same depth-first order,
+   and each run inherits `clip_rect` and `transform_after_tessellation`); a single non-`Vec` HDR shape
+   at the threshold boundary (`Hdr{Path(32 points)}` not parallelized, `33` parallelized) gets a fresh
+   mesh either way; a uniform shape is classified by a read-only walk and left untouched, so the
+   no-allocation claim is true once it is scoped to "the temporary `Vec` of runs exists only when a
+   split is emitted"; and the predicate is `Shape::is_hdr()`, not a copy of it. The fourth
+   construction fails: `should_parallelize`'s new `Hdr` arm recurses (line 800, `:2535-2552`), so
+   `Hdr{inner: Vec([… Callback …])}` with more than four children — or with one parallelizable child —
+   is accepted by the rayon pass, which runs *before* `tessellate_clipped_shape` applies the
+   interception. `tessellate_shape` cannot emit a `Primitive::Callback`; the wrapper's arm can only
+   skip the child with `debug_assert!(false, …)`, so the callback is a debug panic and a silent drop
+   in release, on exactly the nesting C.5 item 4, §8.4, §16 Q5 and the §12 row promise away. Fixed by
+   declining every shape whose sub-tree contains a `Shape::Callback` in the acceptance predicate, not
+   only in the split: the entry then goes to the serial path unchanged, where the interception paints
+   it. That also closes the pre-existing panic for a plain `Shape::Vec` with a callback and more than
+   four children, and it costs only the parallelism of such a `Vec`. The precondition on
+   `tessellate_shape` itself stays as declared: the tessellator's own paths satisfy it, a direct
+   caller is routed at `:1564-1565`, and a violation lands in `Mesh::is_valid`'s length clause under
+   `tessellate_shapes`'s final `debug_assert!` — a diagnostic, not repaired pixels.
+2. **The fade mirror reproduces the twin; its comparison did not** (§9). Re-traced
+   `tint_color_towards` (`ecolor/src/lib.rs:279-300`): `a == 0` halves rgb and leaves alpha; `a < 170`
+   also halves alpha and adds `target / ((2·255/a) as u8)`; `a >= 170` blends rgb and keeps alpha. The
+   pinned form (`a8 = round(a × 255)`, integer divisor, target scaled to `0..=1`) reproduces all three
+   on the sidecar: `a8 = 128`, target `TRANSPARENT` gives `rgb/2, a8 = 64` on both sides, and
+   `multiply_opacity`'s `gamma_multiply` is `(x·factor + 0.5) as u8` over all four components, which
+   the sidecar's four-component multiply matches up to rounding. C.7's parenthetical had the
+   float comparison inverted (corrected in place above): a float `2/a` divisor is `1/3.98` at
+   `a8 = 128` (a quarter), while the twin's integer `510/128 = 3` pulls by a third, so the float port
+   *under*-weights the target. The prescription is unchanged.
+3. **Lazy handles resolve, but the switch lost the callback re-set** (§11). Both lookups are possible
+   from `&self` (the cache is a `Mutex<HashMap>`), each on the first mesh of its tier, and total given
+   the tier scan: the fold that would host that scan touches no `self` field (`renderer.rs:1294-1314`
+   borrows only `paint_jobs` and `callbacks`), so moving it above `ensure_pipeline` is borrow-clean,
+   and an SDR-only and an HDR-only frame each call `ensure_pipeline` once. The gap was the switch
+   itself: `render_pass.set_pipeline` is issued today inside `needs_reset`, which is re-armed after
+   every paint callback (`:686`, and §4 names it) precisely because a callback may bind its own
+   pipeline. A per-mesh "tier differs from the previous mesh" test never fires after a callback on a
+   single-tier frame, so the next mesh would draw with the callback's pipeline. §11 now says the set
+   is issued at the first mesh, on a tier change, and after a callback, and that the bound-tier note
+   is cleared with `needs_reset`.
+4. **Test rows.** Both rayon rows use five-child `Vec`s and `should_parallelize` accepts `4 < len`,
+   so both do reach the wholesale call; with the pre-split removed the mixed `Vec` becomes one mesh
+   whose sidecar is short, the final `debug_assert!(mesh.is_valid())` trips in debug, and the
+   primitive-count/sidecar assertions fail in either profile. One caveat for 6a: `rayon` is not a
+   default feature, and without it the serial path produces the expected per-run primitives on its
+   own, so the row must be feature-gated or it passes for the wrong reason.
+
+Re-read and unchanged in this pass: §0's table, §6.3's sparsity claim and pipeline argument, §8.2's
+append/promote rules, §8.4's interception totality *as a function on the shapes it receives*, §8.5's
+twin, §9's three dimming rules, §13's SDR budget, and the non-negotiables — the SDR default path
+(20 B/vertex, one staging buffer, no per-frame CPU conversion, SDR pipeline count unchanged),
+`Shape` 64 B, no `unsafe`, no new mandatory dependency. Anchors were not re-swept; the three new ones
+in this section were read.
