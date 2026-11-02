@@ -787,9 +787,10 @@ pub enum HdrColorMode {
   is uncoloured, not a rewrite of the callback's semantics. The `Callback` case **cannot** be handled
   inside `tessellate_shape` (that function cannot emit a `Primitive::Callback` and panics on one), so
   `tessellate_clipped_shape` intercepts `Shape::Hdr` next to its existing `Shape::Callback` fast path
-  (`tessellator.rs:1509-1516`) and unwraps it there: a `Callback` inner is emitted uncoloured with a
-  `debug_assert`, and a `Vec` inner is split into one `Hdr`-wrapped `ClippedShape` per child and fed
-  back through the same interception. Both halves are needed: unwrapping only the top level lets the
+  (`tessellator.rs:1509-1516`) and unwraps it there: a `Callback` inner is emitted uncoloured
+  (**no `debug_assert!(false, …)` on this path** — §16 Q5 promises it and §12 tests it in debug), and
+  a `Vec` inner is split into one `Hdr`-wrapped `ClippedShape` per child and fed back through the
+  same interception. Both halves are needed: unwrapping only the top level lets the
   `Hdr`-over-`Vec` arm re-wrap a `Callback` child in `Hdr`, which walks straight into the
   `tessellate_shape` callback panic — the one panic the wrapper promises a public variant does not
   cause. The constructor's pass-through is the ergonomic path; the interception is the
@@ -1311,6 +1312,13 @@ scope" (Open Question 1): nothing here expands that scope.
 | Serde | `Mesh` round-trip with and without the sidecar; old payload → SDR; `HdrVertexColor` serializes as its `[u16; 4]` bits (`serde(transparent)`, §8.1); `TextShape` round-trip with and without `hdr_color`, and an old `TextShape` payload still loads; `Shape` round-trips **without** an HDR mode at all (`Shape` is not serde-derived) | the `cfg_attr(serde(default))` form on the two new fields, and the old-payload paths |
 | glow | SDR snapshot byte-identical; an HDR mesh draws its **twin** and logs one warning per painter (asserted through the same `log` capture PR 2b's reject test uses) | a backend that degrades must say so once, not silently |
 | Perf | demo app vertex bytes/frame before/after via `stats`; SDR frame path asserted unchanged; the pipeline cache holds **one** entry after an SDR-only frame (§11, §13) | the claim that makes B acceptable, and the lazy-tier rule is the only thing keeping the SDR first frame cost identical |
+
+The rayon clauses in the two rows above — `CPU wrapper`'s callback-decline and five-child wholesale
+cases, and `CPU text`'s alternating-tier case — are `#[cfg(feature = "rayon")]` tests, with
+`parallel_tessellation` left at its default `true`: `rayon` is not in `epaint`'s default feature set,
+and without it the serial path alone satisfies all three (the interception paints the callback, and
+the grouping key emits the per-run primitives), so an ungated test passes without exercising either
+the decline or the pre-split (C.8 item 4 records the pre-split half).
 
 The GPU numeric and snapshot tests live in `crates/egui_kittest/tests/hdr_vertex_colors.rs`, next to
 the existing per-concern files (`fp16_target.rs`, `snapshot_colorspace.rs`,
